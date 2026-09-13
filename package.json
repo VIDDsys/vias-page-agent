@@ -1,6 +1,6 @@
 {
   "name": "vias-page-agent",
-  "version": "0.11.1",
+  "version": "0.11.3",
   "private": true,
   "description": "Vias Edge MV3 page agent",
   "scripts": {

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Vias 页面助手",
-  "version": "0.11.1",
+  "version": "0.11.3",
   "minimum_chrome_version": "114",
   "description": "可靠、可确认、可中断的 AI 页面助手，支持自定义 OpenAI 兼容模型与复杂网页操作。",
   "permissions": ["activeTab", "scripting", "storage", "sidePanel", "tabs"],
