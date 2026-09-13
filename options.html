@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>Vias 页面助手 - 设置</title>
+<style>
+  :root { color-scheme: light dark; --ink: #111; --page: #fff; --bg: #fafafa; --line: #e5e7eb; --line-soft: #f1f2f4; --muted: #8a8f98; --ok: #107c10; --fail: #c42b1c; }
+  @media (prefers-color-scheme: dark) {
+    :root { --ink: #f4f4f5; --page: #1c1c1f; --bg: #161618; --line: #2e2e33; --line-soft: #26262b; --muted: #7c7f87; }
+  }
+  * { box-sizing: border-box; }
+  body { font: 14px/1.7 "Segoe UI", "Microsoft YaHei", sans-serif; max-width: 660px; margin: 40px auto; padding: 0 16px; color: var(--ink); background: var(--bg); }
+  h1 { font-size: 18px; }
+  h2 { font-size: 15px; margin: 26px 0 8px; }
+  .card { background: var(--page); border: 1px solid var(--line); border-radius: 14px; padding: 12px 16px; margin: 10px 0; }
+  .card.active { border-color: var(--ink); box-shadow: 0 6px 20px rgba(0,0,0,.06); }
+  .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .meta { color: var(--muted); font-size: 12px; word-break: break-all; margin-top: 4px; }
+  label { display: block; margin-top: 12px; font-weight: 600; font-size: 13px; }
+  input, textarea { width: 100%; padding: 8px 10px; margin-top: 4px; border-radius: 8px; border: 1px solid var(--line); font: inherit; background: var(--page); color: inherit; }
+  input[type="checkbox"] { width: auto; margin-right: 8px; }
+  textarea { height: 96px; resize: vertical; }
+  button { padding: 7px 16px; border: 1px solid var(--line); border-radius: 999px; background: var(--page); color: var(--ink); cursor: pointer; font: inherit; font-size: 13px; }
+  button.primary { background: var(--ink); color: var(--page); border-color: var(--ink); }
+  button.danger { color: var(--fail); }
+  button:disabled { opacity: .5; cursor: default; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .status { font-size: 12px; }
+  .ok { color: var(--ok); }
+  .fail { color: var(--fail); }
+  #formWrap { display: none; }
+  #formWrap.show { display: block; }
+  .tag { font-size: 11px; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; margin-left: 8px; }
+</style>
+</head>
+<body>
+<h1>Vias 页面助手 · 设置</h1>
+<p class="hint">配置一个或多个模型（任意 OpenAI 兼容接口：官方 API、中转站、本地模型均可），配置后在侧边栏可随时切换。所有配置仅保存在本机浏览器内（不上云同步），卸载扩展即自动清除。</p>
+
+<h2>模型列表</h2>
+<div id="modelList"></div>
+<div class="row" style="margin-top:12px">
+  <button id="btnAdd" class="primary">＋ 添加模型</button>
+</div>
+
+<div id="formWrap" class="card">
+  <h2 id="formTitle" style="margin-top:0">添加模型</h2>
+  <label for="fName">显示名称（侧边栏切换菜单里显示的名字）</label>
+  <input id="fName" autocomplete="off" placeholder="例如：DeepSeek / 我的中转站 / 本地 GLM">
+  <label for="fBase">API 地址（Base URL）</label>
+  <input id="fBase" type="url" autocomplete="url" placeholder="https://api.deepseek.com 或 https://xxx.com/v1">
+  <p class="hint">填到域名或 /v1 为止，自动拼接 /chat/completions；误粘贴完整端点会自动纠正。</p>
+  <label for="fKey">API Key</label>
+  <input id="fKey" type="password" autocomplete="new-password" placeholder="sk-...（本地无鉴权服务可留空）">
+  <label><input id="fClearKey" type="checkbox" style="width:auto;margin-right:8px">清除已保存的 API Key</label>
+  <label for="fModel">模型名</label>
+  <input id="fModel" autocomplete="off" placeholder="例如 deepseek-flash / glm-5.3 / gpt-5.6">
+  <label><input id="fVision" type="checkbox" style="width:auto;margin-right:8px">允许向模型发送页面图片</label>
+  <p class="hint">页面文字始终会发送到你配置的 API；仅在明确启用后，才发送提取到的页面图片或当前可视区截图。</p>
+  <div class="row" style="margin-top:16px">
+    <button id="btnSave" class="primary">保存</button>
+    <button id="btnCancel">取消</button>
+    <span id="formStatus" class="status" role="status" aria-live="polite"></span>
+  </div>
+</div>
+
+<h2><label for="systemPrompt">系统提示词（全局，对所有模型生效）</label></h2>
+<textarea id="systemPrompt" placeholder="留空使用默认提示词"></textarea>
+<div class="row" style="margin-top:10px">
+  <button id="btnSavePrompt" class="primary">保存提示词</button>
+  <span id="promptStatus" class="status" role="status" aria-live="polite"></span>
+</div>
+
+<script src="core.js"></script>
+<script src="options.js"></script>
+</body>
+</html>

@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>Vias content fixture</title>
+  <style>
+    body { font: 16px sans-serif; }
+    input, button, #shadow-host { display: block; width: 240px; min-height: 32px; margin: 8px; }
+  </style>
+</head>
+<body>
+  <h1>fixture-start-marker</h1>
+  <label for="name">Name</label>
+  <input id="name" type="text" autocomplete="off">
+  <label><input id="terms" type="checkbox">Accept terms</label>
+  <button id="counter">Count once</button>
+  <label for="password">Password</label>
+  <input id="password" type="password" value="S3cr3t-fixture-value">
+  <section id="long-copy"></section>
+  <div id="shadow-host"></div>
+  <script>
+    window.fixtureCounts = { button: 0, nameInput: 0, nameChange: 0, termsChange: 0 };
+    document.querySelector('#counter').addEventListener('click', () => { window.fixtureCounts.button += 1; });
+    document.querySelector('#name').addEventListener('input', () => { window.fixtureCounts.nameInput += 1; });
+    document.querySelector('#name').addEventListener('change', () => { window.fixtureCounts.nameChange += 1; });
+    document.querySelector('#terms').addEventListener('change', () => { window.fixtureCounts.termsChange += 1; });
+
+    const copy = document.querySelector('#long-copy');
+    for (let index = 0; index < 100; index += 1) {
+      const paragraph = document.createElement('p');
+      paragraph.textContent = `long-copy-${String(index).padStart(3, '0')} ` + '内容'.repeat(80);
+      copy.append(paragraph);
+    }
+    const end = document.createElement('p');
+    end.textContent = 'fixture-end-marker';
+    copy.append(end);
+
+    const shadow = document.querySelector('#shadow-host').attachShadow({ mode: 'open' });
+    shadow.innerHTML = '<button id="shadow-button">Shadow action</button><input id="shadow-input" aria-label="Shadow field">';
+  </script>
+</body>
+</html>
