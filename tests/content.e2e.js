@@ -172,8 +172,25 @@ test('DOM 在快照后变化时拒绝执行旧 ref', { timeout: 30000 }, async (
     await page.waitForTimeout(0);
     const response = await execute(page, extraction, 'op-dom-stale', [{ action: 'click', ref }]);
     assert.equal(response.results[0].ok, false);
-    assert.equal(response.results[0].code, 'STALE_SNAPSHOT');
+    assert.equal(response.results[0].code, 'STALE_TARGET');
     assert.equal(await page.evaluate(() => window.fixtureCounts.button), 0);
+  });
+});
+
+test('无关节点的持续抖动不再阻止对有效目标执行（回归：自动刷新页点击落不了地）', { timeout: 30000 }, async () => {
+  await withFixture(async (page) => {
+    const extraction = await extract(page);
+    const ref = refMatching(extraction, /按钮「Count once」/);
+    await page.evaluate(() => {
+      // 模拟倒计时/自动保存：改无关节点的文字与属性，不动目标本身
+      const h = document.querySelector('h1');
+      h.textContent = `fixture-start-marker 12:${30 + Math.floor(Math.random() * 9)}`;
+      h.dataset.tick = String(Date.now());
+    });
+    await page.waitForTimeout(0);
+    const response = await execute(page, extraction, 'op-unrelated-churn', [{ action: 'click', ref }]);
+    assert.equal(response.results[0].ok, true, JSON.stringify(response.results[0]));
+    assert.equal(await page.evaluate(() => window.fixtureCounts.button), 1);
   });
 });
 

@@ -145,5 +145,94 @@
     throw lastError || new Error('模型请求失败');
   }
 
-  globalThis.ViasCore = Object.freeze({ normalizeBaseUrl, validateModel, callModel });
+  function repairControlEscapes(text) {
+    const valid = new Set(['"', '\\', '/', 'b', 'f', 'n', 'r', 't', 'u']);
+    let out = '';
+    let inStr = false;
+    let esc = false;
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      if (inStr) {
+        if (esc) { esc = false; out += ch; continue; }
+        if (ch === '\\') {
+          if (valid.has(text[i + 1])) { out += ch; esc = true; }
+          else out += '\\\\';
+          continue;
+        }
+        if (ch === '"') { inStr = false; out += ch; continue; }
+        out += ch;
+        continue;
+      }
+      if (ch === '"') { inStr = true; }
+      out += ch;
+    }
+    return out;
+  }
+
+  function tryParseJson(str) {
+    try { return JSON.parse(str); } catch {}
+    try { return JSON.parse(repairControlEscapes(str)); } catch { return null; }
+  }
+
+  function isInstructionObject(value) {
+    return !!value && typeof value === 'object'
+      && (Array.isArray(value.actions) || typeof value.say === 'string' || value.done === true);
+  }
+
+  // 平衡括号扫描：从混排文本中提取合法的指令 JSON 对象（正确处理字符串内的引号与转义）
+  function extractInstructionObjects(text) {
+    const found = [];
+    let depth = 0;
+    let start = -1;
+    let inStr = false;
+    let esc = false;
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (ch === '\\') esc = true;
+        else if (ch === '"') inStr = false;
+        continue;
+      }
+      if (ch === '"') { inStr = true; continue; }
+      if (ch === '{') {
+        if (depth === 0) start = i;
+        depth++;
+      } else if (ch === '}') {
+        if (depth === 0) continue;
+        depth--;
+        if (depth === 0 && start >= 0) {
+          const value = tryParseJson(text.slice(start, i + 1));
+          if (isInstructionObject(value)) found.push(value);
+          start = -1;
+        }
+      }
+    }
+    return found;
+  }
+
+  function normalizeInstruction(value) {
+    return {
+      say: typeof value.say === 'string' ? value.say.slice(0, 50000) : '',
+      actions: Array.isArray(value.actions) ? value.actions : [],
+      done: value.done === true,
+    };
+  }
+
+  // 解析模型回复为 {say, actions, done}。done 是任务真正完成的显式截止信号。
+  function parseReply(text) {
+    const candidates = [];
+    for (const match of String(text).matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)) candidates.push(match[1]);
+    candidates.push(String(text).trim());
+    for (const candidate of candidates) {
+      const value = tryParseJson(candidate);
+      if (isInstructionObject(value)) return normalizeInstruction(value);
+    }
+    // 兜底：模型常把 JSON 与自由文本混排（前言/解说写在块外）——提取最后一个合法指令对象，绝不吞掉操作
+    const extracted = extractInstructionObjects(String(text));
+    if (extracted.length) return normalizeInstruction(extracted[extracted.length - 1]);
+    return { say: String(text), actions: [], done: false };
+  }
+
+  globalThis.ViasCore = Object.freeze({ normalizeBaseUrl, validateModel, callModel, parseReply });
 })();

@@ -37,7 +37,7 @@ function listen(server) {
       } else {
         secondMessages = body.messages || [];
         response.writeHead(200, { 'content-type': 'application/json' });
-        response.end(JSON.stringify({ choices: [{ message: { content: '```json\n{"say":"任务完成","actions":[]}\n```' } }] }));
+        response.end(JSON.stringify({ choices: [{ message: { content: '```json\n{"say":"任务完成","done":true,"actions":[]}\n```' } }] }));
       }
     });
   });

@@ -114,6 +114,36 @@ test('core 拒绝伪成功响应并支持无鉴权服务', async () => {
   await assert.rejects(() => invalidCore.callModel({ baseUrl: 'https://api.example.test/v1', model: 'x' }, [{ role: 'user', content: 'hi' }]), /缺少 choices/);
 });
 
+test('core parseReply 自愈非法转义并识别 done 截止信号', () => {
+  const core = loadCore();
+
+  // 模型违约：前言写在围栏外 + say 含非法 JSON 转义 \g \G —— 须修复后解析，绝不吞掉 actions
+  const messy = '我来逐题作答：\n```json\n{"say":"结束符 \\g 和 \\G","actions":[{"action":"check","ref":3}]}\n```';
+  const p = core.parseReply(messy);
+  assert.deepEqual(JSON.parse(JSON.stringify(p.actions)), [{ action: 'check', ref: 3 }]);
+  assert.equal(p.done, false);
+  assert.match(p.say, /结束符/);
+
+  const done = core.parseReply('{"say":"全部完成","done":true,"actions":[]}');
+  assert.equal(done.done, true);
+  assert.equal(done.actions.length, 0);
+
+  const onlySay = core.parseReply('{"say":"我打算这样选"}');
+  assert.deepEqual(JSON.parse(JSON.stringify(onlySay.actions)), []);
+  assert.equal(onlySay.done, false);
+
+  const raw = core.parseReply('页面读取失败');
+  assert.equal(raw.say, '页面读取失败');
+  assert.deepEqual(JSON.parse(JSON.stringify(raw.actions)), []);
+  assert.equal(raw.done, false);
+});
+
+test('后台使用集中式 core 解析器而非本地重复实现', () => {
+  const background = read('background.js');
+  assert.match(background, /ViasCore\.parseReply\(/);
+  assert.doesNotMatch(background, /function parseAiReply\(/, '解析器应集中在 core.js，不在 background 里重复实现');
+});
+
 test('后台和内容脚本声明完整的快照、操作与取消协议', () => {
   const background = read('background.js');
   const content = read('content.js');

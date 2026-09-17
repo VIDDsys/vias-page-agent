@@ -12,6 +12,7 @@
   const SENSITIVE_AUTOCOMPLETE = /(current-password|new-password|one-time-code|cc-|transaction-|webauthn)/i;
   const documentId = crypto.randomUUID();
   const refMap = new Map();
+  const refFingerprints = new Map();
   const operationCache = new Map();
   const cancelledRuns = new Set();
   let snapshotEpoch = 0;
@@ -211,6 +212,19 @@
     return cleanText(text, max);
   }
 
+  // 目标身份指纹：只含稳定特征（标签/类型/角色/名称/文字），刻意排除 checked、value 等会被操作改变的属性。
+  // 用于执行前逐目标核验：若编号指向的节点已被复用成别的内容（乱序页常见），据指纹不符判定失效，避免点错。
+  function fingerprintOf(el) {
+    const tag = el.tagName.toLowerCase();
+    if (tag === 'label') return `label|${visibleText(el, 120)}`;
+    if (tag === 'input') return `input|${String(el.type || '').toLowerCase()}|${cleanText(el.getAttribute('aria-label') || el.getAttribute('title') || el.placeholder || el.name || el.id || '')}`;
+    if (tag === 'textarea') return `textarea|${cleanText(el.getAttribute('aria-label') || el.getAttribute('title') || el.placeholder || el.name || el.id || '')}`;
+    if (tag === 'select') return `select|${labelOf(el)}`;
+    const role = (el.getAttribute('role') || '').toLowerCase();
+    const text = visibleText(el, 120) || labelOf(el);
+    return `${tag}|${role}|${text}`;
+  }
+
   async function fetchImage(url, timeoutMs = 2500) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -274,6 +288,7 @@
     await waitForStable(runId, 1000, 150);
     assertActive(runId);
     refMap.clear();
+    refFingerprints.clear();
     const targets = {};
     const targetMeta = {};
     let ref = 0;
@@ -291,6 +306,7 @@
         if (isInteractive(el)) {
           const id = ++ref;
           refMap.set(id, el);
+          refFingerprints.set(id, fingerprintOf(el));
           const description = descriptionOf(el, id);
           targets[id] = description;
           const target = el.tagName === 'LABEL' ? targetForLabel(el) || el : el;
@@ -320,6 +336,7 @@
           if (isToggle && own) {
             const id = ++ref;
             refMap.set(id, el);
+            refFingerprints.set(id, fingerprintOf(el));
             const description = `[${id}] 选项「${cleanText(own, 60)}」 类型:${controlled.type === 'radio' ? '单选' : '复选'} ${controlled.checked ? '已选中' : '未选'}`;
             targets[id] = description;
             targetMeta[id] = { description, tag: 'label', type: controlled.type, role: '', inForm: !!controlled.closest('form'), submitsForm: false, sensitive: isSensitive(controlled) };
@@ -335,6 +352,7 @@
           if (own) {
             const id = ++ref;
             refMap.set(id, el);
+            refFingerprints.set(id, fingerprintOf(el));
             const description = `[${id}] 列表项「${own}」`;
             targets[id] = description;
             targetMeta[id] = { description, tag: 'li', type: '', role: '', inForm: false, submitsForm: false, sensitive: false };
@@ -396,6 +414,10 @@
     }
     if (!element) return { error: errorResult('TARGET_NOT_FOUND', action.ref != null ? `编号 ${action.ref} 不存在或已过期` : '找不到目标元素') };
     if (!element.isConnected) return { error: errorResult('STALE_TARGET', '目标元素已被页面移除') };
+    if (action.ref != null && options.verifyFingerprint !== false) {
+      const recorded = refFingerprints.get(Number(action.ref));
+      if (recorded && fingerprintOf(element) !== recorded) return { error: errorResult('STALE_TARGET', `编号 ${action.ref} 的目标内容已变化，请重新读取页面`) };
+    }
     if (!options.allowHidden && isHidden(element)) return { error: errorResult('TARGET_HIDDEN', '目标元素当前不可见') };
     const target = element.tagName === 'LABEL' ? targetForLabel(element) || element : element;
     if (target.disabled || target.getAttribute('aria-disabled') === 'true') return { error: errorResult('TARGET_DISABLED', '目标元素已禁用') };
@@ -671,8 +693,8 @@
 
   async function executeBatch(message) {
     if (!message.runId || !message.operationId || !message.snapshotId) return { results: [errorResult('INVALID_REQUEST', '缺少 runId、operationId 或 snapshotId')] };
-    if (message.snapshotId !== currentSnapshotId || currentSnapshotUrl !== location.href || currentSnapshotMutationVersion !== mutationVersion) {
-      return { results: [errorResult('STALE_SNAPSHOT', '页面已在快照后发生变化，请重新读取页面')] };
+    if (message.snapshotId !== currentSnapshotId || currentSnapshotUrl !== location.href) {
+      return { results: [errorResult('STALE_SNAPSHOT', '页面已跳转或快照已重建，请重新读取页面')] };
     }
     if (!Array.isArray(message.actions) || message.actions.length < 1 || message.actions.length > 20) return { results: [errorResult('INVALID_ACTIONS', '操作数量必须为 1-20')] };
     if (executing) return { results: [errorResult('BUSY', '页面正在执行另一批操作')] };
@@ -690,7 +712,7 @@
         try {
           const result = await executeAction(message.actions[index], message.runId, 0, true); // 完全访问权限：不再要求审批
           results.push(result);
-          if (!result.ok && !['WAIT_TIMEOUT', 'TARGET_NOT_FOUND'].includes(result.code)) {
+          if (!result.ok && !['WAIT_TIMEOUT', 'TARGET_NOT_FOUND', 'STALE_TARGET', 'TARGET_HIDDEN'].includes(result.code)) {
             for (let rest = index + 1; rest < message.actions.length; rest++) results.push(errorResult('SKIPPED_AFTER_FAILURE', '前序操作失败，已跳过'));
             break;
           }
