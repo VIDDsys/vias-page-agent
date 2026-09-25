@@ -170,3 +170,44 @@ test('Element UI 风格：opacity:0 隐藏 input 的 label 选项必须拿到编
   assert.deepEqual(radioChecked, [true, false]);
   await page.close();
 });
+
+test('嵌套交互容器/label 不吞控件或重复映射，checked/value 变化不破坏同批多选', async () => {
+  const page = await openQuizPage();
+  try {
+    await page.evaluate(() => {
+      const container = document.createElement('div');
+      container.setAttribute('role', 'button');
+      document.body.prepend(container);
+      document.querySelectorAll('.opt').forEach((label) => {
+        label.setAttribute('onclick', 'void 0');
+        container.append(label);
+      });
+      const extra = document.createElement('button');
+      extra.type = 'button';
+      extra.textContent = 'Nested label action';
+      extra.id = 'nested-label-button';
+      document.querySelector('#optA').append(extra);
+      window.extraClicks = 0;
+      extra.addEventListener('click', () => window.extraClicks++);
+      container.insertAdjacentHTML('beforeend', '<label for="cA">Duplicate A label</label><input id="cE" type="checkbox"><label for="cE">External E label</label>');
+      document.querySelector('#cA').addEventListener('change', () => {
+        document.querySelectorAll('input').forEach((input) => { input.value = `changed-${input.id}`; });
+      });
+    });
+    const snap = await send(page, { type: 'EXTRACT', runId: 'nested-run', maxLen: 16000 });
+    const refs = Object.entries(snap.targets).filter(([, description]) => description.includes('类型:复选')).map(([ref]) => Number(ref));
+    assert.equal(refs.length, 5, 'label 与其控件，以及多个 for label 不得重复编号');
+    const nested = Object.entries(snap.targets).find(([, description]) => /按钮「Nested label action」/.test(description));
+    assert.ok(nested, 'label 内其他真正的按钮也必须枚举');
+    const result = await send(page, {
+      type: 'EXECUTE', runId: 'nested-run', operationId: 'nested-batch', snapshotId: snap.snapshotId,
+      actions: [...refs.map((ref) => ({ action: 'check', ref })), { action: 'check', ref: refs[0] }, { action: 'click', ref: Number(nested[0]) }],
+    });
+    assert.ok(result.results.every((item) => item.ok), JSON.stringify(result.results));
+    assert.equal(result.results[5].code, 'NO_CHANGE');
+    assert.deepEqual(await page.locator('input[type="checkbox"]').evaluateAll((inputs) => inputs.map((input) => input.checked)), [true, true, true, true, true]);
+    assert.equal(await page.evaluate(() => window.extraClicks), 1);
+  } finally {
+    await page.close();
+  }
+});

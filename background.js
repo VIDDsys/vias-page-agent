@@ -155,10 +155,13 @@ function contentLength(content) {
   return 0;
 }
 
-function trimMessages(messages, protectedHead, limit = 90000) {
+function trimMessages(messages, protectedHead, latestObservation, limit = 90000) {
   let total = messages.reduce((sum, message) => sum + contentLength(message.content), 0);
-  while (total > limit && messages.length > protectedHead + 4) {
-    const dropped = messages.splice(protectedHead, 2);
+  while (total > limit && messages.length > protectedHead + 2) {
+    let index = protectedHead;
+    while (index < messages.length - 2 && (messages[index] === latestObservation || messages[index + 1] === latestObservation)) index += 2;
+    if (index >= messages.length - 2) break;
+    const dropped = messages.splice(index, 2);
     total -= dropped.reduce((sum, message) => sum + contentLength(message.content), 0);
   }
 }
@@ -220,6 +223,27 @@ function displayAction(action, page) {
   return display;
 }
 
+function instructionHistory(parsed, actions, page) {
+  const compact = (action) => {
+    const item = { ...action };
+    if (typeof item.value === 'string' && item.value.length > 1024) {
+      item.valuePreview = item.value.slice(0, 1024);
+      item.valueLength = item.value.length;
+      delete item.value;
+    }
+    if (item.actions) item.actions = item.actions.map(compact);
+    return item;
+  };
+  const summary = { say: parsed.say.slice(0, 2048), actions: actions.map((action) => compact(displayAction(action, page))), done: parsed.done };
+  let text = JSON.stringify(summary);
+  if (text.length > 12000) {
+    summary.actions = actions.map((action) => ({ action: action.action, ref: action.ref, times: action.times, subActionCount: action.actions?.length }));
+    summary.detailsOmitted = true;
+    text = JSON.stringify(summary);
+  }
+  return text;
+}
+
 function approvalReason(actions, page, question) {
   const explicitlyRequiresConfirmation = /(提交前.{0,12}确认|确认后.{0,12}提交|先问我|让我确认)/i.test(question);
   const inspect = (items) => {
@@ -276,14 +300,6 @@ function summarizeResults(results) {
   });
 }
 
-function compressFeedback(feedback) {
-  if (!feedback) return;
-  const text = typeof feedback.content === 'string'
-    ? feedback.content
-    : feedback.content.find((part) => part.type === 'text')?.text || '';
-  feedback.content = `${text.split('\n【页面】')[0]}\n（本轮旧页面快照已省略，最新页面见最后一条消息）`;
-}
-
 let activeRun = null;
 let currentStatus = '';
 
@@ -294,6 +310,7 @@ function createRun(port, runId, tabId) {
     activeTabId: tabId,
     tabIds: new Set([tabId]),
     candidateTabs: [],
+    navigationVersions: new Map(),
     executionTabId: null,
     expectingNewTabUntil: 0,
     cancelled: false,
@@ -331,6 +348,7 @@ function requestModel(run, cfg, messages) {
   const requestId = randomId('model');
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
+      emit(run, 'model_cancel', { requestId });
       run.pendingModels.delete(requestId);
       reject(new Error('侧边栏模型请求超时'));
     }, 195000);
@@ -359,16 +377,19 @@ function requestApproval(run, reason, actions, page) {
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function waitForTabReady(tabId, timeoutMs = 5000) {
+async function waitForTabReady(tabId, run, previousUrl = '', timeoutMs = 15000, previousNavigation = 0) {
   const deadline = Date.now() + timeoutMs;
+  let sawLoading = false;
   while (Date.now() < deadline) {
+    if (run.cancelled) return null;
     try {
       const tab = await chrome.tabs.get(tabId);
-      if (tab.status === 'complete' && tab.url) return tab;
+      sawLoading ||= tab.status === 'loading' || (run.navigationVersions.get(tabId) || 0) > previousNavigation;
+      if (tab.status === 'complete' && tab.url && (!previousUrl || tab.url !== previousUrl || sawLoading)) return tab;
     } catch { return null; }
     await delay(100);
   }
-  try { return await chrome.tabs.get(tabId); } catch { return null; }
+  return null;
 }
 
 function historyMessages(history) {
@@ -394,6 +415,7 @@ function historyMessages(history) {
 
 async function agentLoop(run, question, options) {
   const state = await getState();
+  if (run.cancelled) return { outcome: 'cancelled' };
   const cfg = activeModelOf(state);
   if (!cfg?.baseUrl || !cfg.model) throw new Error('未配置模型：请在设置中添加 API 地址、Key 和模型名');
   const validatedCfg = globalThis.ViasCore.validateModel(cfg);
@@ -408,10 +430,15 @@ async function agentLoop(run, question, options) {
   };
   const onTabRemoved = (tabId) => {
     run.tabIds.delete(tabId);
+    run.navigationVersions.delete(tabId);
     if (tabId === run.activeTabId) void cancelRun(run, '任务标签页已关闭');
+  };
+  const onTabUpdated = (tabId, change) => {
+    if (run.tabIds.has(tabId) && change.status === 'loading') run.navigationVersions.set(tabId, (run.navigationVersions.get(tabId) || 0) + 1);
   };
   chrome.tabs.onCreated.addListener(onTabCreated);
   chrome.tabs.onRemoved.addListener(onTabRemoved);
+  chrome.tabs.onUpdated.addListener(onTabUpdated);
 
   try {
     emit(run, 'status', { text: '读取页面…' });
@@ -421,34 +448,46 @@ async function agentLoop(run, question, options) {
     } catch {
       throw new Error('无法读取该页面；浏览器内部页面、扩展商店和受限页面不支持');
     }
+    if (run.cancelled) return { outcome: 'cancelled' };
     if (!page?.snapshotId) throw new Error('页面快照无效，请重载扩展后重试');
     let images = await ensureImages(run.activeTabId, page, validatedCfg.vision);
     if (images.length) emit(run, 'status', { text: `已附带 ${images.length} 张页面图片` });
 
     const flat = historyMessages(options.history || []);
-    let taskContent = toMultimodal(`当前页面: ${page.title}\nURL: ${page.url}\n\n页面内容:\n${page.text}\n\n任务: ${question}`, images);
-    if (flat.at(-1)?.role === 'user') {
-      const previous = flat.pop().content + '\n\n';
-      taskContent = typeof taskContent === 'string'
-        ? previous + taskContent
-        : [{ type: 'text', text: previous + taskContent[0].text }, ...taskContent.slice(1)];
-    }
+    let taskSummary = `任务: ${question}`;
+    if (flat.at(-1)?.role === 'user') taskSummary = `${flat.pop().content}\n\n${taskSummary}`;
+    const taskContent = toMultimodal(`${taskSummary}\n\n【页面】\n当前页面: ${page.title}\nURL: ${page.url}\n\n页面内容:\n${page.text}`, images);
     const messages = [{ role: 'system', content: system }, ...flat, { role: 'user', content: taskContent }];
     const protectedHead = flat.length + 2;
-    let lastFeedback = null;
+    let lastFeedback = messages.at(-1);
+    let lastFeedbackSummary = taskSummary;
     let finalSay = '';
     let previousOperationKey = '';
+    let previousScrollResult = '';
     let repeatedOperationCount = 0;
     let failedRounds = 0;
     let lastRoundFailed = false;
     let emptyReplyNudges = 0;
+    let invalidActionRounds = 0;
+
+    function appendObservation(historyReply, summary) {
+      lastFeedback.content = `${lastFeedbackSummary}\n（旧页面快照已省略，最新页面见最后一条观察消息）`;
+      lastFeedbackSummary = summary;
+      messages.push({ role: 'assistant', content: historyReply });
+      lastFeedback = {
+        role: 'user',
+        content: toMultimodal(`${summary}\n\n【页面】\n当前页面: ${page.title}\nURL: ${page.url}\n最新页面状态（编号已刷新，只能使用本次编号）:\n${page.text || '(无法读取)'}\n\n请基于结果继续。`, images),
+      };
+      messages.push(lastFeedback);
+    }
 
     for (let step = 0; step < maxSteps; step++) {
       if (run.cancelled) return { outcome: 'cancelled' };
+      trimMessages(messages, protectedHead, lastFeedback);
       emit(run, 'status', { text: `第 ${step + 1} 轮：模型分析中…` });
       const reply = await requestModel(run, validatedCfg, messages);
       if (run.cancelled) return { outcome: 'cancelled' };
-      const parsed = globalThis.ViasCore.parseReply(reply);
+      const parsed = allowActions ? globalThis.ViasCore.parseReply(reply) : { say: reply, actions: [], done: true };
       if (parsed.say) {
         finalSay = parsed.say;
         emit(run, 'say', { text: parsed.say });
@@ -462,9 +501,8 @@ async function agentLoop(run, question, options) {
           emit(run, 'say', { text: '多次未收到实际操作或完成信号，为避免空转已停止。' });
           return { outcome: 'stalled' };
         }
-        messages.push({ role: 'assistant', content: reply });
-        messages.push({ role: 'user', content: `【任务】${question}\n\n你这条回复只有说明文字，既没有 actions 也没有 done——任务尚未确认完成。请依据最新页面下发具体操作（如 {"action":"check","ref":N} 或 {"action":"checkRadio","ref":N}）继续推进；若确实已全部完成，请输出 {"say":"…最终总结…","done":true,"actions":[]}。` });
-        trimMessages(messages, protectedHead);
+        messages.push({ role: 'assistant', content: reply.slice(0, 20000) });
+        messages.push({ role: 'user', content: '你这条回复只有说明文字，既没有 actions 也没有 done——任务尚未确认完成。请依据最新页面下发具体操作继续推进；若确实已全部完成，请输出 {"say":"…最终总结…","done":true,"actions":[]}。' });
         continue;
       }
 
@@ -472,15 +510,20 @@ async function agentLoop(run, question, options) {
       try {
         actions = validateActions(parsed.actions);
       } catch (error) {
-        messages.push({ role: 'assistant', content: reply });
-        messages.push({ role: 'user', content: `工具参数无效：${error.message}\n请修正 JSON 操作；不要声称操作已完成。` });
+        invalidActionRounds += 1;
+        if (invalidActionRounds >= 3) {
+          emit(run, 'say', { text: '模型连续三轮返回无效操作参数，已停止以避免无效调用。' });
+          return { outcome: 'stalled' };
+        }
+        messages.push({ role: 'assistant', content: reply.slice(0, 4000) });
+        messages.push({ role: 'user', content: `工具参数无效：${String(error.message).slice(0, 500)}\n请修正 JSON 操作；不要声称操作已完成。` });
         continue;
       }
+      invalidActionRounds = 0;
+      const historyReply = instructionHistory(parsed, actions, page);
       const operationKey = JSON.stringify(actions);
-      repeatedOperationCount = operationKey === previousOperationKey ? repeatedOperationCount + 1 : 0;
-      previousOperationKey = operationKey;
-      if (repeatedOperationCount >= 2) {
-        emit(run, 'say', { text: '检测到重复执行相同操作，为避免误操作已停止。' });
+      if (operationKey === previousOperationKey && repeatedOperationCount >= 2) {
+        emit(run, 'say', { text: '重复操作后页面仍无进展，已停止以避免无效执行。' });
         return { outcome: 'stalled' };
       }
 
@@ -488,63 +531,79 @@ async function agentLoop(run, question, options) {
       const approved = true;
       if (run.cancelled) return { outcome: 'cancelled' };
 
-      // 唯一的提交硬闸（不是审批、不打断全自动）：上一轮零成功却直接尝试提交，几乎必是空转后的误交卷——拦下这一次，逼模型先重读核对。
+      // 零成功后的提交只拦一次，并提供真正的新快照供下一轮核对。
       if (lastRoundFailed && batchTouchesSubmit(actions, page)) {
-        failedRounds += 1;
-        messages.push({ role: 'assistant', content: reply });
-        messages.push({ role: 'user', content: `【任务】${question}\n\n上一轮没有任何操作成功，本轮却尝试提交——已拦下这次提交，以免在未经确认的页面状态上误交卷。请重新读取页面、依据选项 state 核对状态后再决定下一步，不要直接提交。` });
-        trimMessages(messages, protectedHead);
-        if (failedRounds >= 3) {
-          emit(run, 'say', { text: '页面连续未能执行有效操作且反复尝试提交，已停止以避免误交卷。' });
-          return { outcome: 'stalled' };
-        }
+        emit(run, 'status', { text: '提交前重新读取页面…' });
+        const freshPage = await csSend(run.activeTabId, { type: 'EXTRACT', runId: run.runId, includeImages: validatedCfg.vision });
+        if (run.cancelled) return { outcome: 'cancelled' };
+        if (!freshPage?.snapshotId) throw new Error('提交前无法取得新快照，任务已停止');
+        page = freshPage;
+        images = await ensureImages(run.activeTabId, page, validatedCfg.vision);
+        lastRoundFailed = false;
+        appendObservation(historyReply, '上一轮没有任何操作成功，已拦下这一次提交并重新读取页面。请依据最新选项 state 核对；确认符合任务要求后，下一轮可继续提交。');
         continue;
       }
 
+      const beforePage = { url: page.url, text: page.text, documentId: page.snapshotId.split(':')[0] };
       emit(run, 'status', { text: `第 ${step + 1} 轮：执行 ${actions.length} 个操作…` });
       emit(run, 'actions', { round: step + 1, actions: actions.map((action) => displayAction(action, page)) });
       const operationId = randomId(`op-${step + 1}`);
       const executionTabId = run.activeTabId;
+      const navigationVersion = run.navigationVersions.get(executionTabId) || 0;
       run.executionTabId = executionTabId;
       run.candidateTabs = [];
       run.expectingNewTabUntil = Date.now() + 4000;
       let exec;
       try {
-        exec = await csSend(executionTabId, { type: 'EXECUTE', runId: run.runId, operationId, snapshotId: page.snapshotId, approved, actions });
+        exec = await csSend(executionTabId, { type: 'EXECUTE', runId: run.runId, operationId, snapshotId: page.snapshotId, approved, actions, includeImages: validatedCfg.vision });
       } catch (error) {
         run.expectingNewTabUntil = 0;
         if (run.cancelled) return { outcome: 'cancelled' };
+        await waitForTabReady(run.activeTabId, run);
+        if (run.cancelled) return { outcome: 'cancelled' };
         let freshPage = null;
         try { freshPage = await csSend(run.activeTabId, { type: 'EXTRACT', runId: run.runId, includeImages: validatedCfg.vision }); } catch {}
-        messages.push({ role: 'assistant', content: reply });
-        messages.push({ role: 'user', content: freshPage?.snapshotId
-          ? `【任务】${question}\n\n操作通信失败：${error.message}\n\n【页面】\n已重新读取页面（编号已刷新）：\n${freshPage.text}\n请基于新页面继续，不要直接重复提交类操作。`
-          : `操作通信失败：${error.message}\n无法重新读取页面，请说明情况并停止操作。` });
-        if (freshPage?.snapshotId) page = freshPage;
+        if (run.cancelled) return { outcome: 'cancelled' };
+        if (!freshPage?.snapshotId) throw new Error('操作通信失败且无法重新读取页面，任务已停止');
+        failedRounds += 1;
+        lastRoundFailed = true;
+        if (failedRounds >= 3) {
+          emit(run, 'say', { text: '页面连续三轮通信失败，已停止以避免无效调用。' });
+          return { outcome: 'stalled' };
+        }
+        page = freshPage;
+        images = await ensureImages(run.activeTabId, page, validatedCfg.vision);
+        appendObservation(historyReply, `操作通信失败：${String(error.message).slice(0, 500)}\n已重新读取页面，请核对结果，不要直接重复提交类操作。`);
         continue;
       }
       run.expectingNewTabUntil = 0;
+      let followedNewTab = false;
       const candidate = run.candidateTabs.at(-1);
       if (candidate) {
-        const candidateTab = await waitForTabReady(candidate.id);
-        if (candidateTab?.url) {
-          let sameOrigin = false;
-          try { sameOrigin = new URL(candidateTab.url).origin === new URL(page.url).origin; } catch {}
-          const mayFollow = sameOrigin || true; // 完全访问权限：跨站新标签页也自动跟随
-          if (mayFollow && !run.cancelled) {
-            run.activeTabId = candidate.id;
-            run.lastTabFollowAt = Date.now();
-            emit(run, 'status', { text: '已跟随到操作打开的新标签页' });
-          }
-        }
+        const candidateTab = await waitForTabReady(candidate.id, run);
+        if (run.cancelled) return { outcome: 'cancelled' };
+        if (!candidateTab?.url) throw new Error('新标签页未能加载完成，任务已停止');
+        run.activeTabId = candidate.id;
+        followedNewTab = true;
+        emit(run, 'status', { text: '已跟随到操作打开的新标签页' });
       }
       run.candidateTabs = [];
       const results = Array.isArray(exec?.results) ? exec.results : [{ ok: false, code: 'INVALID_RESPONSE', msg: '页面执行器返回无效' }];
       results.forEach((result, index) => emit(run, 'result', { round: step + 1, index, ok: result.ok === true, msg: result.msg || result.error || '', state: result.state || '', code: result.code || '' }));
-      const recoverable = results.some((result) => ['STALE_SNAPSHOT', 'STALE_TARGET', 'BUSY', 'INVALID_RESPONSE'].includes(result.code));
-      if ((recoverable || !exec?.page?.snapshotId) && !run.cancelled) {
-        try { exec.page = await csSend(run.activeTabId, { type: 'EXTRACT', runId: run.runId, includeImages: validatedCfg.vision }); } catch {}
+      const navigating = results.some((result) => ['NAVIGATING', 'NAVIGATED'].includes(result.code))
+        || (run.navigationVersions.get(executionTabId) || 0) > navigationVersion;
+      if (navigating && !followedNewTab) {
+        emit(run, 'status', { text: '等待页面跳转完成…' });
+        const ready = await waitForTabReady(run.activeTabId, run, beforePage.url, 15000, navigationVersion);
+        if (run.cancelled) return { outcome: 'cancelled' };
+        if (!ready) throw new Error('页面跳转未完成，已停止，未继续操作旧页面');
       }
+      let nextPage = exec?.page;
+      const recoverable = results.some((result) => ['STALE_SNAPSHOT', 'STALE_TARGET', 'BUSY', 'INVALID_RESPONSE'].includes(result.code));
+      if ((followedNewTab || navigating || recoverable || !nextPage?.snapshotId) && !run.cancelled) {
+        try { nextPage = await csSend(run.activeTabId, { type: 'EXTRACT', runId: run.runId, includeImages: validatedCfg.vision }); } catch { nextPage = null; }
+      }
+      if (run.cancelled) return { outcome: 'cancelled' };
       const roundSucceeded = results.some((result) => result.ok);
       failedRounds = roundSucceeded ? 0 : failedRounds + 1;
       lastRoundFailed = !roundSucceeded;
@@ -554,30 +613,27 @@ async function agentLoop(run, question, options) {
         return { outcome: 'stalled' };
       }
 
-      compressFeedback(lastFeedback);
-      const followedNewTab = Date.now() - (run.lastTabFollowAt || 0) < 8000;
-      if (followedNewTab) {
-        try { page = await csSend(run.activeTabId, { type: 'EXTRACT', runId: run.runId, includeImages: validatedCfg.vision }); }
-        catch { page = exec.page; }
-      } else {
-        page = exec.page;
-      }
+      page = nextPage;
       if (!page?.snapshotId) throw new Error('操作后未获得有效页面快照');
+      if (navigating && !followedNewTab && page.url === beforePage.url && page.snapshotId.split(':')[0] === beforePage.documentId) {
+        throw new Error('跳转未产生新文档或 URL 变化，已停止，未继续操作旧页面');
+      }
+      const scrollResult = results.filter((result, index) => result.ok && actions[index]?.action === 'scroll').map((result) => result.msg || '').join('|');
+      const madeProgress = beforePage.url !== page.url || beforePage.text !== page.text
+        || (scrollResult && scrollResult !== previousScrollResult);
+      repeatedOperationCount = madeProgress ? 0 : (operationKey === previousOperationKey ? repeatedOperationCount + 1 : 1);
+      previousOperationKey = operationKey;
+      previousScrollResult = scrollResult;
       images = await ensureImages(run.activeTabId, page, validatedCfg.vision);
-      const followNote = followedNewTab ? '刚才已成功打开并跟随到新标签页。\n' : '';
-      messages.push({ role: 'assistant', content: reply });
-      lastFeedback = {
-        role: 'user',
-        content: toMultimodal(`【任务】${question}\n\n操作结果: ${JSON.stringify(summarizeResults(results))}\n\n${followNote}【页面】\n最新页面状态（编号已刷新，只能使用本次编号）:\n${page.text || '(无法读取)'}\n\n请基于结果继续。`, images),
-      };
-      messages.push(lastFeedback);
-      trimMessages(messages, protectedHead);
+      const followNote = followedNewTab ? '\n刚才已成功打开并跟随到新标签页。' : '';
+      appendObservation(historyReply, `操作结果: ${JSON.stringify(summarizeResults(results))}${followNote}`);
     }
     emit(run, 'status', { text: `已达到最大轮数 ${maxSteps}` });
     return { outcome: 'limit', finalSay };
   } finally {
     chrome.tabs.onCreated.removeListener(onTabCreated);
     chrome.tabs.onRemoved.removeListener(onTabRemoved);
+    chrome.tabs.onUpdated.removeListener(onTabUpdated);
   }
 }
 

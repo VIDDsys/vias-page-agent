@@ -70,6 +70,12 @@
   <button id="btnSavePrompt" class="primary">保存提示词</button>
   <span id="promptStatus" class="status" role="status" aria-live="polite"></span>
 </div>
+<section id="promptConflict" class="card" hidden aria-label="提示词冲突恢复">
+  <p>设置已更新，未保存的草稿仍保留在上方。请对照下方最新提示词，按需合并到草稿，再点击「保留草稿并继续」后重新保存；不会自动覆盖其他窗口。</p>
+  <label for="latestPrompt">最新已保存的提示词（只读）</label>
+  <textarea id="latestPrompt" readonly></textarea>
+  <button id="btnRebasePrompt" type="button">保留草稿并继续</button>
+</section>
 
 <script src="core.js"></script>
 <script src="options.js"></script>

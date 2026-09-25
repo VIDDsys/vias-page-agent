@@ -20,6 +20,7 @@ let sessionKey = '';
 let initialized = false;
 let currentModelId = '';
 let menuModels = [];
+let modelRefreshId = 0;
 let persistQueue = Promise.resolve();
 let autoStick = true;
 let toastTimer;
@@ -217,39 +218,85 @@ function setMode(value) {
 modeAsk.addEventListener('click', () => setMode(false));
 modeAgent.addEventListener('click', () => setMode(true));
 
+function boundedHistory(items) {
+  return items.slice(-100).map((item) => ({ role: item.role, content: String(item.content || '').slice(0, 20000) }));
+}
+
+function queueSessionWrite(operation) {
+  const next = persistQueue.then(operation);
+  // Keep the queue usable after failure, but let each caller report its own error.
+  persistQueue = next.catch(() => {});
+  return next;
+}
+
 function persist() {
-  if (!sessionKey) return Promise.resolve();
-  const snapshot = history.slice(-100).map((item) => ({ role: item.role, content: String(item.content || '').slice(0, 20000) }));
-  persistQueue = persistQueue.then(() => chrome.storage.session.set({ [sessionKey]: snapshot })).catch((error) => {
+  const key = sessionKey;
+  if (!key) return Promise.resolve();
+  const snapshot = boundedHistory(history);
+  return queueSessionWrite(() => chrome.storage.session.set({ [key]: snapshot })).catch((error) => {
     addMessage('sys', `对话保存失败：${error.message}`);
   });
-  return persistQueue;
 }
 
 async function initializeHistory(windowId) {
   sessionKey = `chat:${windowId}`;
   const stored = await chrome.storage.session.get([sessionKey, 'chat']);
   const saved = Array.isArray(stored[sessionKey]) ? stored[sessionKey] : Array.isArray(stored.chat) ? stored.chat : [];
-  history = saved.filter((item) => item && ['user', 'assistant'].includes(item.role) && typeof item.content === 'string').slice(-100);
+  history = boundedHistory(saved.filter((item) => item && ['user', 'assistant'].includes(item.role) && typeof item.content === 'string'));
   if (!stored[sessionKey] && Array.isArray(stored.chat)) {
-    await chrome.storage.session.set({ [sessionKey]: history });
-    await chrome.storage.session.remove('chat');
+    const key = sessionKey;
+    const snapshot = boundedHistory(history);
+    await queueSessionWrite(async () => {
+      await chrome.storage.session.set({ [key]: snapshot });
+      await chrome.storage.session.remove('chat');
+    });
   }
   for (const item of history) addMessage(item.role === 'user' ? 'user' : 'ai', item.content);
 }
 
-function toggleMenu(open) {
+function positionModelMenu() {
+  if (!modelMenu.classList.contains('show')) return;
+  const viewport = window.visualViewport;
+  const left = (viewport?.offsetLeft || 0) + 8;
+  const top = (viewport?.offsetTop || 0) + 8;
+  const right = left + (viewport?.width || innerWidth) - 16;
+  const bottom = top + (viewport?.height || innerHeight) - 16;
+  const rect = modelPill.getBoundingClientRect();
+  const scrollTop = modelMenu.scrollTop;
+  modelMenu.style.minWidth = `${Math.min(150, right - left)}px`;
+  modelMenu.style.maxWidth = `${Math.min(240, right - left)}px`;
+  modelMenu.style.maxHeight = 'none';
+  const naturalHeight = modelMenu.getBoundingClientRect().height;
+  const below = Math.max(0, bottom - rect.bottom - 6);
+  const above = Math.max(0, rect.top - 6 - top);
+  const opensDown = naturalHeight <= below || below >= above;
+  modelMenu.style.maxHeight = `${Math.min(bottom - top, opensDown ? below : above)}px`;
+  const size = modelMenu.getBoundingClientRect();
+  modelMenu.style.left = `${Math.max(left, Math.min(rect.left, right - size.width))}px`;
+  modelMenu.style.top = `${Math.max(top, Math.min(opensDown ? rect.bottom + 6 : rect.top - 6 - size.height, bottom - size.height))}px`;
+  modelMenu.scrollTop = scrollTop;
+  if (modelMenu.contains(document.activeElement)) document.activeElement.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+}
+
+function focusMenuItem(item) {
+  if (!item) return;
+  for (const button of modelMenu.querySelectorAll('button')) button.tabIndex = button === item ? 0 : -1;
+  item.focus({ preventScroll: true });
+  item.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+}
+
+function toggleMenu(open, restoreFocus = true) {
   const next = open ?? !modelMenu.classList.contains('show');
   if (next && !activeRun) {
-    const rect = modelPill.getBoundingClientRect();
-    modelMenu.style.left = `${Math.max(8, Math.min(rect.left, innerWidth - 240))}px`;
-    modelMenu.style.top = `${rect.bottom + 6}px`;
     modelMenu.classList.add('show');
     modelPill.setAttribute('aria-expanded', 'true');
-    modelMenu.querySelector('button')?.focus();
+    positionModelMenu();
+    focusMenuItem(modelMenu.querySelector('[aria-checked="true"]') || modelMenu.querySelector('button'));
   } else {
+    const wasOpen = modelMenu.classList.contains('show');
     modelMenu.classList.remove('show');
     modelPill.setAttribute('aria-expanded', 'false');
+    if (wasOpen && restoreFocus) modelPill.focus({ preventScroll: true });
   }
 }
 
@@ -263,18 +310,27 @@ function runtimeMessage(message) {
   });
 }
 
+function setModelLabel(model) {
+  modelPill.textContent = model ? `${model.name || '未命名模型'} ▾` : '＋ 配置模型';
+  modelPill.title = model ? `切换模型：${model.name || '未命名模型'}` : '配置模型';
+}
+
 async function refreshModels() {
+  const refreshId = ++modelRefreshId;
   const state = await runtimeMessage({ type: 'GET_SETTINGS' });
+  // Requests from an ended run (or an older refresh) cannot relabel a new run.
+  if (refreshId !== modelRefreshId || activeRun) return null;
   if (!state?.ok) throw new Error(state?.error || '无法读取模型设置');
   menuModels = state.models || [];
   currentModelId = state.activeModelId || '';
   const current = menuModels.find((model) => model.id === currentModelId);
-  modelPill.textContent = current ? `${current.name || '未命名模型'} ▾` : '＋ 配置模型';
+  setModelLabel(current);
   renderModelMenu();
   return current;
 }
 
 function renderModelMenu() {
+  const focusedId = modelMenu.contains(document.activeElement) ? document.activeElement.dataset.modelId : null;
   modelMenu.innerHTML = '';
   for (const model of menuModels) {
     const item = document.createElement('button');
@@ -282,13 +338,16 @@ function renderModelMenu() {
     item.role = 'menuitemradio';
     item.className = `model-item${model.id === currentModelId ? ' on' : ''}`;
     item.setAttribute('aria-checked', String(model.id === currentModelId));
+    item.dataset.modelId = model.id;
+    item.tabIndex = -1;
     item.textContent = model.name || '未命名模型';
     item.addEventListener('click', async () => {
+      if (activeRun) return;
+      toggleMenu(false);
       try {
         const response = await runtimeMessage({ type: 'UPDATE_SETTINGS', operation: 'setActive', id: model.id });
         if (!response?.ok) throw new Error(response?.error || '切换失败');
         await refreshModels();
-        toggleMenu(false);
         addMessage('sys', `已切换模型：${model.name || '未命名模型'}`);
       } catch (error) { addMessage('sys', `切换模型失败：${error.message}`); }
     });
@@ -298,26 +357,59 @@ function renderModelMenu() {
   manage.type = 'button';
   manage.role = 'menuitem';
   manage.className = 'model-item manage';
+  manage.dataset.modelId = '';
+  manage.tabIndex = -1;
   manage.textContent = '管理模型…';
   manage.addEventListener('click', () => { toggleMenu(false); chrome.runtime.openOptionsPage(); });
   modelMenu.appendChild(manage);
+  if (modelMenu.classList.contains('show')) {
+    positionModelMenu();
+    if (focusedId != null) focusMenuItem([...modelMenu.querySelectorAll('button')].find((item) => item.dataset.modelId === focusedId) || manage);
+  }
 }
 
 modelPill.setAttribute('aria-haspopup', 'menu');
+modelPill.setAttribute('aria-controls', 'modelMenu');
 modelPill.setAttribute('aria-expanded', 'false');
 modelPill.addEventListener('click', (event) => { event.stopPropagation(); toggleMenu(); });
-document.addEventListener('click', (event) => { if (!modelMenu.contains(event.target) && event.target !== modelPill) toggleMenu(false); });
-document.addEventListener('keydown', (event) => {
-  if (event.key === 'Escape' && modelMenu.classList.contains('show')) { toggleMenu(false); modelPill.focus(); }
+modelPill.addEventListener('keydown', (event) => {
+  if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key) || activeRun) return;
+  event.preventDefault();
+  toggleMenu(true);
+  const items = modelMenu.querySelectorAll('button');
+  focusMenuItem(items[['ArrowUp', 'End'].includes(event.key) ? items.length - 1 : 0]);
 });
+modelMenu.addEventListener('keydown', (event) => {
+  if (event.key === 'Tab') { toggleMenu(false); return; }
+  if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
+  event.preventDefault();
+  const items = [...modelMenu.querySelectorAll('button')];
+  const index = items.indexOf(document.activeElement);
+  const next = event.key === 'Home' ? 0 : event.key === 'End' ? items.length - 1
+    : (index + (event.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length;
+  focusMenuItem(items[next]);
+});
+document.addEventListener('click', (event) => { if (!modelMenu.contains(event.target) && event.target !== modelPill) toggleMenu(false, false); });
+document.addEventListener('focusin', (event) => { if (!modelMenu.contains(event.target) && event.target !== modelPill) toggleMenu(false, false); });
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && modelMenu.classList.contains('show')) { event.preventDefault(); toggleMenu(false); }
+});
+window.addEventListener('resize', positionModelMenu);
+document.addEventListener('scroll', (event) => { if (event.target !== modelMenu) positionModelMenu(); }, true);
+window.visualViewport?.addEventListener('resize', positionModelMenu);
+window.visualViewport?.addEventListener('scroll', positionModelMenu);
+const menuAnchorObserver = new ResizeObserver(positionModelMenu);
+menuAnchorObserver.observe(modelPill);
+menuAnchorObserver.observe(document.querySelector('footer'));
 
 $('#gear').addEventListener('click', () => chrome.runtime.openOptionsPage());
 clearButton.addEventListener('click', async () => {
-  if (activeRun) return;
+  if (activeRun || !sessionKey) return;
+  const key = sessionKey;
   history = [];
   chatEl.innerHTML = '';
-  try { await chrome.storage.session.remove(sessionKey); addMessage('sys', '已新建对话'); }
-  catch (error) { addMessage('sys', `新建失败：${error.message}`); }
+  try { await queueSessionWrite(() => chrome.storage.session.remove(key)); addMessage('sys', '已新建对话'); }
+  catch (error) { addMessage('sys', `新建失败：${error.message}（旧对话可能仍保存在本机，请重试新建）`); }
 });
 
 const CHIPS = [
@@ -358,17 +450,23 @@ function finishRun(context, outcome, error = '') {
   else if (outcome === 'cancelled') addMessage('sys', '任务已停止');
   else if (outcome === 'limit') addMessage('sys', '任务达到最大轮数后停止');
   else if (outcome === 'stalled') addMessage('sys', '任务因连续重复或无进展而安全停止');
+  void refreshModels().catch(() => {});
 }
 
 async function handleModelRequest(context, message) {
-  if (context.finished || activeRun !== context) return;
+  if (context.finished || context.stopRequested || activeRun !== context) return;
+  if (!context.modelLabel) {
+    // The worker captures the task's actual model; an idle settings refresh may still be in flight.
+    context.modelLabel = message.cfg?.name || '未命名模型';
+    setModelLabel({ name: context.modelLabel });
+  }
   const controller = new AbortController();
   context.modelControllers.set(message.requestId, controller);
   try {
     const text = await globalThis.ViasCore.callModel(message.cfg, message.messages, { signal: controller.signal, timeoutMs: 180000, retries: 2 });
-    if (!context.finished) context.port.postMessage({ t: 'model_response', runId: context.runId, requestId: message.requestId, text });
+    if (!context.finished && !context.stopRequested && activeRun === context) context.port.postMessage({ t: 'model_response', runId: context.runId, requestId: message.requestId, text });
   } catch (error) {
-    if (!context.finished) context.port.postMessage({ t: 'model_response', runId: context.runId, requestId: message.requestId, error: error.name === 'AbortError' ? '模型请求已取消' : error.message });
+    if (!context.finished && !context.stopRequested && activeRun === context) context.port.postMessage({ t: 'model_response', runId: context.runId, requestId: message.requestId, error: error.name === 'AbortError' ? '模型请求已取消' : error.message });
   } finally {
     context.modelControllers.delete(message.requestId);
   }
@@ -401,6 +499,8 @@ async function send() {
     stopRequested: false,
   };
   activeRun = context;
+  modelRefreshId += 1;
+  toggleMenu(false, false);
   setControlsRunning(true);
   setStatus('准备任务…');
   try {
@@ -453,7 +553,7 @@ async function send() {
     context.heartbeat = setInterval(() => {
       try { port.postMessage({ t: 'ping', runId: context.runId }); } catch {}
     }, 15000);
-    const conversation = history.slice(0, -1).map((item) => ({ role: item.role, content: String(item.content).slice(0, 20000) }));
+    const conversation = boundedHistory(history.slice(0, -1));
     port.postMessage({ t: 'RUN', runId: context.runId, tabId: tab.id, question, allowActions, maxSteps: allowActions ? 50 : 1, history: conversation });
   } catch (error) {
     finishRun(context, 'interrupted', error.message);

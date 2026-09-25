@@ -20,21 +20,22 @@ Edge 侧边栏网页操作 Agent（Manifest V3）。它读取当前页面，把�
 
 ## 工作机制
 
-- **快照定位**：每次提取生成新的 `snapshotId` 和元素编号（ref），模型只能用最新编号操作；页面变化后旧编号直接拒绝，防止误点。支持原生控件、ARIA 控件、富文本、列表项和 open Shadow DOM；密码字段脱敏。
+- **快照定位**：每次提取生成新的 `snapshotId` 和元素编号（ref），模型只能用最新编号操作；页面跳转或目标身份变化时拒绝旧操作，无关页面更新不影响有效目标。支持原生控件、ARIA 控件、富文本、列表项和 open Shadow DOM；敏感字段脱敏。
 - **操作幂等**：同一 `operationId` 只执行一次；`check` 不会反选已勾选项；`fill` 相同值不重复触发事件；`repeat` 禁止嵌套，可随时取消。
-- **任务隔离**：每个任务独立 `runId`，停止即取消在途请求和页面等待；连续重复操作或连续无进展自动熔断（重复 2 次 / 连续 3 轮无进展 / 单任务最多 50 轮）。
+- **任务隔离**：每个任务独立 `runId`，停止即取消在途请求和页面等待；相同操作连续两轮无进展、连续三轮执行/通信失败或无效参数时自动停止，正常推进的任务最多 50 轮。
+- **模型协议**：只接受最终回答，不执行推理草稿或截断输出；只有明确的 `done:true` 才判定任务完成。已失效的页面全文和图片不在后续请求中重复保留，操作历史使用有界摘要，不缩短实际执行的填写内容。
 - **执行模式**：所有操作自动执行、不弹确认，请只在自己负责的页面和账号上使用。
 
 ## 验证
 
 ```bash
-for f in core.js background.js content.js sidepanel.js options.js main-world.js; do node --check "$f"; done
-node --test tests/static.test.js
-# 安装 playwright-core@1.55.0 后：
-node tests/content.e2e.js
-node tests/extension.smoke.js
-node tests/agent.integration.js
+npm run check
+npm test
+# 安装 package.json 中的开发依赖并使用系统 Edge：
+npm run test:all
 ```
+
+`test:all` 覆盖语法、模型协议、任务循环、内容脚本、真实扩展加载、代理集成和侧栏/设置页。浏览器测试使用临时隔离配置及本地假模型，不读取日常浏览器配置，不调用付费接口。
 
 ## 已知边界
 

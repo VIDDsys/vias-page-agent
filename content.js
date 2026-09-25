@@ -23,6 +23,7 @@
   let extracting = false;
   let executing = false;
   let activeRunId = '';
+  let activeOperation = null;
 
   const mutationObserver = new MutationObserver((records) => {
     if (records.some((record) => record.type !== 'attributes' || ['id', 'role', 'type', 'name', 'class', 'style', 'hidden', 'disabled', 'readonly', 'href', 'value', 'aria-label', 'aria-hidden', 'aria-disabled', 'aria-checked', 'aria-expanded'].includes(record.attributeName))) mutationVersion++;
@@ -51,13 +52,29 @@
       || SENSITIVE_AUTOCOMPLETE.test(el.getAttribute('autocomplete') || '');
   }
 
+  function navigationResult() {
+    const operation = activeOperation;
+    if (!operation) return null;
+    const moved = location.href !== operation.startUrl;
+    if (!moved && !operation.navigationStarted) return null;
+    return {
+      ok: true,
+      code: moved ? 'NAVIGATED' : 'NAVIGATING',
+      ...(moved || operation.navigationUrl ? { navigationUrl: moved ? location.href : operation.navigationUrl } : {}),
+      msg: '页面正在或已经跳转，本批剩余操作已停止',
+    };
+  }
+
   function assertActive(runId) {
     if (!runId || cancelledRuns.has(runId) || (activeRunId && activeRunId !== runId)) throw new CancelledError();
+    const navigation = activeOperation?.runId === runId && navigationResult();
+    if (navigation) throw Object.assign(new Error(navigation.msg), navigation);
   }
 
   function sleep(ms, runId) {
     assertActive(runId);
-    const duration = Math.min(30000, Math.max(0, Number(ms) || 0));
+    // wait 自行限制 30 秒；repeat 的合法周期可达 60 秒，不能在公共等待中截短。
+    const duration = Math.min(60000, Math.max(0, Number(ms) || 0));
     return new Promise((resolve, reject) => {
       const started = performance.now();
       const tick = () => {
@@ -84,7 +101,10 @@
         clearTimeout(deadline);
         clearInterval(abortTimer);
       }
-      function done() { cleanup(); resolve(); }
+      function done() {
+        cleanup();
+        try { assertActive(runId); resolve(); } catch (error) { reject(error); }
+      }
       function scheduleQuiet() {
         clearTimeout(quietTimer);
         quietTimer = setTimeout(done, quiet);
@@ -140,7 +160,7 @@
   function visibleText(node, max = 120) {
     const parts = [];
     function visit(current) {
-      if (parts.join(' · ').length >= max) return;
+      if (isSensitive(current) || parts.join(' · ').length >= max) return;
       for (const child of current.childNodes || []) {
         if (child.nodeType === Node.TEXT_NODE) {
           const text = cleanText(child.textContent, max);
@@ -177,9 +197,9 @@
   function readState(el) {
     const target = el.tagName === 'LABEL' ? targetForLabel(el) || el : el;
     const tag = target.tagName.toLowerCase();
+    if (isSensitive(target)) return (target.value || (target.isContentEditable && target.textContent)) ? '已有敏感内容（已隐藏）' : '当前为空';
     if (tag === 'input' && ['checkbox', 'radio'].includes(target.type)) return target.checked ? '已选中' : '未选中';
     if (tag === 'select') return `当前选项=${cleanText(target.selectedOptions[0]?.textContent || target.value, 60)}`;
-    if (isSensitive(target)) return target.value ? '已有敏感内容（已隐藏）' : '当前为空';
     if (tag === 'input' || tag === 'textarea') return target.value ? `当前值="${cleanText(target.value, 80)}"` : '当前为空';
     if (target.isContentEditable) return target.textContent.trim() ? `当前内容="${cleanText(target.textContent, 80)}"` : '当前为空';
     const aria = target.getAttribute('aria-checked');
@@ -197,6 +217,7 @@
     }
     if (tag === 'textarea') return `[${ref}] 文本域 标签:${labelOf(el)} ${readState(el)}`;
     if (tag === 'select') {
+      if (isSensitive(el)) return `[${ref}] 下拉框 标签:${labelOf(el)} ${readState(el)}（敏感选项已隐藏）`;
       const options = [...el.options].slice(0, 100).map((option) => `${cleanText(option.textContent, 30)}(value=${cleanText(option.value, 30)})`).join(' | ');
       return `[${ref}] 下拉框 标签:${labelOf(el)} ${readState(el)}\n    选项: ${options.slice(0, 1600)}`;
     }
@@ -221,8 +242,18 @@
     if (tag === 'textarea') return `textarea|${cleanText(el.getAttribute('aria-label') || el.getAttribute('title') || el.placeholder || el.name || el.id || '')}`;
     if (tag === 'select') return `select|${labelOf(el)}`;
     const role = (el.getAttribute('role') || '').toLowerCase();
+    // 富文本的正文也是可变值，不能把本批合法输入当作节点身份变化。
+    if (el.isContentEditable || role === 'textbox') return `${tag}|${role}|${labelOf(el)}`;
     const text = visibleText(el, 120) || labelOf(el);
-    return `${tag}|${role}|${text}`;
+    let href = '';
+    if (tag === 'a' || role === 'link') {
+      const raw = el.getAttribute('href');
+      if (raw != null) {
+        try { href = new URL(raw, document.baseURI).href; }
+        catch { href = raw.trim(); }
+      }
+    }
+    return `${tag}|${role}|${text}|${href}`;
   }
 
   async function fetchImage(url, timeoutMs = 2500) {
@@ -291,84 +322,107 @@
     refFingerprints.clear();
     const targets = {};
     const targetMeta = {};
+    const mappedControls = new Set();
+    const budget = Math.min(50000, Math.max(1000, Number(maxLen) || 16000));
     let ref = 0;
-    const lines = [];
-    const walk = (root) => {
+    let text = '';
+    let previousLine = '';
+    const append = (line) => {
+      if (!line || line === previousLine || text.length >= budget) return false;
+      previousLine = line;
+      const addition = (text ? '\n' : '') + line;
+      const complete = text.length + addition.length <= budget;
+      text += addition.slice(0, budget - text.length);
+      return complete;
+    };
+    const addTarget = (el, describe = (id) => descriptionOf(el, id)) => {
+      const target = el.tagName === 'LABEL' ? targetForLabel(el) || el : el;
+      if (mappedControls.has(target)) return;
+      mappedControls.add(target);
+      const id = ref + 1;
+      let description = describe(id);
+      const remaining = budget - text.length - (text ? 1 : 0);
+      if (description.length > remaining) {
+        const title = description.split('\n')[0];
+        // 编号与完整标题是原子记录；只截短多行详情，绝不输出无法执行的半条 ref。
+        if (title.length > remaining) return;
+        const omitted = ' …（选项已省略）';
+        const detailBudget = remaining - title.length - 1 - omitted.length;
+        description = title;
+        if (detailBudget >= 0) {
+          const detail = describe(id).slice(title.length + 1, title.length + 1 + detailBudget);
+          description += `\n${detail}${omitted}`;
+        } else if (remaining >= title.length + 4) description += '（省略）';
+      }
+      if (!append(description)) return;
+      ref = id;
+      refMap.set(id, el);
+      refFingerprints.set(id, fingerprintOf(el));
+      targets[id] = description;
+      const tagName = target.tagName.toLowerCase();
+      const inputType = tagName === 'input' || tagName === 'button' ? String(target.type || '').toLowerCase() : '';
+      targetMeta[id] = {
+        tag: el.tagName === 'LABEL' ? 'label' : tagName,
+        type: inputType,
+        role: (target.getAttribute('role') || '').toLowerCase(),
+        inForm: !!(target.form || target.closest('form')),
+        submitsForm: target instanceof HTMLFormElement
+          || (tagName === 'button' && (!inputType || inputType === 'submit'))
+          || (tagName === 'input' && ['submit', 'image'].includes(inputType)),
+        sensitive: isSensitive(target),
+      };
+    };
+    const walk = (root, controlsOnly = false) => {
       for (const el of root.children || []) {
+        if (text.length >= budget) return;
         const tag = el.tagName.toLowerCase();
         if (SKIP_TAGS.has(tag)) continue;
         const style = getComputedStyle(el);
         if (isHidden(el) && style.display !== 'contents') continue;
         if (tag === 'iframe') {
-          lines.push(`嵌入页面: ${cleanText(el.title || el.src, 120)}（跨域内容可能无法读取）`);
-          continue;
-        }
-        if (isInteractive(el)) {
-          const id = ++ref;
-          refMap.set(id, el);
-          refFingerprints.set(id, fingerprintOf(el));
-          const description = descriptionOf(el, id);
-          targets[id] = description;
-          const target = el.tagName === 'LABEL' ? targetForLabel(el) || el : el;
-          const tagName = target.tagName.toLowerCase();
-          const inputType = tagName === 'input' || tagName === 'button' ? String(target.type || '').toLowerCase() : '';
-          targetMeta[id] = {
-            description,
-            tag: tagName,
-            type: inputType,
-            role: (target.getAttribute('role') || '').toLowerCase(),
-            inForm: !!target.closest('form'),
-            submitsForm: target instanceof HTMLFormElement
-              || (tagName === 'button' && (!inputType || inputType === 'submit'))
-              || (tagName === 'input' && ['submit', 'image'].includes(inputType)),
-            sensitive: isSensitive(target),
-          };
-          lines.push(description);
-          if (el.shadowRoot) walk(el.shadowRoot);
+          if (!controlsOnly) append(`嵌入页面: ${cleanText(el.title || el.src, 120)}（跨域内容可能无法读取）`);
           continue;
         }
         if (tag === 'label') {
-          // Element UI 等组件库把原生 input 视觉隐藏（opacity:0），label 本身不是 isInteractive，
-          // 必须给这种 label 发编号，否则整页选择题没有任何可操作目标。
+          // 隐藏原生 input 的组件仍通过 label 操作；同一控件只发一个 ref。
           const controlled = targetForLabel(el);
-          const isToggle = controlled instanceof HTMLInputElement && ['checkbox', 'radio'].includes(controlled.type) && controlled.type !== 'hidden';
+          const isToggle = controlled instanceof HTMLInputElement && ['checkbox', 'radio'].includes(controlled.type);
           const own = visibleText(el, 120);
           if (isToggle && own) {
-            const id = ++ref;
-            refMap.set(id, el);
-            refFingerprints.set(id, fingerprintOf(el));
-            const description = `[${id}] 选项「${cleanText(own, 60)}」 类型:${controlled.type === 'radio' ? '单选' : '复选'} ${controlled.checked ? '已选中' : '未选'}`;
-            targets[id] = description;
-            targetMeta[id] = { description, tag: 'label', type: controlled.type, role: '', inForm: !!controlled.closest('form'), submitsForm: false, sensitive: isSensitive(controlled) };
-            lines.push(description);
+            addTarget(el, (id) => `[${id}] 选项「${cleanText(own, 60)}」 类型:${controlled.type === 'radio' ? '单选' : '复选'} ${controlled.checked ? '已选中' : '未选'}`);
+            walk(el, true);
+            if (el.shadowRoot) walk(el.shadowRoot, true);
             continue;
           }
-          if (own) lines.push(own);
-          walk(el);
-          if (el.shadowRoot) walk(el.shadowRoot);
+        }
+        if (isInteractive(el)) {
+          addTarget(el);
+          // 父级描述已包含普通文字，但不能吞掉内部真正的 input/button 等控件。
+          if (!isSensitive(el) && !['select', 'textarea'].includes(tag)) {
+            walk(el, true);
+            if (el.shadowRoot) walk(el.shadowRoot, true);
+          }
           continue;
-        } else if (tag === 'li' && !el.children.length) {
+        }
+        if (tag === 'label') {
+          if (!controlsOnly) append(visibleText(el, 120));
+          walk(el, true);
+          if (el.shadowRoot) walk(el.shadowRoot, true);
+          continue;
+        } else if (!controlsOnly && tag === 'li' && !el.children.length) {
           const own = directText(el, 120);
           if (own) {
-            const id = ++ref;
-            refMap.set(id, el);
-            refFingerprints.set(id, fingerprintOf(el));
-            const description = `[${id}] 列表项「${own}」`;
-            targets[id] = description;
-            targetMeta[id] = { description, tag: 'li', type: '', role: '', inForm: false, submitsForm: false, sensitive: false };
-            lines.push(description);
+            addTarget(el, (id) => `[${id}] 列表项「${own}」`);
             continue;
           }
-        } else {
-          const own = directText(el);
-          if (own) lines.push(own);
+        } else if (!controlsOnly) {
+          append(directText(el));
         }
-        walk(el);
-        if (el.shadowRoot) walk(el.shadowRoot);
+        walk(el, controlsOnly);
+        if (el.shadowRoot) walk(el.shadowRoot, controlsOnly);
       }
     };
     if (document.body) walk(document.body);
-    const deduplicated = lines.filter((line, index) => line && line !== lines[index - 1]);
     currentSnapshotUrl = location.href;
     currentSnapshotMutationVersion = mutationVersion;
     currentSnapshotId = `${documentId}:${++snapshotEpoch}:${currentSnapshotMutationVersion}`;
@@ -376,7 +430,7 @@
       snapshotId: currentSnapshotId,
       url: currentSnapshotUrl,
       title: document.title,
-      text: deduplicated.join('\n').slice(0, Math.min(50000, Math.max(1000, Number(maxLen) || 16000))),
+      text,
       targets,
       targetMeta,
       images: imageResult.images,
@@ -397,11 +451,18 @@
           if (found) { cleanup(); resolve(found); }
         } catch (error) { cleanup(); reject(error); }
       }
-      try { if (queryDeep(selector)) { resolve(queryDeep(selector)); return; } } catch (error) { reject(error); return; }
+      try {
+        assertActive(runId);
+        const found = queryDeep(selector);
+        if (found) { resolve(found); return; }
+      } catch (error) { reject(error); return; }
       observer = new MutationObserver(inspect);
       observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true });
       poll = setInterval(inspect, 100);
-      timer = setTimeout(() => { cleanup(); resolve(null); }, Math.min(30000, Math.max(0, timeout)));
+      timer = setTimeout(() => {
+        cleanup();
+        try { assertActive(runId); resolve(null); } catch (error) { reject(error); }
+      }, Math.min(30000, Math.max(0, timeout)));
     });
   }
 
@@ -410,8 +471,12 @@
     if (action.ref != null) element = refMap.get(Number(action.ref));
     else if (action.selector) {
       try { element = queryDeep(String(action.selector)) || await waitForSelector(String(action.selector), 3000, runId); }
-      catch { return { error: errorResult('INVALID_SELECTOR', `选择器语法错误: ${action.selector}`) }; }
+      catch (error) {
+        if (typeof error.code === 'string') throw error;
+        return { error: errorResult('INVALID_SELECTOR', `选择器语法错误: ${action.selector}`) };
+      }
     }
+    assertActive(runId);
     if (!element) return { error: errorResult('TARGET_NOT_FOUND', action.ref != null ? `编号 ${action.ref} 不存在或已过期` : '找不到目标元素') };
     if (!element.isConnected) return { error: errorResult('STALE_TARGET', '目标元素已被页面移除') };
     if (action.ref != null && options.verifyFingerprint !== false) {
@@ -421,10 +486,36 @@
     if (!options.allowHidden && isHidden(element)) return { error: errorResult('TARGET_HIDDEN', '目标元素当前不可见') };
     const target = element.tagName === 'LABEL' ? targetForLabel(element) || element : element;
     if (target.disabled || target.getAttribute('aria-disabled') === 'true') return { error: errorResult('TARGET_DISABLED', '目标元素已禁用') };
-    return { element, target };
+    return bindTarget(element, runId);
   }
 
-  function setNativeValue(el, value, emitChange = true) {
+  function bindTarget(element, runId) {
+    const target = element.tagName === 'LABEL' ? targetForLabel(element) || element : element;
+    const recorded = fingerprintOf(element);
+    const targetRecorded = fingerprintOf(target);
+    const anchor = element.closest('a');
+    const linkRecorded = anchor && fingerprintOf(anchor);
+    const form = target.form || target.closest('form');
+    const formIdentity = () => form ? `${form.action}|${form.method}|${form.target}|${target.getAttribute('formaction') || ''}|${target.getAttribute('formmethod') || ''}` : '';
+    const formRecorded = formIdentity();
+    const verify = (click = false) => {
+      assertActive(runId);
+      if (!element.isConnected || !target.isConnected || fingerprintOf(element) !== recorded
+          || fingerprintOf(target) !== targetRecorded
+          || (element.tagName === 'LABEL' && (targetForLabel(element) || element) !== target)
+          || (target.form || target.closest('form')) !== form || formIdentity() !== formRecorded
+          || (click && (element.closest('a') !== anchor || (anchor && fingerprintOf(anchor) !== linkRecorded)))) {
+        throw Object.assign(new Error('目标身份在操作准备期间变化，请重新读取页面'), { code: 'STALE_TARGET' });
+      }
+      if (target.disabled || target.getAttribute('aria-disabled') === 'true') {
+        throw Object.assign(new Error('目标元素已禁用'), { code: 'TARGET_DISABLED' });
+      }
+      if (click) safeLink(element);
+    };
+    return { element, target, verify };
+  }
+
+  function setNativeValue(el, value, emitChange = true, verify = () => {}) {
     const next = String(value ?? '');
     if (el.value === next) return false;
     const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype
@@ -432,9 +523,10 @@
       : HTMLInputElement.prototype;
     const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
     if (!setter) throw new Error('目标不支持设置值');
+    verify();
     setter.call(el, next);
     el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: next }));
-    if (emitChange) el.dispatchEvent(new Event('change', { bubbles: true }));
+    if (emitChange) { verify(); el.dispatchEvent(new Event('change', { bubbles: true })); }
     return true;
   }
 
@@ -442,25 +534,29 @@
     const anchor = element.tagName === 'A' ? element : element.closest('a');
     if (!anchor) return null;
     const href = anchor.getAttribute('href') || '';
-    if (/^\s*(javascript|data|vbscript):/i.test(href)) throw new Error('已阻止不安全链接');
+    const protocol = new URL(href, document.baseURI).protocol;
+    if (['javascript:', 'data:', 'vbscript:'].includes(protocol)) throw new Error('已阻止不安全链接');
     return anchor;
   }
 
-  async function clickOnce(element, runId, detail = 1) {
-    assertActive(runId);
+  async function clickOnce(element, runId, verify, detail = 1) {
+    verify(true);
+    element.scrollIntoView({ block: 'center', inline: 'nearest' });
+    await sleep(TIMING.paint, runId);
+    verify(true);
     const anchor = safeLink(element);
     const originalTarget = anchor?.getAttribute('target');
     if (anchor && /^_blank$/i.test(originalTarget || '')) anchor.setAttribute('target', '_self');
     try {
-      element.scrollIntoView({ block: 'center', inline: 'nearest' });
-      await sleep(TIMING.paint, runId);
       const rect = element.getBoundingClientRect();
       const init = { bubbles: true, cancelable: true, composed: true, view: window, button: 0, detail, clientX: Math.round(rect.left + rect.width / 2), clientY: Math.round(rect.top + rect.height / 2) };
-      if (window.PointerEvent) element.dispatchEvent(new PointerEvent('pointerdown', { ...init, pointerId: 1, pointerType: 'mouse', isPrimary: true }));
-      element.dispatchEvent(new MouseEvent('mousedown', init));
-      if (window.PointerEvent) element.dispatchEvent(new PointerEvent('pointerup', { ...init, pointerId: 1, pointerType: 'mouse', isPrimary: true }));
-      element.dispatchEvent(new MouseEvent('mouseup', init));
-      element.dispatchEvent(new MouseEvent('click', init));
+      // 每个前置事件都可能同步复用/移除节点或发起导航，不能只在整串事件前检查一次。
+      for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+        verify(true);
+        if (type.startsWith('pointer')) {
+          if (window.PointerEvent) element.dispatchEvent(new PointerEvent(type, { ...init, pointerId: 1, pointerType: 'mouse', isPrimary: true }));
+        } else element.dispatchEvent(new MouseEvent(type, init));
+      }
       await sleep(TIMING.event, runId);
     } finally {
       if (anchor?.isConnected) {
@@ -474,14 +570,17 @@
     return `${location.href}|${cleanText(document.body?.innerText, 1000)}`;
   }
 
-  async function performPress(element, value, runId) {
+  async function performPress(element, value, runId, verify) {
     const requested = String(value || '').trim();
     const aliases = { esc: 'Escape', space: ' ', enter: 'Enter', tab: 'Tab', arrowdown: 'ArrowDown', arrowup: 'ArrowUp', arrowleft: 'ArrowLeft', arrowright: 'ArrowRight', backspace: 'Backspace', delete: 'Delete' };
     const key = aliases[requested.toLowerCase()] || requested;
     if (!key || key.length > 20) return errorResult('INVALID_KEY', '按键名称无效');
+    verify();
     element.focus?.();
+    verify();
     const init = { key, code: key === ' ' ? 'Space' : key, bubbles: true, cancelable: true, composed: true };
     const proceed = element.dispatchEvent(new KeyboardEvent('keydown', init));
+    verify();
     if (proceed) {
       if (key === 'Enter') {
         const form = element.form || element.closest?.('form');
@@ -494,17 +593,22 @@
         focusable[(index + 1) % focusable.length]?.focus();
       }
     }
+    assertActive(runId);
     element.dispatchEvent(new KeyboardEvent('keyup', init));
     await sleep(TIMING.settle, runId);
     return { ok: true, msg: `已按键 ${requested}`, state: readState(element) };
   }
 
-  async function typeText(element, value, runId) {
+  async function typeText(element, value, runId, verify) {
     if (!(element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element.isContentEditable)) return errorResult('NOT_EDITABLE', '目标不是可编辑元素');
     if (element.readOnly) return errorResult('READ_ONLY', '目标为只读');
     const text = String(value ?? '');
+    verify();
     element.scrollIntoView({ block: 'center' });
+    verify();
     element.focus();
+    verify();
+    if (element.readOnly) return errorResult('READ_ONLY', '目标为只读');
     if (!element.isContentEditable && element.value === text) return { ok: true, code: 'NO_CHANGE', msg: '目标已是指定内容', state: readState(element) };
     if (element.isContentEditable) {
       if (element.textContent === text) return { ok: true, code: 'NO_CHANGE', msg: '目标已是指定内容', state: readState(element) };
@@ -514,21 +618,43 @@
       Object.getOwnPropertyDescriptor(proto, 'value')?.set?.call(element, '');
     }
     for (const char of text) {
-      assertActive(runId);
+      verify();
       const down = element.dispatchEvent(new KeyboardEvent('keydown', { key: char, bubbles: true, cancelable: true, composed: true }));
+      verify();
       if (down) {
         if (element.isContentEditable) element.textContent += char;
         else Object.getOwnPropertyDescriptor(element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype, 'value')?.set?.call(element, element.value + char);
         element.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, inputType: 'insertText', data: char }));
       }
+      verify();
       element.dispatchEvent(new KeyboardEvent('keyup', { key: char, bubbles: true, cancelable: true, composed: true }));
       await sleep(12, runId);
     }
+    verify();
     element.dispatchEvent(new Event('change', { bubbles: true }));
     return { ok: true, msg: '已逐字输入', state: readState(element) };
   }
 
+  function isNavigationResult(result) {
+    return ['NAVIGATING', 'NAVIGATED'].includes(result?.code);
+  }
+
+  function skippedAfterNavigation() {
+    return errorResult('SKIPPED_AFTER_NAVIGATION', '页面正在或已经跳转，本批剩余操作已跳过');
+  }
+
   async function executeAction(action, runId, depth = 0, approved = false) {
+    try {
+      const result = await performAction(action, runId, depth, approved);
+      return isNavigationResult(result) ? result : navigationResult() || result;
+    } catch (error) {
+      if (isNavigationResult(error)) return navigationResult();
+      if (error.code === 'STALE_TARGET') return errorResult(error.code, error.message);
+      throw error;
+    }
+  }
+
+  async function performAction(action, runId, depth, approved) {
     assertActive(runId);
     if (!action || typeof action !== 'object' || !ACTIONS.has(action.action)) return errorResult('UNKNOWN_ACTION', `未知操作: ${action?.action || '(空)'}`);
     if (action.action === 'wait') {
@@ -536,7 +662,10 @@
       if (action.selector) {
         let element;
         try { element = await waitForSelector(String(action.selector), timeout, runId); }
-        catch { return errorResult('INVALID_SELECTOR', '等待选择器语法错误'); }
+        catch (error) {
+          if (typeof error.code === 'string') throw error;
+          return errorResult('INVALID_SELECTOR', '等待选择器语法错误');
+        }
         return element ? { ok: true, msg: '元素已出现' } : errorResult('WAIT_TIMEOUT', '等待元素超时');
       }
       await sleep(timeout, runId);
@@ -548,15 +677,20 @@
       const interval = Number(action.value ?? 1000);
       if (!Number.isInteger(times) || times < 1 || times > 100 || !Number.isFinite(interval) || interval < 0 || interval > 60000) return errorResult('INVALID_REPEAT', 'repeat 参数无效');
       if (!Array.isArray(action.actions) || !action.actions.length || action.actions.some((item) => item?.action === 'repeat')) return errorResult('INVALID_REPEAT', 'repeat 子操作无效');
-      const startUrl = location.href;
       const summaries = [];
       for (let index = 0; index < times; index++) {
+        assertActive(runId);
         const started = performance.now();
-        for (const subAction of action.actions) {
-          const result = await executeAction(subAction, runId, depth + 1, approved);
+        const roundResults = [];
+        for (let subIndex = 0; subIndex < action.actions.length; subIndex++) {
+          const result = await executeAction(action.actions[subIndex], runId, depth + 1, approved);
+          roundResults.push(result);
           summaries.push(`第${index + 1}轮:${result.msg || result.error || ''}`);
+          if (isNavigationResult(result)) {
+            for (let rest = subIndex + 1; rest < action.actions.length; rest++) roundResults.push(skippedAfterNavigation());
+            return { ...result, msg: `循环执行 ${index + 1}/${times} 轮后因导航停止`, results: roundResults };
+          }
           if (!result.ok) return errorResult(result.code || 'REPEAT_FAILED', `循环在第 ${index + 1} 轮停止：${result.msg || result.error}`);
-          if (location.href !== startUrl) return { ok: true, code: 'NAVIGATED', msg: `循环执行 ${index + 1}/${times} 轮后页面跳转并停止` };
         }
         if (index < times - 1) await sleep(Math.max(0, interval - (performance.now() - started)), runId);
       }
@@ -568,15 +702,19 @@
       if (!['http:', 'https:'].includes(url.protocol)) return errorResult('UNSAFE_URL', 'navigate 仅支持 http(s) 地址');
       if (location.href === url.href) return { ok: true, code: 'NO_CHANGE', msg: '已在目标页面' };
       location.assign(url.href);
-      return { ok: true, code: 'NAVIGATING', msg: `正在跳转到 ${url.href}` };
+      activeOperation.navigationStarted = true;
+      activeOperation.navigationUrl = url.href;
+      return { ok: true, code: 'NAVIGATING', navigationUrl: url.href, msg: `正在跳转到 ${url.href}` };
     }
     if (action.action === 'scroll') {
       let target = document.scrollingElement || document.documentElement;
       if (action.ref != null || action.selector) {
         const resolved = await resolveTarget(action, runId, { allowHidden: true });
         if (resolved.error) return resolved.error;
+        resolved.verify();
         target = resolved.element;
       }
+      assertActive(runId);
       const value = action.value;
       if (value === 'top') target.scrollTo({ top: 0, behavior: 'smooth' });
       else if (value === 'bottom') target.scrollTo({ top: target.scrollHeight, behavior: 'smooth' });
@@ -589,11 +727,12 @@
     }
 
     let resolved;
-    if (action.action === 'press' && action.ref == null && !action.selector) resolved = { element: document.activeElement || document.body, target: document.activeElement || document.body };
+    if (action.action === 'press' && action.ref == null && !action.selector) resolved = bindTarget(document.activeElement || document.body, runId);
     else resolved = await resolveTarget(action, runId);
     if (resolved.error) return resolved.error;
-    const { element, target } = resolved;
+    const { element, target, verify } = resolved;
     if (TARGET_ACTIONS.has(action.action) && !element) return errorResult('MISSING_TARGET', '操作缺少目标');
+    verify();
 
     const tagName = target.tagName.toLowerCase();
     const inputType = tagName === 'input' || tagName === 'button' ? String(target.type || '').toLowerCase() : '';
@@ -605,13 +744,16 @@
       return errorResult('APPROVAL_REQUIRED', '此操作可能提交表单，必须先获得用户确认');
     }
 
-    if (action.action === 'press') return performPress(target, action.value, runId);
+    if (action.action === 'press') return performPress(target, action.value, runId, verify);
     if (action.action === 'hover') {
       element.scrollIntoView({ block: 'center' });
+      verify();
       const rect = element.getBoundingClientRect();
       const init = { bubbles: true, composed: true, clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2 };
       if (window.PointerEvent) element.dispatchEvent(new PointerEvent('pointerover', { ...init, pointerType: 'mouse', pointerId: 1, isPrimary: true }));
+      verify();
       element.dispatchEvent(new MouseEvent('mouseover', init));
+      verify();
       element.dispatchEvent(new MouseEvent('mousemove', init));
       await waitForStable(runId, 2000, 300);
       return { ok: true, msg: '已悬停目标' };
@@ -620,32 +762,40 @@
       const checkbox = target instanceof HTMLInputElement && ['checkbox', 'radio'].includes(target.type) ? target : null;
       if (checkbox?.checked || target.getAttribute('aria-checked') === 'true') return { ok: true, code: 'NO_CHANGE', msg: '目标已选中', state: '已选中' };
       // label 引用时 target 是其内部 input，直接点 input 保证原生翻转与 change 事件
-      await clickOnce(checkbox || element, runId);
+      await clickOnce(checkbox || element, runId, verify);
       return { ok: true, msg: '已选中目标', state: readState(element) };
     }
     if (action.action === 'click') {
       const before = pageSignature();
       // 复选/单选目标直接点 input，避免合成点击 label 时激活行为不生效导致翻转失败
       const toggle = target instanceof HTMLInputElement && ['checkbox', 'radio'].includes(target.type);
-      try { await clickOnce(toggle ? target : element, runId); } catch (error) { return errorResult('CLICK_BLOCKED', error.message); }
+      try { await clickOnce(toggle ? target : element, runId, verify); }
+      catch (error) {
+        if (typeof error.code === 'string') throw error;
+        return errorResult('CLICK_BLOCKED', error.message);
+      }
       await waitForStable(runId, 2500, 350);
       return { ok: true, msg: `已点击${pageSignature() !== before ? '，页面已更新' : ''}`, state: element.isConnected ? readState(element) : '页面已更新' };
     }
     if (action.action === 'dblclick') {
       const before = pageSignature();
-      await clickOnce(element, runId, 1);
-      await clickOnce(element, runId, 2);
+      await clickOnce(element, runId, verify, 1);
+      await clickOnce(element, runId, verify, 2);
+      verify(true);
       const rect = element.getBoundingClientRect();
       element.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true, composed: true, view: window, button: 0, detail: 2, clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2 }));
       await waitForStable(runId, 2000, 350);
       return { ok: true, msg: `已双击${pageSignature() !== before ? '，页面已更新' : ''}`, state: element.isConnected ? readState(element) : '页面已更新' };
     }
-    if (action.action === 'type') return typeText(target, action.value, runId);
+    if (action.action === 'type') return typeText(target, action.value, runId, verify);
     if (action.action === 'fill') {
       if (!(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target.isContentEditable)) return errorResult('NOT_EDITABLE', '目标不是可编辑元素');
       if (target.readOnly) return errorResult('READ_ONLY', '目标为只读');
       target.scrollIntoView({ block: 'center' });
+      verify();
       target.focus();
+      verify();
+      if (target.readOnly) return errorResult('READ_ONLY', '目标为只读');
       const next = String(action.value ?? '');
       let changed = false;
       if (target.isContentEditable) {
@@ -653,9 +803,11 @@
         if (changed) {
           target.textContent = next;
           target.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, inputType: 'insertText', data: next }));
+          verify();
           target.dispatchEvent(new Event('change', { bubbles: true }));
         }
-      } else changed = setNativeValue(target, next);
+      } else changed = setNativeValue(target, next, true, verify);
+      assertActive(runId);
       target.blur();
       await sleep(TIMING.event, runId);
       return { ok: true, code: changed ? 'FILLED' : 'NO_CHANGE', msg: changed ? '已填写目标' : '目标已是指定内容', state: readState(target) };
@@ -667,20 +819,27 @@
       const prefix = exact.length ? [] : [...target.options].filter((option) => option.textContent.trim().startsWith(requested));
       const hit = exact[0] || (prefix.length === 1 ? prefix[0] : null);
       if (!hit) return errorResult('OPTION_NOT_FOUND', prefix.length > 1 ? '选项前缀不唯一' : '选项不存在');
-      const changed = setNativeValue(target, hit.value);
-      return { ok: true, code: changed ? 'SELECTED' : 'NO_CHANGE', msg: changed ? `已选择「${cleanText(hit.textContent, 60)}」` : '已是指定选项', state: readState(target) };
+      const changed = setNativeValue(target, hit.value, true, verify);
+      return { ok: true, code: changed ? 'SELECTED' : 'NO_CHANGE', msg: changed ? (isSensitive(target) ? '已选择敏感选项（已隐藏）' : `已选择「${cleanText(hit.textContent, 60)}」`) : '已是指定选项', state: readState(target) };
     }
     if (action.action === 'submitForm') {
       const form = target instanceof HTMLFormElement ? target : target.form || target.closest('form');
       if (!form) {
-        await clickOnce(element, runId);
+        await clickOnce(element, runId, verify);
         await waitForStable(runId, 3500, 500);
         return { ok: true, msg: '已点击提交目标' };
       }
-      if (!form.reportValidity()) return errorResult('FORM_INVALID', '表单校验未通过，未提交');
-      const submitter = target instanceof HTMLElement && ['BUTTON', 'INPUT'].includes(target.tagName) ? target : undefined;
-      if (form.requestSubmit) form.requestSubmit(submitter);
-      else form.submit();
+      target.scrollIntoView({ block: 'center' });
+      verify();
+      const valid = form.reportValidity();
+      verify();
+      if (!valid) return errorResult('FORM_INVALID', '表单校验未通过，未提交');
+      const submitter = (target instanceof HTMLButtonElement && target.type === 'submit')
+        || (target instanceof HTMLInputElement && ['submit', 'image'].includes(target.type)) ? target : undefined;
+      if (form.requestSubmit) {
+        if (submitter) form.requestSubmit(submitter);
+        else form.requestSubmit();
+      } else form.submit();
       await waitForStable(runId, 3500, 500);
       return { ok: true, msg: '已提交表单' };
     }
@@ -697,26 +856,34 @@
       return { results: [errorResult('STALE_SNAPSHOT', '页面已跳转或快照已重建，请重新读取页面')] };
     }
     if (!Array.isArray(message.actions) || message.actions.length < 1 || message.actions.length > 20) return { results: [errorResult('INVALID_ACTIONS', '操作数量必须为 1-20')] };
-    if (executing) return { results: [errorResult('BUSY', '页面正在执行另一批操作')] };
-    activeRunId = message.runId;
+    if (executing || extracting) return { results: [errorResult('BUSY', '页面正在处理另一项请求')] };
     assertActive(message.runId);
+    activeRunId = message.runId;
     executing = true;
+    const operation = { runId: message.runId, startUrl: location.href, navigationStarted: false };
+    activeOperation = operation;
+    // 仅观察本次 operation；不阻断卸载、不改页面 API，finally 必须卸下监听。
+    const onBeforeUnload = () => {
+      if (activeOperation === operation) operation.navigationStarted = true;
+    };
+    addEventListener('beforeunload', onBeforeUnload, true);
     const results = [];
-    const startUrl = location.href;
     try {
       for (let index = 0; index < message.actions.length; index++) {
-        if (location.href !== startUrl) {
-          results.push(errorResult('SKIPPED_AFTER_NAVIGATION', '页面已跳转，本批剩余操作已跳过'));
-          continue;
-        }
+        assertActive(message.runId);
         try {
           const result = await executeAction(message.actions[index], message.runId, 0, true); // 完全访问权限：不再要求审批
           results.push(result);
+          if (isNavigationResult(result)) {
+            for (let rest = index + 1; rest < message.actions.length; rest++) results.push(skippedAfterNavigation());
+            break;
+          }
           if (!result.ok && !['WAIT_TIMEOUT', 'TARGET_NOT_FOUND', 'STALE_TARGET', 'TARGET_HIDDEN'].includes(result.code)) {
             for (let rest = index + 1; rest < message.actions.length; rest++) results.push(errorResult('SKIPPED_AFTER_FAILURE', '前序操作失败，已跳过'));
             break;
           }
         } catch (error) {
+          if (isNavigationResult(error)) throw error;
           const code = error.code || (error.name === 'CancelledError' ? 'CANCELLED' : 'ACTION_ERROR');
           results.push(errorResult(code, error.message || String(error)));
           for (let rest = index + 1; rest < message.actions.length; rest++) results.push(errorResult('SKIPPED_AFTER_FAILURE', '前序操作中止，已跳过'));
@@ -724,11 +891,26 @@
         }
         if (index < message.actions.length - 1) await sleep(TIMING.settle, message.runId);
       }
+      // beforeunload 后 URL 仍可能是旧页；绝不能返回旧文档快照。
+      if (navigationResult() || results.some(isNavigationResult)) return { results };
       let page;
       try { page = await buildSnapshot(message.runId, 12000, message.includeImages === true); }
-      catch (error) { if (error.name !== 'CancelledError') throw error; }
+      catch (error) {
+        if (error.name !== 'CancelledError') throw error;
+        return { results };
+      }
+      assertActive(message.runId);
       return { results, page };
+    } catch (error) {
+      // 导航也可能发生于批间等待或最终快照等待，把边界归到最后一个已执行动作。
+      if (!isNavigationResult(error)) throw error;
+      if (results.length) Object.assign(results.at(-1), navigationResult());
+      else results.push(navigationResult());
+      while (results.length < message.actions.length) results.push(skippedAfterNavigation());
+      return { results };
     } finally {
+      removeEventListener('beforeunload', onBeforeUnload, true);
+      if (activeOperation === operation) activeOperation = null;
       executing = false;
       if (activeRunId === message.runId) activeRunId = '';
     }
@@ -746,11 +928,15 @@
       if (executing || extracting) { sendResponse(errorResult('BUSY', '页面正在处理另一项请求')); return; }
       activeRunId = message.runId;
       extracting = true;
-      waitForStable(message.runId, 1500, 250)
-        .then(() => buildSnapshot(message.runId, message.maxLen, message.includeImages === true))
-        .then(sendResponse)
-        .catch((error) => sendResponse(errorResult(error.code || 'EXTRACT_ERROR', error.message || String(error))))
-        .finally(() => { extracting = false; if (activeRunId === message.runId) activeRunId = ''; });
+      (async () => {
+        try {
+          await waitForStable(message.runId, 1500, 250);
+          return await buildSnapshot(message.runId, message.maxLen, message.includeImages === true);
+        } finally {
+          extracting = false;
+          if (activeRunId === message.runId) activeRunId = '';
+        }
+      })().then(sendResponse, (error) => sendResponse(errorResult(error.code || 'EXTRACT_ERROR', error.message || String(error))));
       return true;
     }
     if (message.type === 'EXECUTE') {

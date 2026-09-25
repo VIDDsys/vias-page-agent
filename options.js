@@ -10,6 +10,11 @@ let dirtyForm = false;
 let formRevision = 0;
 let apiKeyTouched = false;
 let promptDirty = false;
+let promptRevision = 0;
+let promptBaseText = '';
+let promptEditVersion = 0;
+let promptSaving = false;
+let latestPromptState = null;
 
 function runtimeMessage(message) {
   return new Promise((resolve, reject) => {
@@ -21,17 +26,34 @@ function runtimeMessage(message) {
   });
 }
 
-async function load(options = {}) {
+async function load() {
   const state = await runtimeMessage({ type: 'GET_SETTINGS', includeSecrets: true });
   if (!state?.ok) throw new Error(state?.error || '无法读取设置');
+  const revision = state.settingsRevision || 0;
+  if (revision < settingsRevision) return;
   models = Array.isArray(state.models) ? state.models : [];
   activeModelId = state.activeModelId || '';
-  settingsRevision = state.settingsRevision || 0;
-  if (!promptDirty || options.force) {
-    $('systemPrompt').value = state.systemPrompt || DEFAULT_SYSTEM_PROMPT;
-    promptDirty = false;
-  }
+  settingsRevision = revision;
+  latestPromptState = { revision, text: state.systemPrompt || DEFAULT_SYSTEM_PROMPT };
+  syncPromptState();
   renderList();
+}
+
+function syncPromptState() {
+  if (!latestPromptState || promptSaving || latestPromptState.revision < promptRevision) return;
+  if (!promptDirty) {
+    $('systemPrompt').value = latestPromptState.text;
+    promptRevision = latestPromptState.revision;
+    promptBaseText = latestPromptState.text;
+  } else if (latestPromptState.text === promptBaseText) {
+    promptRevision = latestPromptState.revision;
+  }
+  const conflict = promptDirty && promptRevision !== latestPromptState.revision;
+  $('promptConflict').hidden = !conflict;
+  if (conflict) {
+    $('latestPrompt').value = latestPromptState.text;
+    setStatus('promptStatus', '设置已更新，草稿已保留；请核对下方最新提示词后继续', false, true);
+  }
 }
 
 function setStatus(id, message, ok, persistent = false) {
@@ -95,13 +117,15 @@ async function update(operation, fields = {}, expectedRevision = settingsRevisio
   const response = await runtimeMessage({ type: 'UPDATE_SETTINGS', operation, expectedRevision, ...fields });
   if (!response?.ok) {
     if (response?.code === 'REVISION_CONFLICT') {
-      closeForm();
-      await load({ force: true });
-      throw new Error('设置已在其他窗口更新；编辑表单已关闭，请重新打开后再修改');
+      if (operation !== 'setPrompt') closeForm();
+      await load();
+      throw new Error(operation === 'setPrompt'
+        ? '设置已在其他窗口更新；提示词草稿已保留，请核对下方最新提示词后继续'
+        : '设置已在其他窗口更新；模型编辑表单已关闭，请重新打开后再修改（提示词草稿保留）');
     }
     throw new Error(response?.error || '保存失败');
   }
-  settingsRevision = response.settingsRevision ?? settingsRevision + 1;
+  settingsRevision = Math.max(settingsRevision, response.settingsRevision ?? settingsRevision + 1);
   return response;
 }
 
@@ -119,7 +143,7 @@ async function deleteModel(model) {
   if (!confirm(`删除模型「${model.name}」？`)) return;
   try {
     await update('deleteModel', { id: model.id });
-    await load({ force: true });
+    await load();
   } catch (error) {
     setStatus('promptStatus', error.message, false, true);
   }
@@ -155,7 +179,20 @@ $('btnAdd').addEventListener('click', () => openForm(null));
 $('btnCancel').addEventListener('click', closeForm);
 $('formWrap').addEventListener('input', () => { dirtyForm = true; });
 $('fKey').addEventListener('input', () => { apiKeyTouched = true; });
-$('systemPrompt').addEventListener('input', () => { promptDirty = true; });
+$('systemPrompt').addEventListener('input', () => {
+  // The draft stays based on the last displayed/saved/reconciled prompt, not a model-list refresh.
+  promptDirty = true;
+  promptEditVersion += 1;
+  setStatus('promptStatus', '有未保存的修改', true, true);
+  syncPromptState();
+});
+$('btnRebasePrompt').addEventListener('click', () => {
+  if (promptSaving || !latestPromptState) return;
+  promptRevision = latestPromptState.revision;
+  promptBaseText = latestPromptState.text;
+  $('promptConflict').hidden = true;
+  setStatus('promptStatus', '草稿已保留，请再次保存提示词；若设置再次变化仍会提示冲突', true, true);
+});
 
 $('btnSave').addEventListener('click', async () => {
   const saveButton = $('btnSave');
@@ -173,7 +210,7 @@ $('btnSave').addEventListener('click', async () => {
     if (!validated.name) throw new Error('请填写显示名称');
     await update('upsertModel', { model: validated }, formRevision);
     closeForm();
-    await load({ force: true });
+    await load();
   } catch (error) {
     setStatus($('formWrap').classList.contains('show') ? 'formStatus' : 'promptStatus', error.message, false, true);
   } finally {
@@ -204,16 +241,32 @@ async function testModel(model, testButton) {
 }
 
 $('btnSavePrompt').addEventListener('click', async () => {
+  if (promptSaving) return;
   const saveButton = $('btnSavePrompt');
+  const text = $('systemPrompt').value.trim() || DEFAULT_SYSTEM_PROMPT;
+  const editVersion = promptEditVersion;
+  const revision = promptRevision;
+  promptDirty = true;
+  promptSaving = true;
   saveButton.disabled = true;
+  $('btnRebasePrompt').disabled = true;
   try {
-    await update('setPrompt', { systemPrompt: $('systemPrompt').value.trim() || DEFAULT_SYSTEM_PROMPT });
-    promptDirty = false;
-    setStatus('promptStatus', '已保存', true);
+    const response = await update('setPrompt', { systemPrompt: text }, revision);
+    promptRevision = response.settingsRevision;
+    promptBaseText = text;
+    $('promptConflict').hidden = true;
+    // An acknowledgement only clears the exact draft that was submitted.
+    promptDirty = promptEditVersion !== editVersion;
+    if (!promptDirty) $('systemPrompt').value = text;
+    setStatus('promptStatus', promptDirty ? '提交的版本已保存；仍有未保存的新修改' : '已保存', true, promptDirty);
+    await load();
   } catch (error) {
     setStatus('promptStatus', error.message, false, true);
   } finally {
+    promptSaving = false;
     saveButton.disabled = false;
+    $('btnRebasePrompt').disabled = false;
+    syncPromptState();
   }
 });
 
@@ -221,4 +274,4 @@ chrome.storage.onChanged.addListener((_changes, area) => {
   if (area === 'local' && !dirtyForm) load().catch((error) => setStatus('promptStatus', error.message, false, true));
 });
 
-load({ force: true }).catch((error) => setStatus('promptStatus', error.message, false, true));
+load().catch((error) => setStatus('promptStatus', error.message, false, true));
