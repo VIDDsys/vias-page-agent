@@ -10,7 +10,8 @@
   const INTERACTIVE_ROLES = new Set(['button', 'radio', 'checkbox', 'option', 'tab', 'switch', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'link', 'textbox', 'combobox', 'slider']);
   const SKIP_TAGS = new Set(['script', 'style', 'noscript', 'svg', 'path', 'head', 'link', 'meta', 'template']);
   const SENSITIVE_AUTOCOMPLETE = /(current-password|new-password|one-time-code|cc-|transaction-|webauthn)/i;
-  const documentId = crypto.randomUUID();
+  // 纯 http 页面不是安全上下文，randomUUID 不可用；退化到时间戳+随机数，仅作快照命名空间
+  const documentId = crypto.randomUUID?.() || `doc-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
   const refMap = new Map();
   const refFingerprints = new Map();
   const operationCache = new Map();
@@ -236,6 +237,7 @@
   // 目标身份指纹：只含稳定特征（标签/类型/角色/名称/文字），刻意排除 checked、value 等会被操作改变的属性。
   // 用于执行前逐目标核验：若编号指向的节点已被复用成别的内容（乱序页常见），据指纹不符判定失效，避免点错。
   function fingerprintOf(el) {
+    if (el === document.body || el === document.documentElement) return el === document.body ? 'body' : 'html';
     const tag = el.tagName.toLowerCase();
     if (tag === 'label') return `label|${visibleText(el, 120)}`;
     if (tag === 'input') return `input|${String(el.type || '').toLowerCase()}|${cleanText(el.getAttribute('aria-label') || el.getAttribute('title') || el.placeholder || el.name || el.id || '')}`;
@@ -320,6 +322,8 @@
     assertActive(runId);
     refMap.clear();
     refFingerprints.clear();
+    // 重建期间旧快照立即失效：若 walk 中途抛错，绝不让旧编号解析到新元素
+    currentSnapshotId = '';
     const targets = {};
     const targetMeta = {};
     const mappedControls = new Set();
@@ -559,7 +563,8 @@
       }
       await sleep(TIMING.event, runId);
     } finally {
-      if (anchor?.isConnected) {
+      // 页面可能在点击串中移除并稍后重挂 anchor；无条件恢复，避免 target=_self 永久泄漏
+      if (anchor) {
         if (originalTarget == null) anchor.removeAttribute('target');
         else anchor.setAttribute('target', originalTarget);
       }
@@ -583,8 +588,17 @@
     verify();
     if (proceed) {
       if (key === 'Enter') {
-        const form = element.form || element.closest?.('form');
-        if (form?.requestSubmit) form.requestSubmit();
+        // 浏览器原生行为：textarea/富文本内 Enter 是换行而不是提交表单
+        if (element instanceof HTMLTextAreaElement) {
+          Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set?.call(element, element.value + '\n');
+          element.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, inputType: 'insertLineBreak', data: '\n' }));
+          element.dispatchEvent(new Event('change', { bubbles: true }));
+        } else if (element.isContentEditable) {
+          try { document.execCommand('insertText', false, '\n'); } catch {}
+        } else {
+          const form = element.form || element.closest?.('form');
+          if (form?.requestSubmit) form.requestSubmit();
+        }
       } else if (key === ' ' && element instanceof HTMLInputElement && ['checkbox', 'radio'].includes(element.type)) {
         element.click();
       } else if (key === 'Tab') {
@@ -601,6 +615,7 @@
 
   async function typeText(element, value, runId, verify) {
     if (!(element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element.isContentEditable)) return errorResult('NOT_EDITABLE', '目标不是可编辑元素');
+    if (element instanceof HTMLInputElement && element.type === 'file') return errorResult('NOT_EDITABLE', '文件上传暂不支持，请手动选择文件');
     if (element.readOnly) return errorResult('READ_ONLY', '目标为只读');
     const text = String(value ?? '');
     verify();
@@ -640,7 +655,11 @@
   }
 
   function skippedAfterNavigation() {
-    return errorResult('SKIPPED_AFTER_NAVIGATION', '页面正在或已经跳转，本批剩余操作已跳过');
+    const result = errorResult('SKIPPED_AFTER_NAVIGATION', '页面正在或已经跳转，本批剩余操作已跳过');
+    const operation = activeOperation;
+    if (operation?.navigationUrl) result.navigationUrl = operation.navigationUrl;
+    else if (operation && location.href !== operation.startUrl) result.navigationUrl = location.href;
+    return result;
   }
 
   async function executeAction(action, runId, depth = 0, approved = false) {
@@ -790,6 +809,7 @@
     if (action.action === 'type') return typeText(target, action.value, runId, verify);
     if (action.action === 'fill') {
       if (!(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target.isContentEditable)) return errorResult('NOT_EDITABLE', '目标不是可编辑元素');
+      if (target instanceof HTMLInputElement && target.type === 'file') return errorResult('NOT_EDITABLE', '文件上传暂不支持，请手动选择文件');
       if (target.readOnly) return errorResult('READ_ONLY', '目标为只读');
       target.scrollIntoView({ block: 'center' });
       verify();
@@ -814,11 +834,28 @@
     }
     if (action.action === 'select') {
       if (!(target instanceof HTMLSelectElement)) return errorResult('NOT_SELECT', 'select 仅支持原生下拉框');
-      const requested = String(action.value ?? '');
-      const exact = [...target.options].filter((option) => option.value === requested || option.textContent.trim() === requested);
-      const prefix = exact.length ? [] : [...target.options].filter((option) => option.textContent.trim().startsWith(requested));
-      const hit = exact[0] || (prefix.length === 1 ? prefix[0] : null);
-      if (!hit) return errorResult('OPTION_NOT_FOUND', prefix.length > 1 ? '选项前缀不唯一' : '选项不存在');
+      // 多选下拉 value 传数组；标量赋值会清掉其余已选项
+      const requestedList = Array.isArray(action.value) ? action.value.map((item) => String(item ?? '')) : [String(action.value ?? '')];
+      if (!requestedList.length || requestedList.includes('')) return errorResult('OPTION_NOT_FOUND', '选项不存在');
+      const hits = [];
+      for (const requested of requestedList) {
+        const exact = [...target.options].filter((option) => option.value === requested || option.textContent.trim() === requested);
+        const prefix = exact.length ? [] : [...target.options].filter((option) => option.textContent.trim().startsWith(requested));
+        const hit = exact[0] || (prefix.length === 1 ? prefix[0] : null);
+        if (!hit) return errorResult('OPTION_NOT_FOUND', prefix.length > 1 ? '选项前缀不唯一' : '选项不存在');
+        if (!hits.includes(hit)) hits.push(hit);
+      }
+      if (target.multiple) {
+        const signatureOf = () => [...target.selectedOptions].map((option) => option.value).join('\u0000');
+        const before = signatureOf();
+        verify();
+        for (const option of target.options) option.selected = hits.includes(option);
+        const changed = before !== signatureOf();
+        target.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true }));
+        if (changed) target.dispatchEvent(new Event('change', { bubbles: true }));
+        return { ok: true, code: changed ? 'SELECTED' : 'NO_CHANGE', msg: changed ? (isSensitive(target) ? '已选择敏感选项（已隐藏）' : `已选择 ${hits.length} 项`) : '已是指定选项', state: readState(target) };
+      }
+      const hit = hits[0];
       const changed = setNativeValue(target, hit.value, true, verify);
       return { ok: true, code: changed ? 'SELECTED' : 'NO_CHANGE', msg: changed ? (isSensitive(target) ? '已选择敏感选项（已隐藏）' : `已选择「${cleanText(hit.textContent, 60)}」`) : '已是指定选项', state: readState(target) };
     }

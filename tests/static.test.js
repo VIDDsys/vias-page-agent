@@ -569,6 +569,18 @@ test('core parseReply 非法转义自愈而合法 Unicode、换行与反斜杠�
   });
 });
 
+test('core parseReply 修复字符串内裸换行/制表等控制字符而不改变含义', () => {
+  const core = loadCore();
+  const text = '{"say":"第一行\n第二行","actions":[{"action":"fill","ref":2,"value":"a\tb\r\nc"}]}';
+  assert.deepEqual(plain(core.parseReply(text)), {
+    say: '第一行\n第二行',
+    actions: [{ action: 'fill', ref: 2, value: 'a\tb\r\nc' }],
+    done: false,
+  });
+  const fenced = '说明\n```json\n{"say":"多行\n回答","done":true,"actions":[]}\n```';
+  assert.deepEqual(plain(core.parseReply(fenced)), { say: '多行\n回答', actions: [], done: true });
+});
+
 test('core parseReply 正确处理字符串内括号、转义引号和嵌套值', () => {
   const core = loadCore();
   const instruction = {
@@ -671,6 +683,46 @@ test('侧边栏与设置页使用任务隔离、可取消请求和集中设置�
   assert.match(options, /ViasCore\.callModel/);
   assert.ok(sidepanelHtml.indexOf('core.js') < sidepanelHtml.indexOf('sidepanel.js'));
   assert.ok(optionsHtml.indexOf('core.js') < optionsHtml.indexOf('options.js'));
+});
+
+test('侧边栏任务列表复选框用自绘 span 而非被净化的 input', () => {
+  const sidepanel = read('sidepanel.js');
+  const sidepanelHtml = read('sidepanel.html');
+
+  assert.match(sidepanel, /checkbox\(checked\)\s*\{\s*return `<span class="task-checkbox\$\{checked \? ' checked' : ''\}" aria-hidden="true"><\/span>`;/);
+  assert.match(sidepanelHtml, /\.md-content li:has\(> \.task-checkbox\)/);
+  assert.doesNotMatch(sidepanelHtml, /input\[type="checkbox"\]/, '复选框样式应针对自绘 span，不再引用被 DOMPurify 剥掉的 input');
+});
+
+test('侧边栏无审批残留且具备基础无障碍与 CSP 边界', () => {
+  const sidepanelHtml = read('sidepanel.html');
+  const manifest = JSON.parse(read('manifest.json'));
+
+  assert.doesNotMatch(sidepanelHtml, /\.approval/, '审批卡片已拆除，不应残留样式');
+  assert.doesNotMatch(sidepanelHtml, /\.md-content img/, 'img 已被 DOMPurify 禁止，对应样式应删除');
+  assert.doesNotMatch(sidepanelHtml, /scroll-behavior:\s*smooth/, '平滑滚动的中间滚动事件会误翻自动吸底状态');
+  assert.match(sidepanelHtml, /<title>Vias 页面助手<\/title>/);
+  assert.match(sidepanelHtml, /id="modeAsk" aria-pressed="false"/);
+  assert.match(sidepanelHtml, /id="modeAgent" class="on" aria-pressed="true"/);
+  assert.match(sidepanelHtml, /id="copyToast" role="status" aria-live="polite"/);
+  assert.equal(manifest.content_security_policy?.extension_pages, "script-src 'self'; object-src 'self'; img-src 'self' data:");
+  assert.doesNotMatch(manifest.description, /可确认/, '审批门已拆除，描述不应再声称可确认');
+});
+
+test('内容脚本健壮性：非安全上下文、快照原子性与边界 DOM', () => {
+  const content = read('content.js');
+  const background = read('background.js');
+
+  assert.match(content, /crypto\.randomUUID\?\.\(\)/, '纯 http 页面无 randomUUID，documentId 需退化生成');
+  assert.match(content, /if \(el === document\.body \|\| el === document\.documentElement\) return el === document\.body \? 'body' : 'html';/, 'body/html 指纹须稳定，不受页面文字抖动影响');
+  assert.match(content, /refFingerprints\.clear\(\);[\s\S]{0,120}currentSnapshotId = '';/, '重建期间旧快照应立即失效，防止旧编号解析到新元素');
+  assert.match(content, /insertLineBreak/, 'textarea 上 Enter 应换行而非提交表单');
+  assert.doesNotMatch(content, /anchor\?\.isConnected\) \{/, '点击后恢复 target 属性不应以 isConnected 为条件，避免 _self 永久泄漏');
+  assert.match(content, /文件上传暂不支持/, 'fill/type 文件输入应返回明确错误而非抛异常');
+  assert.match(content, /SKIPPED_AFTER_NAVIGATION'[\s\S]{0,300}navigationUrl/, '跳过结果应携带 navigationUrl');
+  assert.match(content, /if \(target\.multiple\)/, '多选下拉须走数组分支，标量赋值会清掉其余已选项');
+  assert.match(background, /action === 'select' && Array\.isArray\(raw\.value\)/, 'background 校验须放行 select 的数组 value');
+  assert.match(background, /多选下拉传数组/, '操作协议须告知模型多选下拉的数组用法');
 });
 
 test('静态安全边界：密钥脱敏、页面隔离与无动态代码执行', () => {

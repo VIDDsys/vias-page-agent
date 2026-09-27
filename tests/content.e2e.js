@@ -225,6 +225,56 @@ test('fill 相同值重放不重复触发 input/change', { timeout: 30000 }, asy
   });
 });
 
+test('多选下拉：数组 value 多选不互斥，标量 value 精确设定单选', { timeout: 30000 }, async () => {
+  await withFixture(async (page) => {
+    const firstExtraction = await extract(page);
+    const fruitsRef = refMatching(firstExtraction, /下拉框 标签:Fruits/);
+    const multi = await execute(page, firstExtraction, 'op-multi-1', [
+      { action: 'select', ref: fruitsRef, value: ['apple', 'cherry'] },
+    ]);
+    assert.equal(multi.results[0].ok, true);
+    assert.deepEqual(await page.evaluate(() => [...document.querySelector('#fruits').selectedOptions].map((option) => option.value)), ['apple', 'cherry'], '数组多选不得互相覆盖');
+    assert.equal(await page.evaluate(() => window.fixtureCounts.fruitsChange), 1);
+
+    const secondExtraction = await extract(page);
+    await execute(page, secondExtraction, 'op-multi-2', [
+      { action: 'select', ref: refMatching(secondExtraction, /下拉框 标签:Fruits/), value: 'banana' },
+    ]);
+    assert.deepEqual(await page.evaluate(() => [...document.querySelector('#fruits').selectedOptions].map((option) => option.value)), ['banana'], '多选下拉上的标量 value 应精确设定为单项');
+  });
+});
+
+test('textarea 上 press Enter 换行而不提交表单', { timeout: 30000 }, async () => {
+  await withFixture(async (page) => {
+    const firstExtraction = await extract(page);
+    const notesRef = refMatching(firstExtraction, /文本域 标签:Notes/);
+    await execute(page, firstExtraction, 'op-notes-1', [
+      { action: 'fill', ref: notesRef, value: '第一行' },
+    ]);
+
+    const secondExtraction = await extract(page);
+    const pressed = await execute(page, secondExtraction, 'op-notes-2', [
+      { action: 'press', ref: refMatching(secondExtraction, /文本域 标签:Notes/), value: 'Enter' },
+    ]);
+    assert.equal(pressed.results[0].ok, true);
+    assert.equal(await page.evaluate(() => document.querySelector('#notes').value), '第一行\n', 'textarea 的 Enter 应插入换行');
+    assert.equal(await page.evaluate(() => window.fixtureCounts.formSubmit), 0, 'textarea 的 Enter 不得触发 requestSubmit');
+  });
+});
+
+test('fill 文件输入返回明确错误且不抛异常', { timeout: 30000 }, async () => {
+  await withFixture(async (page) => {
+    const extraction = await extract(page);
+    const uploadRef = refMatching(extraction, /输入框\(file\) 标签:Upload/);
+    const outcome = await execute(page, extraction, 'op-file-1', [
+      { action: 'fill', ref: uploadRef, value: 'fake.txt' },
+    ]);
+    assert.equal(outcome.results[0].ok, false);
+    assert.equal(outcome.results[0].code, 'NOT_EDITABLE');
+    assert.match(outcome.results[0].msg, /文件上传暂不支持/);
+  });
+});
+
 test('checkbox check 相同目标重放后仍保持选中', { timeout: 30000 }, async () => {
   await withFixture(async (page) => {
     const firstExtraction = await extract(page);

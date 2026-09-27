@@ -16,14 +16,28 @@
   <button id="counter">Count once</button>
   <label for="password">Password</label>
   <input id="password" type="password" value="S3cr3t-fixture-value">
+  <form id="note-form">
+    <label for="notes">Notes</label>
+    <textarea id="notes" rows="2"></textarea>
+  </form>
+  <label for="fruits">Fruits</label>
+  <select id="fruits" multiple>
+    <option value="apple">苹果</option>
+    <option value="banana">香蕉</option>
+    <option value="cherry">樱桃</option>
+  </select>
+  <label for="upload">Upload</label>
+  <input id="upload" type="file">
   <section id="long-copy"></section>
   <div id="shadow-host"></div>
   <script>
-    window.fixtureCounts = { button: 0, nameInput: 0, nameChange: 0, termsChange: 0 };
+    window.fixtureCounts = { button: 0, nameInput: 0, nameChange: 0, termsChange: 0, formSubmit: 0, fruitsChange: 0 };
     document.querySelector('#counter').addEventListener('click', () => { window.fixtureCounts.button += 1; });
     document.querySelector('#name').addEventListener('input', () => { window.fixtureCounts.nameInput += 1; });
     document.querySelector('#name').addEventListener('change', () => { window.fixtureCounts.nameChange += 1; });
     document.querySelector('#terms').addEventListener('change', () => { window.fixtureCounts.termsChange += 1; });
+    document.querySelector('#note-form').addEventListener('submit', (event) => { event.preventDefault(); window.fixtureCounts.formSubmit += 1; });
+    document.querySelector('#fruits').addEventListener('change', () => { window.fixtureCounts.fruitsChange += 1; });
 
     const copy = document.querySelector('#long-copy');
     for (let index = 0; index < 100; index += 1) {

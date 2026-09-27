@@ -2,6 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
+<title>Vias 页面助手</title>
 <style>
   /* ===== Rikka 极简黑白灰阶体系（与主站 AI 助手统一） ===== */
   :root {
@@ -70,7 +71,6 @@
   #chat {
     flex: 1; overflow-y: auto; overscroll-behavior: contain;
     padding: 16px 14px 8px; display: flex; flex-direction: column; gap: 14px;
-    scroll-behavior: smooth;
   }
   .msg { max-width: 86%; padding: 10px 14px; font-size: 14px; }
   .msg.user {
@@ -106,13 +106,6 @@
   .tool.pending .tool-state { color: var(--muted); }
   .tool.ok .tool-state { color: var(--ok); }
   .tool.fail .tool-state { color: var(--fail); }
-  .approval { align-self: stretch; border: 1.5px solid var(--ink); border-radius: 14px; padding: 12px 14px; background: var(--page); font-size: 13px; }
-  .approval strong { display: block; margin-bottom: 4px; }
-  .approval pre { margin: 8px 0; padding: 8px 10px; border-radius: 8px; background: var(--line-soft); color: var(--ink); white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.5 "Cascadia Code", Consolas, monospace; }
-  .approval-actions { display: flex; gap: 8px; align-items: center; color: var(--muted); }
-  .approval-actions button { border: 1px solid var(--line); border-radius: 999px; padding: 6px 12px; background: var(--page); color: var(--ink); cursor: pointer; font: inherit; font-size: 12px; }
-  .approval-actions button.primary { background: var(--ink); border-color: var(--ink); color: var(--page); }
-  .approval.resolved { border-color: var(--line); color: var(--muted); }
 
   /* ===== 运行状态条 ===== */
   #status {
@@ -244,17 +237,16 @@
   .md-content a { color: var(--ink); text-underline-offset: 3px; text-decoration-thickness: 1.5px; }
   .md-content mark { --ink: #111111; --ink-strong: #111111; --line-soft: transparent; background: var(--mark); color: #111111; border-radius: 3px; padding: 0 3px; }
   .md-content strong { font-weight: 700; color: var(--ink-strong); }
-  .md-content img { max-width: 100%; border-radius: 10px; }
   /* 任务列表：复选框与文字居中，gap 呼吸留白 */
-  .md-content li:has(> input[type="checkbox"]) {
+  .md-content li:has(> .task-checkbox) {
     list-style: none; display: flex; align-items: center; gap: 10px; margin: 4px 0;
   }
-  .md-content li:has(> input[type="checkbox"])::marker { content: ''; }
-  .md-content input[type="checkbox"] {
-    appearance: none; width: 15px; height: 15px; flex: none;
+  .md-content li:has(> .task-checkbox)::marker { content: ''; }
+  .md-content .task-checkbox {
+    width: 15px; height: 15px; flex: none;
     border: 1.5px solid var(--muted); border-radius: 4px; cursor: default; margin: 0;
   }
-  .md-content input[type="checkbox"]:checked {
+  .md-content .task-checkbox.checked {
     background: var(--ink); border-color: var(--ink);
     background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='white'%3E%3Cpath d='M6.3 11.2 3.1 8l-1 1 4.2 4.2 7.4-7.4-1-1z'/%3E%3C/svg%3E");
     background-size: 12px; background-position: center; background-repeat: no-repeat;
@@ -272,8 +264,8 @@
 <header>
   <div class="brand">Vias<small>页面助手</small></div>
   <div class="seg">
-    <button id="modeAsk" title="只读当前页面回答，不执行任何操作">问答</button>
-    <button id="modeAgent" class="on" title="AI 可操作当前页面（点击、填写、提交）">执行</button>
+    <button id="modeAsk" aria-pressed="false" title="只读当前页面回答，不执行任何操作">问答</button>
+    <button id="modeAgent" class="on" aria-pressed="true" title="AI 可操作当前页面（点击、填写、提交）">执行</button>
   </div>
   <button id="clear" class="icon-btn" title="新建对话">新建</button>
   <button id="gear" class="icon-btn" title="设置">设置</button>
@@ -289,7 +281,7 @@
     <button id="send" type="submit" title="发送">➤</button>
   </form>
 </footer>
-<div class="copy-toast" id="copyToast">已复制</div>
+<div class="copy-toast" id="copyToast" role="status" aria-live="polite">已复制</div>
 <div class="model-menu" id="modelMenu" role="menu" aria-label="模型列表"></div>
 <script src="vendor/marked.min.js"></script>
 <script src="vendor/purify.min.js"></script>

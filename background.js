@@ -16,7 +16,7 @@ const ACTION_PROTOCOL = `
 可用 action：click、dblclick、hover、fill、type、press、select、check、checkRadio、submitForm、scroll、navigate、wait、repeat。
 - 勾选复选框（多选题选项）用 check，点选单选钮用 checkRadio：目标已选中时安全跳过，不会误取消；不要用 click 勾选，重复点击会把已选项翻掉。
 - 页面交互元素带 [编号]，必须优先使用最新页面中的 ref；每批操作后编号全部刷新，旧编号立即失效。
-- fill/type/select 使用 value；press 的 value 是 Enter/Tab/Escape/方向键等；navigate 仅 http(s) URL。
+- fill/type/select 使用 value（多选下拉传数组，如 ["苹果","香蕉"]）；press 的 value 是 Enter/Tab/Escape/方向键等；navigate 仅 http(s) URL。
 - scroll 的 value 为 top、bottom 或相对滚动像素，也可带 ref 滚动指定容器。
 - wait 可带 selector 和超时毫秒，或只带延时毫秒。
 - repeat 仅用于精确定时重复，格式 {"action":"repeat","times":10,"value":3000,"actions":[...]}; 禁止嵌套 repeat。
@@ -87,8 +87,9 @@ function updateSettings(message) {
       const normalized = globalThis.ViasCore.validateModel(message.model);
       const id = String(normalized.id || '').trim();
       if (!id || id.length > 100) throw new Error('模型 ID 无效');
-      const model = { id, name: normalized.name || normalized.model, baseUrl: normalized.baseUrl, apiKey: normalized.apiKey, model: normalized.model, vision: normalized.vision };
       const index = state.models.findIndex((item) => item.id === id);
+      const apiKey = message.keepApiKey === true && index >= 0 ? String(state.models[index].apiKey || '') : normalized.apiKey;
+      const model = { id, name: normalized.name || normalized.model, baseUrl: normalized.baseUrl, apiKey, model: normalized.model, vision: normalized.vision };
       if (index >= 0) state.models[index] = model;
       else state.models.push(model);
       if (!state.activeModelId) state.activeModelId = id;
@@ -177,7 +178,10 @@ function validateAction(raw, depth = 0) {
     result.ref = ref;
   }
   if (raw.selector != null && raw.selector !== '') result.selector = String(raw.selector).slice(0, 1000);
-  if (raw.value != null) result.value = typeof raw.value === 'number' ? raw.value : String(raw.value).slice(0, 20000);
+  if (raw.value != null) {
+    if (action === 'select' && Array.isArray(raw.value)) result.value = raw.value.slice(0, 50).map((item) => String(item ?? '').slice(0, 20000));
+    else result.value = typeof raw.value === 'number' ? raw.value : String(raw.value).slice(0, 20000);
+  }
   if (raw.times != null) {
     const times = Number(raw.times);
     if (!Number.isInteger(times) || times < 1 || times > 100) throw new Error('repeat times 必须为 1-100 的整数');
@@ -244,39 +248,6 @@ function instructionHistory(parsed, actions, page) {
   return text;
 }
 
-function approvalReason(actions, page, question) {
-  const explicitlyRequiresConfirmation = /(提交前.{0,12}确认|确认后.{0,12}提交|先问我|让我确认)/i.test(question);
-  const inspect = (items) => {
-    for (const action of items) {
-      if (action.action === 'repeat') {
-        const nested = inspect(action.actions || []);
-        if (nested) return nested;
-        continue;
-      }
-      const meta = targetMetaOf(page, action);
-      const description = targetDescription(page, action);
-      const combined = `${description} ${action.selector || ''} ${action.value || ''}`;
-      if (action.selector && ['click', 'dblclick', 'fill', 'type', 'select', 'submitForm', 'check', 'checkRadio', 'press'].includes(action.action)) {
-        return `即将使用后备选择器执行操作：${action.action} ${action.selector}`;
-      }
-      if (actionIsSensitive(action, page)) return '即将填写敏感信息';
-      if (/(支付|付款|购买|下单|转账|删除|注销|发布|公开|发送|提交|保存|登录|注册)/i.test(combined)) return `即将执行可能产生外部影响的操作：${description || action.action}`;
-      if (action.action === 'submitForm' || meta?.submitsForm) return '即将提交表单';
-      if (action.action === 'press' && String(action.value || '').toLowerCase() === 'enter' && meta?.inForm) return '按下 Enter 可能提交表单';
-      if (action.action === 'navigate') {
-        try {
-          if (new URL(String(action.value), page.url).origin !== new URL(page.url).origin) return `即将跳转到其他站点：${new URL(String(action.value), page.url).origin}`;
-        } catch {
-          return '即将跳转到其他站点';
-        }
-      }
-      if (explicitlyRequiresConfirmation && ['click', 'press'].includes(action.action)) return '用户要求在执行前确认';
-    }
-    return '';
-  };
-  return inspect(actions);
-}
-
 function batchTouchesSubmit(actions, page) {
   const inspect = (items) => items.some((action) => {
     if (action.action === 'repeat') return inspect(action.actions || []);
@@ -316,7 +287,6 @@ function createRun(port, runId, tabId) {
     cancelled: false,
     finished: false,
     pendingModels: new Map(),
-    pendingApprovals: new Map(),
   };
 }
 
@@ -332,8 +302,6 @@ function rejectPending(run, reason) {
     pending.reject(new Error(reason));
   }
   run.pendingModels.clear();
-  for (const pending of run.pendingApprovals.values()) pending.resolve(false);
-  run.pendingApprovals.clear();
 }
 
 async function cancelRun(run, reason = '任务已取消') {
@@ -357,21 +325,6 @@ function requestModel(run, cfg, messages) {
       reject: (error) => { clearTimeout(timeout); reject(error); },
     });
     emit(run, 'model_request', { requestId, cfg, messages });
-  });
-}
-
-function requestApproval(run, reason, actions, page) {
-  if (run.cancelled) return Promise.resolve(false);
-  const approvalId = randomId('approval');
-  return new Promise((resolve) => {
-    const timeout = setTimeout(() => {
-      run.pendingApprovals.delete(approvalId);
-      resolve(false);
-    }, 120000);
-    run.pendingApprovals.set(approvalId, {
-      resolve: (approved) => { clearTimeout(timeout); resolve(approved); },
-    });
-    emit(run, 'approval', { approvalId, reason, actions: actions.map((action) => displayAction(action, page)) });
   });
 }
 
@@ -687,11 +640,6 @@ chrome.runtime.onConnect.addListener((port) => {
       portRun.pendingModels.delete(message.requestId);
       if (message.error) pending.reject(new Error(String(message.error)));
       else pending.resolve(String(message.text || ''));
-    } else if (message.t === 'approve') {
-      const pending = portRun.pendingApprovals.get(message.approvalId);
-      if (!pending) return;
-      portRun.pendingApprovals.delete(message.approvalId);
-      pending.resolve(message.approved === true);
     }
   });
   port.onDisconnect.addListener(() => {
@@ -702,14 +650,22 @@ chrome.runtime.onConnect.addListener((port) => {
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // Content scripts share the runtime; only extension pages may read or change settings.
+  if (sender.id !== chrome.runtime.id || !String(sender.url || '').startsWith(chrome.runtime.getURL(''))) return;
   if (message.type === 'PING') {
     sendResponse({ ok: true, status: currentStatus, running: !!activeRun });
     return;
   }
   if (message.type === 'GET_SETTINGS') {
     getState().then((state) => {
-      const isOptionsPage = sender.id === chrome.runtime.id && sender.url === chrome.runtime.getURL('options.html');
-      sendResponse(message.includeSecrets === true && isOptionsPage ? { ok: true, ...state } : publicState(state));
+      sendResponse({ ...publicState(state), systemPrompt: state.systemPrompt });
+    }).catch((error) => sendResponse({ ok: false, error: String(error?.message || error) }));
+    return true;
+  }
+  if (message.type === 'RESOLVE_MODEL') {
+    getState().then((state) => {
+      const model = state.models.find((item) => item.id === String(message.id || ''));
+      sendResponse(model ? { ok: true, model } : { ok: false, error: '模型不存在' });
     }).catch((error) => sendResponse({ ok: false, error: String(error?.message || error) }));
     return true;
   }

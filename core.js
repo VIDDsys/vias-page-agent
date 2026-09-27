@@ -200,6 +200,11 @@
           continue;
         }
         if (ch === '"') { inStr = false; out += ch; continue; }
+        const code = ch.charCodeAt(0);
+        if (code < 0x20) {
+          out += ch === '\n' ? '\\n' : ch === '\r' ? '\\r' : ch === '\t' ? '\\t' : `\\u${code.toString(16).padStart(4, '0')}`;
+          continue;
+        }
         out += ch;
         continue;
       }

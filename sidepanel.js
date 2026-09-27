@@ -28,6 +28,10 @@ let toastTimer;
 marked.use({
   gfm: true,
   breaks: false,
+  renderer: {
+    // DOMPurify 禁止 input，任务列表复选框改用自绘 span，避免被剥掉后丢失
+    checkbox(checked) { return `<span class="task-checkbox${checked ? ' checked' : ''}" aria-hidden="true"></span>`; },
+  },
   extensions: [{
     name: 'highlight',
     level: 'inline',
@@ -45,7 +49,7 @@ function renderMarkdown(text) {
   return DOMPurify.sanitize(raw, {
     USE_PROFILES: { html: true },
     FORBID_TAGS: ['img', 'picture', 'source', 'audio', 'video', 'iframe', 'object', 'embed', 'style', 'form', 'input', 'button'],
-    FORBID_ATTR: ['style', 'srcset', 'formaction'],
+    FORBID_ATTR: ['style', 'srcset', 'formaction', 'background', 'poster', 'ping', 'action', 'xlink:href'],
     ALLOWED_URI_REGEXP: /^(?:(?:https?|mailto):|[^a-z]|[a-z+.-]+(?:[^a-z+.-:]|$))/i,
   }).replace(/<table>/g, '<div class="table-scroll"><table>').replace(/<\/table>/g, '</table></div>');
 }
@@ -80,6 +84,7 @@ function addMessage(role, text) {
     markdown.className = 'md-content';
     markdown.innerHTML = renderMarkdown(text);
     hardenLinks(markdown);
+    for (const pre of markdown.querySelectorAll('pre')) { pre.tabIndex = 0; pre.title = '点击或按 Enter 复制'; }
     element.appendChild(markdown);
   } else {
     element.textContent = text;
@@ -120,55 +125,6 @@ function addTools(round, actions) {
   return slots;
 }
 
-function formatActionPreview(action, indent = '') {
-  const target = action.ref != null ? `@${action.ref}` : action.selector || '';
-  const value = action.value != null && action.value !== '' ? ` ← ${String(action.value).slice(0, 120)}` : '';
-  if (action.action !== 'repeat') return `${indent}${action.action} ${target}${value}`.trimEnd();
-  const header = `${indent}repeat ${action.times || 1} 次，周期 ${action.value ?? 1000}ms`;
-  return [header, ...(action.actions || []).map((item) => formatActionPreview(item, `${indent}  `))].join('\n');
-}
-
-function addApproval(context, message) {
-  for (const card of context.approvals.values()) resolveApprovalCard(card, false, '已失效');
-  const card = document.createElement('section');
-  card.className = 'approval';
-  const title = document.createElement('strong');
-  title.textContent = '需要你的确认';
-  const reason = document.createElement('div');
-  reason.textContent = message.reason || '即将执行高风险操作';
-  const preview = document.createElement('pre');
-  preview.textContent = (message.actions || []).map((action) => formatActionPreview(action)).join('\n');
-  const buttons = document.createElement('div');
-  buttons.className = 'approval-actions';
-  const approve = document.createElement('button');
-  approve.className = 'primary';
-  approve.textContent = '允许本批操作';
-  const cancel = document.createElement('button');
-  cancel.textContent = '取消任务';
-  buttons.append(approve, cancel);
-  card.append(title, reason, preview, buttons);
-  chatEl.appendChild(card);
-  const entry = { card, buttons, approvalId: message.approvalId };
-  context.approvals.set(message.approvalId, entry);
-  approve.addEventListener('click', () => {
-    if (activeRun !== context || context.finished) return;
-    context.port?.postMessage({ t: 'approve', runId: context.runId, approvalId: message.approvalId, approved: true });
-    resolveApprovalCard(entry, true, '已允许');
-  });
-  cancel.addEventListener('click', () => {
-    if (activeRun !== context || context.finished) return;
-    context.port?.postMessage({ t: 'approve', runId: context.runId, approvalId: message.approvalId, approved: false });
-    resolveApprovalCard(entry, false, '已取消');
-  });
-  scrollBottom(true);
-}
-
-function resolveApprovalCard(entry, approved, label) {
-  if (!entry || entry.card.classList.contains('resolved')) return;
-  entry.card.classList.add('resolved');
-  entry.buttons.replaceChildren(document.createTextNode(label || (approved ? '已允许' : '已取消')));
-}
-
 function setStatus(text) {
   statusEl.classList.toggle('show', !!text);
   statusEl.textContent = text || '';
@@ -190,7 +146,12 @@ async function copyText(text, success) {
   }
 }
 
+document.addEventListener('keydown', (event) => {
+  const pre = event.target.closest?.('.md-content pre');
+  if (pre && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); void copyText((pre.innerText || '').trim(), '代码块已复制'); }
+});
 document.addEventListener('click', (event) => {
+  if (String(getSelection() || '').length) return;
   const pre = event.target.closest('pre');
   if (pre?.closest('.md-content')) { void copyText((pre.innerText || '').trim(), '代码块已复制'); return; }
   if (event.target.tagName === 'CODE' && event.target.closest('.md-content') && !event.target.closest('pre')) void copyText((event.target.innerText || '').trim(), '行内代码已复制');
@@ -437,10 +398,9 @@ function finishRun(context, outcome, error = '') {
   if (!context || context.finished) return;
   context.finished = true;
   clearInterval(context.heartbeat);
+  clearTimeout(context.stopFallback);
   for (const controller of context.modelControllers.values()) controller.abort();
   context.modelControllers.clear();
-  for (const approval of context.approvals.values()) resolveApprovalCard(approval, false, '已失效');
-  context.approvals.clear();
   try { context.port?.disconnect(); } catch {}
   if (activeRun !== context) return;
   activeRun = null;
@@ -479,7 +439,8 @@ function stopRun() {
   setStatus('正在安全停止…');
   for (const controller of context.modelControllers.values()) controller.abort();
   if (context.port) {
-    try { context.port.postMessage({ t: 'cancel', runId: context.runId }); } catch { finishRun(context, 'interrupted', '连接已中断，任务已停止'); }
+    try { context.port.postMessage({ t: 'cancel', runId: context.runId }); } catch { finishRun(context, 'interrupted', '连接已中断，任务已停止'); return; }
+    context.stopFallback = setTimeout(() => finishRun(context, 'cancelled', '后台未及时确认停止，已在侧边栏强制结束；请检查页面状态'), 8000);
   } else {
     finishRun(context, 'cancelled');
   }
@@ -487,13 +448,13 @@ function stopRun() {
 
 async function send() {
   const question = inputEl.value.trim();
-  if (!initialized || !question || activeRun) return;
+  if (!question || activeRun) return;
+  if (!initialized) { addMessage('sys', '侧边栏尚未初始化成功，请关闭后重新打开侧边栏'); return; }
   const context = {
     runId: crypto.randomUUID(),
     port: null,
     heartbeat: null,
     modelControllers: new Map(),
-    approvals: new Map(),
     toolsByRound: new Map(),
     finished: false,
     stopRequested: false,
@@ -506,7 +467,7 @@ async function send() {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (activeRun !== context || context.stopRequested) { finishRun(context, 'cancelled'); return; }
-    if (!tab?.id || /^(edge|chrome|extension|about|file):/i.test(tab.url || '')) throw new Error('当前页面不可读取，请切换到普通 http(s) 网页');
+    if (!tab?.id || !/^https?:/i.test(tab.url || '') || /^https:\/\/(microsoftedge\.microsoft\.com\/addons|chromewebstore\.google\.com)\//i.test(tab.url)) throw new Error('当前页面不可读取，请切换到普通 http(s) 网页');
     inputEl.value = '';
     autosize();
     addMessage('user', question);
@@ -538,8 +499,6 @@ async function send() {
         void handleModelRequest(context, message);
       } else if (message.t === 'model_cancel') {
         context.modelControllers.get(message.requestId)?.abort();
-      } else if (message.t === 'approval') {
-        addApproval(context, message);
       } else if (message.t === 'error') {
         finishRun(context, 'interrupted', message.message || '任务启动失败');
       } else if (message.t === 'done') {
@@ -554,6 +513,8 @@ async function send() {
       try { port.postMessage({ t: 'ping', runId: context.runId }); } catch {}
     }, 15000);
     const conversation = boundedHistory(history.slice(0, -1));
+    // 会话窗口取「提问前最近 100 条」，快照取「含当前提问最近 100 条」；裁剪须在两者都构造完之后
+    if (history.length > 100) history.splice(0, history.length - 100);
     port.postMessage({ t: 'RUN', runId: context.runId, tabId: tab.id, question, allowActions, maxSteps: allowActions ? 50 : 1, history: conversation });
   } catch (error) {
     finishRun(context, 'interrupted', error.message);
@@ -598,7 +559,8 @@ chrome.storage.onChanged.addListener((_changes, area) => {
   try {
     const currentWindow = await chrome.windows.getCurrent();
     await initializeHistory(currentWindow.id);
-    const current = await refreshModels();
+    let current = await refreshModels();
+    if (current === null) current = await refreshModels();
     if (!current) addMessage('sys', '尚未配置模型：点击上方「＋ 配置模型」添加 API 地址、Key 和模型名。');
     if (!chatEl.children.length) addMessage('sys', 'Vias 已就绪\n「执行」可操作当前页面，「问答」只读取页面。复杂任务会持续观察并自动执行页面操作（已开启完全访问权限，全部自动允许）。');
     initialized = true;

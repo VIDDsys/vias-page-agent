@@ -27,12 +27,12 @@ function listen(server) {
 }
 
 async function settings(page) {
-  return page.evaluate(() => chrome.runtime.sendMessage({ type: 'GET_SETTINGS', includeSecrets: true }));
+  return page.evaluate(() => chrome.runtime.sendMessage({ type: 'GET_SETTINGS' }));
 }
 
 async function seed(page, models, active = models[0]?.id || '') {
   await page.evaluate(async ({ models, active }) => {
-    const state = await chrome.runtime.sendMessage({ type: 'GET_SETTINGS', includeSecrets: true });
+    const state = await chrome.runtime.sendMessage({ type: 'GET_SETTINGS' });
     await chrome.storage.local.set({ models, activeModelId: active, settingsRevision: state.settingsRevision + 1 });
   }, { models, active });
 }
@@ -311,9 +311,32 @@ async function screenshot(page, name) {
       await optionsA.locator('#fName').fill('不应写入的旧表单');
       await savePrompt(optionsB, 'B 更新以制造模型表单冲突');
       await optionsA.locator('#btnSave').click();
-      await optionsA.locator('#formWrap').waitFor({ state: 'hidden' });
+      await optionsA.locator('#formStatus').filter({ hasText: '表单内容已保留' }).waitFor();
+      assert.equal(await optionsA.locator('#formWrap').isVisible(), true, '冲突后表单保持打开');
+      assert.equal(await optionsA.locator('#fName').inputValue(), '不应写入的旧表单');
       assert.equal((await settings(optionsA)).models[0].name, '已编辑模型');
       assert.equal(await optionsA.locator('#systemPrompt').inputValue(), draft);
+      await optionsA.locator('#btnCancel').click();
+    });
+
+    await check('编辑保存不回传明文 Key：留空保留、清除生效、内容脚本不可读写设置', async () => {
+      await seed(optionsA, [{ id: 'k1', name: '带 Key 模型', baseUrl: `http://127.0.0.1:${modelPort}/v1`, apiKey: 'sk-keep-me', model: 'mock-k', vision: false }]);
+      await optionsA.waitForFunction(() => models.length === 1 && models[0].id === 'k1');
+      assert.equal(await optionsA.evaluate(() => JSON.stringify(models).includes('sk-keep-me')), false, '设置页内存中不得持有明文 Key');
+      await optionsA.locator('#modelList .card').first().getByRole('button', { name: '编辑', exact: true }).click();
+      await optionsA.locator('#fName').fill('改名但不动 Key');
+      await optionsA.locator('#btnSave').click();
+      await optionsA.locator('#formWrap').waitFor({ state: 'hidden' });
+      const stored = await optionsA.evaluate(() => chrome.storage.local.get('models'));
+      assert.equal(stored.models[0].apiKey, 'sk-keep-me');
+      assert.equal(stored.models[0].name, '改名但不动 Key');
+      await optionsA.locator('#modelList .card').first().getByRole('button', { name: '编辑', exact: true }).click();
+      await optionsA.locator('#fClearKey').check();
+      await optionsA.locator('#btnSave').click();
+      await optionsA.locator('#formWrap').waitFor({ state: 'hidden' });
+      assert.equal((await optionsA.evaluate(() => chrome.storage.local.get('models'))).models[0].apiKey, '');
+      await seed(optionsA, models(6));
+      await optionsA.waitForFunction(() => models.length === 6);
     });
 
     await check('保存响应延迟期间继续编辑：不清脏、不覆盖，后续保存使用正确基线', async () => {

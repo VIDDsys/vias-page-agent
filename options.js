@@ -6,7 +6,6 @@ let models = [];
 let activeModelId = '';
 let editingId = null;
 let settingsRevision = 0;
-let dirtyForm = false;
 let formRevision = 0;
 let apiKeyTouched = false;
 let promptDirty = false;
@@ -27,7 +26,7 @@ function runtimeMessage(message) {
 }
 
 async function load() {
-  const state = await runtimeMessage({ type: 'GET_SETTINGS', includeSecrets: true });
+  const state = await runtimeMessage({ type: 'GET_SETTINGS' });
   if (!state?.ok) throw new Error(state?.error || '无法读取设置');
   const revision = state.settingsRevision || 0;
   if (revision < settingsRevision) return;
@@ -107,7 +106,7 @@ function renderList() {
     );
     const meta = document.createElement('div');
     meta.className = 'meta';
-    meta.textContent = `${model.baseUrl} · ${model.model} · Key: ${model.apiKey ? '已配置' : '免鉴权/未填'} · 图片: ${model.vision ? '允许' : '关闭'}`;
+    meta.textContent = `${model.baseUrl} · ${model.model} · Key: ${model.hasApiKey ? '已配置' : '免鉴权/未填'} · 图片: ${model.vision ? '允许' : '关闭'}`;
     card.append(row, meta);
     list.appendChild(card);
   }
@@ -117,11 +116,13 @@ async function update(operation, fields = {}, expectedRevision = settingsRevisio
   const response = await runtimeMessage({ type: 'UPDATE_SETTINGS', operation, expectedRevision, ...fields });
   if (!response?.ok) {
     if (response?.code === 'REVISION_CONFLICT') {
-      if (operation !== 'setPrompt') closeForm();
       await load();
+      if (operation === 'upsertModel') formRevision = settingsRevision;
       throw new Error(operation === 'setPrompt'
         ? '设置已在其他窗口更新；提示词草稿已保留，请核对下方最新提示词后继续'
-        : '设置已在其他窗口更新；模型编辑表单已关闭，请重新打开后再修改（提示词草稿保留）');
+        : operation === 'upsertModel'
+          ? '设置已在其他窗口更新；表单内容已保留，请核对上方列表后再次保存以覆盖'
+          : '设置已在其他窗口更新，列表已刷新，请重试');
     }
     throw new Error(response?.error || '保存失败');
   }
@@ -143,6 +144,7 @@ async function deleteModel(model) {
   if (!confirm(`删除模型「${model.name}」？`)) return;
   try {
     await update('deleteModel', { id: model.id });
+    if (editingId === model.id) closeForm();
     await load();
   } catch (error) {
     setStatus('promptStatus', error.message, false, true);
@@ -151,16 +153,15 @@ async function deleteModel(model) {
 
 function openForm(model) {
   editingId = model?.id || null;
-  dirtyForm = true;
   formRevision = settingsRevision;
   apiKeyTouched = false;
   $('formTitle').textContent = model ? '编辑模型' : '添加模型';
   $('fName').value = model?.name || '';
   $('fBase').value = model?.baseUrl || '';
   $('fKey').value = '';
-  $('fKey').placeholder = model?.apiKey ? '已配置；留空保留，输入新值替换' : 'sk-...（本地无鉴权服务可留空）';
+  $('fKey').placeholder = model?.hasApiKey ? '已配置；留空保留，输入新值替换' : 'sk-...（本地无鉴权服务可留空）';
   $('fClearKey').checked = false;
-  $('fClearKey').disabled = !model?.apiKey;
+  $('fClearKey').disabled = !model?.hasApiKey;
   $('fModel').value = model?.model || '';
   $('fVision').checked = model?.vision === true;
   $('formStatus').textContent = '';
@@ -170,14 +171,12 @@ function openForm(model) {
 
 function closeForm() {
   editingId = null;
-  dirtyForm = false;
   apiKeyTouched = false;
   $('formWrap').classList.remove('show');
 }
 
 $('btnAdd').addEventListener('click', () => openForm(null));
 $('btnCancel').addEventListener('click', closeForm);
-$('formWrap').addEventListener('input', () => { dirtyForm = true; });
 $('fKey').addEventListener('input', () => { apiKeyTouched = true; });
 $('systemPrompt').addEventListener('input', () => {
   // The draft stays based on the last displayed/saved/reconciled prompt, not a model-list refresh.
@@ -198,17 +197,17 @@ $('btnSave').addEventListener('click', async () => {
   const saveButton = $('btnSave');
   saveButton.disabled = true;
   try {
-    const existing = models.find((model) => model.id === editingId);
+    const keepApiKey = !!editingId && !apiKeyTouched && !$('fClearKey').checked;
     const validated = globalThis.ViasCore.validateModel({
       id: editingId || crypto.randomUUID(),
       name: $('fName').value,
       baseUrl: $('fBase').value,
-      apiKey: $('fClearKey').checked ? '' : (editingId && !apiKeyTouched ? existing?.apiKey || '' : $('fKey').value),
+      apiKey: $('fClearKey').checked || keepApiKey ? '' : $('fKey').value,
       model: $('fModel').value,
       vision: $('fVision').checked,
     });
     if (!validated.name) throw new Error('请填写显示名称');
-    await update('upsertModel', { model: validated }, formRevision);
+    await update('upsertModel', { model: validated, keepApiKey }, formRevision);
     closeForm();
     await load();
   } catch (error) {
@@ -222,15 +221,16 @@ async function testModel(model, testButton) {
   const oldText = testButton.textContent;
   testButton.disabled = true;
   testButton.textContent = '测试中…';
-  const controller = new AbortController();
   try {
-    const text = await globalThis.ViasCore.callModel(model, [{ role: 'user', content: '请仅回复 OK' }], { signal: controller.signal, timeoutMs: 60000, retries: 0 });
+    const resolved = await runtimeMessage({ type: 'RESOLVE_MODEL', id: model.id });
+    if (!resolved?.ok) throw new Error(resolved?.error || '无法读取模型配置');
+    const text = await globalThis.ViasCore.callModel(resolved.model, [{ role: 'user', content: '请仅回复 OK' }], { timeoutMs: 60000, retries: 0 });
     if (!text.trim()) throw new Error('模型返回为空');
     testButton.textContent = '可用';
     testButton.title = `返回：${text.slice(0, 120)}`;
   } catch (error) {
     testButton.textContent = '失败';
-    testButton.title = error.name === 'AbortError' ? '测试已取消' : error.message;
+    testButton.title = error.message;
   } finally {
     setTimeout(() => {
       testButton.textContent = oldText;
@@ -271,7 +271,7 @@ $('btnSavePrompt').addEventListener('click', async () => {
 });
 
 chrome.storage.onChanged.addListener((_changes, area) => {
-  if (area === 'local' && !dirtyForm) load().catch((error) => setStatus('promptStatus', error.message, false, true));
+  if (area === 'local') load().catch((error) => setStatus('promptStatus', error.message, false, true));
 });
 
 load().catch((error) => setStatus('promptStatus', error.message, false, true));
