@@ -36,6 +36,10 @@
 
   * { box-sizing: border-box; }
   html, body { height: 100%; }
+  .visually-hidden {
+    position: absolute; width: 1px; height: 1px; margin: -1px;
+    overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; padding: 0;
+  }
   body {
     margin: 0; display: flex; flex-direction: column;
     background: var(--bg); color: var(--ink);
@@ -74,7 +78,7 @@
   }
   .msg { max-width: 86%; padding: 10px 14px; font-size: 14px; }
   .msg.user {
-    align-self: flex-end;
+    align-self: stretch; max-width: none;
     background: var(--page); border: 1.5px solid var(--ink);
     border-radius: 28px 28px 8px 28px;
     white-space: pre-wrap; word-break: break-word;
@@ -136,7 +140,7 @@
     color: var(--ink); border-color: var(--ink);
     transform: translateY(-1px); box-shadow: 0 6px 18px rgba(0,0,0,.06);
   }
-  #modelPill { color: var(--ink); font-weight: 600; max-width: min(240px, calc(100vw - 28px)); overflow: hidden; text-overflow: ellipsis; }
+  #modelPill { flex: 0 1 auto; min-width: 0; margin-right: auto; color: var(--ink); font-weight: 600; max-width: min(240px, calc(100vw - 28px)); overflow: hidden; text-overflow: ellipsis; }
 
   /* ===== 模型切换菜单 ===== */
   .model-menu {
@@ -254,9 +258,14 @@
 
   /* 窄侧栏适配 */
   @media (max-width: 400px) {
-    .msg.user { max-width: 92%; }
     body { font-size: 13.5px; }
     .seg button { padding: 5px 9px; font-size: 11.5px; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    #status::before { animation: none; }
+    .chip, .md-content pre, #send, .copy-toast, .ai-input-form { transition: none; }
+    .chip:hover, .md-content pre:hover, #send:hover { transform: none; }
   }
 </style>
 </head>

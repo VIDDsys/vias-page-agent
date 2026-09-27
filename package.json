@@ -1,8 +1,9 @@
 {
   "name": "vias-page-agent",
-  "version": "0.11.6",
+  "version": "0.12.0",
   "private": true,
   "description": "Vias Edge MV3 page agent",
+  "engines": { "node": ">=21" },
   "scripts": {
     "check": "node --check core.js && node --check background.js && node --check content.js && node --check sidepanel.js && node --check options.js && node --check main-world.js",
     "test": "node --test tests/*.test.js",

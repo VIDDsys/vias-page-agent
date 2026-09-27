@@ -98,8 +98,10 @@
     const retries = Math.floor(Math.min(3, Math.max(0, Number(options.retries) || 0)));
     const url = cfg.baseUrl + '/chat/completions';
     let lastError;
+    let omitTemperature = false;
+    let extraAttempt = 0;
 
-    for (let attempt = 0; attempt <= retries; attempt++) {
+    for (let attempt = 0; attempt <= retries + extraAttempt; attempt++) {
       if (options.signal?.aborted) throw abortError();
       const ctrl = new AbortController();
       const unlink = linkAbort(options.signal, ctrl);
@@ -111,7 +113,7 @@
         const resp = await fetch(url, {
           method: 'POST',
           headers,
-          body: JSON.stringify({ model: cfg.model, messages, temperature: 0.2 }),
+          body: JSON.stringify(omitTemperature ? { model: cfg.model, messages } : { model: cfg.model, messages, temperature: 0.2 }),
           signal: ctrl.signal,
           cache: 'no-store',
           credentials: 'omit',
@@ -128,8 +130,11 @@
             body = '错误响应正文读取失败';
           }
           const error = new Error(`API ${resp.status}${body ? `: ${body}` : ''}`);
+          // 推理类模型（o1/o3/gpt-5 等）会拒绝显式 temperature：去掉该参数不计次重试一次
+          const dropTemperature = resp.status === 400 && !omitTemperature && /temperature/i.test(body);
+          if (dropTemperature) { omitTemperature = true; extraAttempt = 1; responseRetryable = true; }
           error.retryable = responseRetryable;
-          error.retryDelay = retryAfterMs(resp, attempt);
+          error.retryDelay = dropTemperature ? 0 : retryAfterMs(resp, attempt);
           throw error;
         }
 
@@ -142,18 +147,22 @@
         }
         if (ctrl.signal.aborted) throw abortError();
         const choice = data?.choices?.[0];
-        const finishReason = choice?.finish_reason;
-        if (finishReason === 'length') {
+        const finishReason = choice?.finish_reason == null ? '' : String(choice.finish_reason).toLowerCase();
+        if (finishReason === 'length' || finishReason === 'max_tokens') {
           throw new Error('模型输出达到长度限制，回复可能被截断，未执行任何操作；请缩小任务后重试');
         }
-        if (finishReason === 'content_filter') {
+        if (finishReason === 'content_filter' || finishReason === 'safety') {
           throw new Error('模型输出被内容过滤，未执行任何操作；请调整请求后重试');
         }
-        // 兼容省略 finish_reason 的网关，但不接受工具调用或其他未正常结束的输出。
-        if (finishReason !== undefined && finishReason !== 'stop') {
+        // 兼容省略或置 null 的 finish_reason 网关与各家等价正常结束值；工具调用等其他状态不支持。
+        if (finishReason !== '' && !['stop', 'end_turn', 'eos', 'stop_sequence'].includes(finishReason)) {
           throw new Error('模型响应未正常结束或返回了不支持的工具调用，未执行任何操作');
         }
-        const content = choice?.message?.content;
+        let content = choice?.message?.content;
+        if (Array.isArray(content)) {
+          // 部分网关把 content 拆成多段：只拼接文本段，其余段忽略。
+          content = content.map((part) => typeof part === 'string' ? part : (part && typeof part === 'object' && typeof part.text === 'string' && (part.type == null || part.type === 'text') ? part.text : '')).join('');
+        }
         if (typeof content !== 'string' || !content.trim()) {
           throw new Error('模型响应缺少 choices[0].message.content 最终回答（推理内容不会执行）');
         }
@@ -172,7 +181,7 @@
           lastError.retryable = responseRetryable ?? (error?.retryable == null ? error instanceof TypeError : error.retryable === true);
           if (Number.isFinite(error?.retryDelay)) lastError.retryDelay = error.retryDelay;
         }
-        if (attempt >= retries || !lastError.retryable) throw lastError;
+        if (attempt >= retries + extraAttempt || !lastError.retryable) throw lastError;
       } finally {
         clearTimeout(timer);
         unlink();

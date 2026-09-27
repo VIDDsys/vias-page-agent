@@ -272,12 +272,34 @@ test('core 401 正文读取超时仍不重试', async () => {
   assert.equal(clock.pending.size, 0);
 });
 
-test('core 仅返回最终 content，保留字符串签名和省略 finish_reason 的网关', async () => {
-  for (const finishReason of [undefined, 'stop']) {
+test('core 仅返回最终 content，保留字符串签名和省略/置空 finish_reason 的网关', async () => {
+  for (const finishReason of [undefined, null, 'stop', 'end_turn', 'EOS', 'stop_sequence']) {
     const content = '  {"say":"最终回答","done":true}  ';
     const core = loadCore(async () => okResponse({ content, reasoning_content: actionReply }, finishReason));
     assert.equal(await core.callModel(modelConfig, modelMessages), content);
   }
+});
+
+test('core 拼接分段 content 的文本段，忽略非文本段与空结果', async () => {
+  const parts = [{ type: 'text', text: '第一段' }, { type: 'image_url', image_url: { url: 'data:image/png;base64,x' } }, '第二段', { type: 'audio', text: '不该出现' }, { text: '无 type 的文本段' }, null];
+  const core = loadCore(async () => okResponse({ content: parts }, 'stop'));
+  assert.equal(await core.callModel(modelConfig, modelMessages), '第一段第二段无 type 的文本段');
+});
+
+test('core 遇推理模型 temperature 报错时去掉该参数免费重试一次', async () => {
+  const calls = [];
+  const clock = mockClock();
+  const core = loadCore(async (url, init) => {
+    calls.push(JSON.parse(init.body));
+    if (calls.length === 1) return errorResponse(400, 'Unsupported value: temperature does not support 0.2 with this model');
+    return okResponse({ content: 'ok-after-retry' }, 'stop');
+  }, clock.timers);
+  const result = core.callModel(modelConfig, modelMessages, { retries: 0 });
+  await clock.fire(0);
+  assert.equal(await result, 'ok-after-retry');
+  assert.equal(calls.length, 2);
+  assert.equal('temperature' in calls[0], true);
+  assert.equal('temperature' in calls[1], false, '重试请求不得再携带 temperature');
 });
 
 test('core 最终 content 缺失或为空时绝不执行 reasoning_content', async () => {
@@ -295,10 +317,11 @@ test('core 最终 content 缺失或为空时绝不执行 reasoning_content', asy
 test('core 拒绝 length/content_filter 等未完整输出，包括合法 JSON 前缀', async () => {
   const reasons = [
     ['length', /长度限制.*截断/],
+    ['max_tokens', /长度限制.*截断/],
     ['content_filter', /内容过滤/],
+    ['safety', /内容过滤/],
     ['tool_calls', /未正常结束|工具调用/],
     ['function_call', /未正常结束|工具调用/],
-    [null, /未正常结束/],
     [`unknown-${modelConfig.apiKey}`, /未正常结束/],
   ];
   for (const [reason, expected] of reasons) {
@@ -689,9 +712,24 @@ test('侧边栏任务列表复选框用自绘 span 而非被净化的 input', ()
   const sidepanel = read('sidepanel.js');
   const sidepanelHtml = read('sidepanel.html');
 
-  assert.match(sidepanel, /checkbox\(checked\)\s*\{\s*return `<span class="task-checkbox\$\{checked \? ' checked' : ''\}" aria-hidden="true"><\/span>`;/);
+  assert.match(sidepanel, /typeof checked === 'boolean' \? checked : checked\?\.checked === true/, '复选框渲染须容忍 marked 未来传入 token 对象');
+  assert.match(sidepanel, /visually-hidden">\$\{isChecked \? '已勾选' : '未勾选'\}/, '勾选状态须对读屏器可感知');
   assert.match(sidepanelHtml, /\.md-content li:has\(> \.task-checkbox\)/);
   assert.doesNotMatch(sidepanelHtml, /input\[type="checkbox"\]/, '复选框样式应针对自绘 span，不再引用被 DOMPurify 剥掉的 input');
+});
+
+test('净化后不得字符串手术：表格经 detached DOM 包装，动效尊重系统偏好', () => {
+  const sidepanel = read('sidepanel.js');
+  const sidepanelHtml = read('sidepanel.html');
+  const packageJson = JSON.parse(read('package.json'));
+
+  assert.match(sidepanel, /template\.content\.querySelectorAll\('table'\)/, '表格须在净化后的 DOM 上包装，正则替换会被属性值破坏');
+  assert.doesNotMatch(sidepanel, /replace\(<\/?table>/, '不得对净化后 HTML 做表格正则替换');
+  assert.match(sidepanel, /if \(activeRun\) stopRun\(\); else void send\(\);/, 'Enter 在任务运行中应能停止任务');
+  assert.match(sidepanel, /cvv\|身份证/, '侧栏敏感值掩码须与后台口径一致');
+  assert.match(sidepanelHtml, /prefers-reduced-motion/, '动画须尊重系统减弱动效偏好');
+  assert.match(sidepanelHtml, /\.visually-hidden/, '读屏器文本须有视觉隐藏样式');
+  assert.equal(packageJson.engines?.node, '>=21', 'npm test 的 tests/*.test.js 通配需 Node 21+');
 });
 
 test('侧边栏无审批残留且具备基础无障碍与 CSP 边界', () => {
@@ -723,6 +761,33 @@ test('内容脚本健壮性：非安全上下文、快照原子性与边界 DOM'
   assert.match(content, /if \(target\.multiple\)/, '多选下拉须走数组分支，标量赋值会清掉其余已选项');
   assert.match(background, /action === 'select' && Array\.isArray\(raw\.value\)/, 'background 校验须放行 select 的数组 value');
   assert.match(background, /多选下拉传数组/, '操作协议须告知模型多选下拉的数组用法');
+});
+
+test('导航观察与幂等缓存的防伪与自净', () => {
+  const content = read('content.js');
+  const background = read('background.js');
+
+  assert.match(content, /if \(event\.isTrusted !== true\) return;/, 'beforeunload 只信浏览器可信事件，页面可合成该事件伪造导航瘫痪整批');
+  assert.match(content, /message\.approved === true\); \/\/ 完全访问权限/, 'EXECUTE 的 approved 字段必须真实透传，不能硬编码');
+  assert.match(content, /单选下拉不支持数组 value/, '单选下拉收到数组应报错而不是悄悄取第一项');
+  assert.match(content, /form\.novalidate === true/, 'novalidate 表单不应被 reportValidity 拦下');
+  assert.match(content, /operationCache\.delete\(key\)/, '幂等缓存须清除未执行的瞬态结局，允许同 operationId 重试');
+  assert.match(content, /Promise\.resolve\(\{ results: result\.results \}\)/, '幂等缓存瘦身须存 Promise，回放路径会调用 .then');
+  assert.match(background, /if \(result\.navigationUrl\) item\.navigationUrl/, '结果摘要须透传 navigationUrl 给模型');
+  assert.match(background, /index < 0\) throw new Error\('该模型已被删除/, 'keepApiKey 遇已删除模型须报错，不能以空 Key 重建');
+  assert.match(background, /select 数组 value 最多 50 项/, 'select 数组超限应明确报错而非静默截断');
+});
+
+test('后台任务循环的候选标签治理与熔断边界', () => {
+  const background = read('background.js');
+  const options = read('options.js');
+
+  assert.match(background, /run\.candidateTabs = run\.candidateTabs\.filter/, '标签页关闭须同步清理候选列表，否则死候选会打断健康任务');
+  assert.match(background, /candidateTab\?\.url && \/\^https\?:\//, '跟随新标签前须确认其存活且为 http(s)');
+  assert.match(background, /noProgressRounds/, '交替式空转须有界熔断，不能烧满 50 轮');
+  assert.match(background, /if \(stateError\) throw stateError;/, '迁移失败不得被吞掉后按空状态继续');
+  assert.match(background, /提交前无法取得新快照，任务已停止（/, '提交前重读的通信错误须走统一出口');
+  assert.match(options, /closeForm[\s\S]{0,120}fKey'\)\.value = '';?/, '关闭表单须清空已输入的 Key 字段');
 });
 
 test('静态安全边界：密钥脱敏、页面隔离与无动态代码执行', () => {

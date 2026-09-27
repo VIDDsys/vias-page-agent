@@ -15,6 +15,8 @@
   .card { background: var(--page); border: 1px solid var(--line); border-radius: 14px; padding: 12px 16px; margin: 10px 0; }
   .card.active { border-color: var(--ink); box-shadow: 0 6px 20px rgba(0,0,0,.06); }
   .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .row strong { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .row .tag, .row button { flex: none; }
   .meta { color: var(--muted); font-size: 12px; word-break: break-all; margin-top: 4px; }
   label { display: block; margin-top: 12px; font-weight: 600; font-size: 13px; }
   input, textarea { width: 100%; padding: 8px 10px; margin-top: 4px; border-radius: 8px; border: 1px solid var(--line); font: inherit; background: var(--page); color: inherit; }
@@ -25,12 +27,19 @@
   button.danger { color: var(--fail); }
   button:disabled { opacity: .5; cursor: default; }
   .hint { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .form-title-row { display: flex; align-items: baseline; gap: 10px; }
+  .form-title-row h2 { margin-right: auto; }
+  .promote-link { font-size: 13px; color: var(--ink); text-decoration: underline; text-underline-offset: 3px; white-space: nowrap; }
+  .key-row { display: flex; gap: 8px; margin-top: 4px; }
+  .key-row input { flex: 1; min-width: 0; margin-top: 0; }
+  .eye-btn { flex: none; width: 42px; padding: 0; display: inline-flex; align-items: center; justify-content: center; border-radius: 8px; color: var(--muted); }
+  .eye-btn:hover { color: var(--ink); }
   .status { font-size: 12px; }
   .ok { color: var(--ok); }
   .fail { color: var(--fail); }
   #formWrap { display: none; }
   #formWrap.show { display: block; }
-  .tag { font-size: 11px; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; margin-left: 8px; }
+  .tag { font: inherit; font-size: 13px; color: var(--ink); border: 1px solid var(--line); border-radius: 999px; padding: 7px 16px; background: var(--page); }
 </style>
 </head>
 <body>
@@ -44,19 +53,22 @@
 </div>
 
 <div id="formWrap" class="card">
-  <h2 id="formTitle" style="margin-top:0">添加模型</h2>
+  <div class="form-title-row">
+    <h2 id="formTitle" style="margin-top:0">添加模型</h2>
+    <a class="promote-link" href="https://api.viddsys.xyz/" target="_blank" rel="noopener noreferrer">打开VIDDsys API</a>
+  </div>
   <label for="fName">显示名称（侧边栏切换菜单里显示的名字）</label>
-  <input id="fName" autocomplete="off" placeholder="例如：DeepSeek / 我的中转站 / 本地 GLM">
+  <input id="fName" autocomplete="off" placeholder="VIDDsys API">
   <label for="fBase">API 地址（Base URL）</label>
-  <input id="fBase" type="url" autocomplete="url" placeholder="https://api.deepseek.com 或 https://xxx.com/v1">
-  <p class="hint">填到域名或 /v1 为止，自动拼接 /chat/completions；误粘贴完整端点会自动纠正。</p>
+  <input id="fBase" type="url" autocomplete="url" placeholder="https://api.viddsys.xyz/v1">
   <label for="fKey">API Key</label>
-  <input id="fKey" type="password" autocomplete="new-password" placeholder="sk-...（本地无鉴权服务可留空）">
-  <label><input id="fClearKey" type="checkbox" style="width:auto;margin-right:8px">清除已保存的 API Key</label>
+  <div class="key-row">
+    <input id="fKey" type="password" autocomplete="new-password" placeholder="sk-******key">
+    <button id="toggleKey" type="button" class="eye-btn" title="显示密钥" aria-label="显示密钥" aria-pressed="false"></button>
+  </div>
   <label for="fModel">模型名</label>
-  <input id="fModel" autocomplete="off" placeholder="例如 deepseek-flash / glm-5.3 / gpt-5.6">
+  <input id="fModel" autocomplete="off" placeholder="deepseek-v4.1-flash">
   <label><input id="fVision" type="checkbox" style="width:auto;margin-right:8px">允许向模型发送页面图片</label>
-  <p class="hint">页面文字始终会发送到你配置的 API；仅在明确启用后，才发送提取到的页面图片或当前可视区截图。</p>
   <div class="row" style="margin-top:16px">
     <button id="btnSave" class="primary">保存</button>
     <button id="btnCancel">取消</button>

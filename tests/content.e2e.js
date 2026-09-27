@@ -160,7 +160,7 @@ test('EXECUTE 拒绝旧 snapshotId，且不触碰页面', { timeout: 30000 }, as
       type: 'EXECUTE',
       runId: 'run-e2e',
       operationId: 'op-stale-snapshot',
-      snapshotId: oldExtraction.snapshotId || '__definitely_stale__',
+      snapshotId: oldExtraction.snapshotId || '__definitely_stale__', approved: true,
       actions: [{ action: 'click', ref }],
     });
     const first = response?.results?.[0] || response;
@@ -275,6 +275,35 @@ test('fill 文件输入返回明确错误且不抛异常', { timeout: 30000 }, a
   });
 });
 
+test('页面合成的 beforeunload 不得伪造导航跳过整批操作', { timeout: 30000 }, async () => {
+  await withFixture(async (page) => {
+    const extraction = await extract(page);
+    const spoofRef = refMatching(extraction, /按钮「Spoof beforeunload」/);
+    const counterRef = refMatching(extraction, /按钮「Count once」/);
+    const outcome = await execute(page, extraction, 'op-spoof-1', [
+      { action: 'click', ref: spoofRef },
+      { action: 'click', ref: counterRef },
+    ]);
+    assert.equal(outcome.results[0].ok, true);
+    assert.equal(outcome.results[1].ok, true, '合成 beforeunload 后续操作必须照常执行');
+    assert.notEqual(outcome.results[1].code, 'SKIPPED_AFTER_NAVIGATION');
+    assert.equal(await page.evaluate(() => window.fixtureCounts.button), 1);
+  });
+});
+
+test('单选下拉收到数组 value 返回明确错误', { timeout: 30000 }, async () => {
+  await withFixture(async (page) => {
+    const extraction = await extract(page);
+    const petRef = refMatching(extraction, /下拉框 标签:Pet/);
+    const outcome = await execute(page, extraction, 'op-pet-1', [
+      { action: 'select', ref: petRef, value: ['cat', 'dog'] },
+    ]);
+    assert.equal(outcome.results[0].ok, false);
+    assert.equal(outcome.results[0].code, 'INVALID_VALUE');
+    assert.equal(await page.evaluate(() => document.querySelector('#pet').value), 'cat', '拒绝执行不得改动单选下拉');
+  });
+});
+
 test('checkbox check 相同目标重放后仍保持选中', { timeout: 30000 }, async () => {
   await withFixture(async (page) => {
     const firstExtraction = await extract(page);
@@ -383,7 +412,7 @@ test('ABORT(old) 后 EXTRACT(old) 同步取消不会锁死新 run', { timeout: 3
     const fresh = await extract(page, { runId: 'new-run' });
     assert.ok(fresh.snapshotId, JSON.stringify(fresh));
     const result = await dispatch(page, {
-      type: 'EXECUTE', runId: 'new-run', operationId: 'op-after-cancel', snapshotId: fresh.snapshotId,
+      type: 'EXECUTE', runId: 'new-run', operationId: 'op-after-cancel', snapshotId: fresh.snapshotId, approved: true,
       actions: [{ action: 'click', ref: refMatching(fresh, /按钮「Count once」/) }],
     });
     assert.equal(result.results[0].ok, true);
@@ -442,7 +471,7 @@ for (const nested of [false, true]) {
         // 在消息回调内读取旧文档计数；导航期间新发 page.evaluate 会等待新执行上下文。
         const { response, clicks } = await page.evaluate((message) => new Promise((resolve) => {
           globalThis.__viasContentListener(message, {}, (response) => resolve({ response, clicks: window.fixtureCounts.button }));
-        }), { type: 'EXECUTE', runId: 'run-e2e', operationId: `op-slow-${nested}`, snapshotId: snap.snapshotId, actions: [first, click, click] });
+        }), { type: 'EXECUTE', runId: 'run-e2e', operationId: `op-slow-${nested}`, snapshotId: snap.snapshotId, approved: true, actions: [first, click, click] });
         await requested;
         assert.equal(page.url(), fixtureUrl, '服务器尚未响应，必须仍为旧 URL');
         assert.equal(response.results[0].code, 'NAVIGATING');
@@ -544,14 +573,14 @@ test('submitForm 保留原生校验，只有真实 submit/image 控件充当 sub
       document.querySelector('form').addEventListener('submit', (event) => { event.preventDefault(); window.submitters.push(event.submitter?.id || null); });
     });
     const snap = await extract(page);
-    const invalid = await execute(page, snap, 'op-invalid-form', [{ action: 'submitForm', selector: '#form-field' }], false);
+    const invalid = await execute(page, snap, 'op-invalid-form', [{ action: 'submitForm', selector: '#form-field' }], true);
     assert.equal(invalid.results[0].code, 'FORM_INVALID');
     assert.deepEqual(await page.evaluate(() => window.submitters), []);
     assert.ok(await page.evaluate(() => window.invalidCount > 0));
     const response = await execute(page, invalid.page, 'op-native-submitters', [
       { action: 'fill', selector: '#form-field', value: 'local valid value' },
       ...['form-field', 'plain-button', 'plain-input', 'reset-button', 'submit-button', 'submit-input', 'image-input'].map((id) => ({ action: 'submitForm', selector: `#${id}` })),
-    ], false);
+    ], true);
     assert.ok(response.results.every((result) => result.ok), JSON.stringify(response.results));
     assert.deepEqual(await page.evaluate(() => window.submitters), [null, null, null, null, 'submit-button', 'submit-input', 'image-input']);
   });
@@ -561,7 +590,7 @@ async function startClockBatch(page, snap, operationId, actions) {
   await page.evaluate((message) => {
     window.clockResponse = null;
     globalThis.__viasContentListener(message, {}, (response) => { window.clockResponse = response; });
-  }, { type: 'EXECUTE', runId: 'run-e2e', snapshotId: snap.snapshotId, operationId, actions });
+  }, { type: 'EXECUTE', runId: 'run-e2e', snapshotId: snap.snapshotId, operationId, approved: true, actions });
 }
 
 for (const cancel of [false, true]) {
@@ -668,7 +697,7 @@ for (const action of ['click', 'submitForm', 'press']) {
           const oldClick = { action: 'click', ref: refMatching(snap, /按钮「Count once」/) };
           const { response, clicks, unload, url } = await page.evaluate((message) => new Promise((resolve) => {
             globalThis.__viasContentListener(message, {}, (response) => resolve({ response, clicks: window.fixtureCounts.button, unload: window.unloadObserved, url: location.href }));
-          }), { type: 'EXECUTE', runId: 'run-e2e', operationId: `op-native-${action}-${nested}`, snapshotId: snap.snapshotId, actions: [nested ? { action: 'repeat', times: 3, value: 60000, actions: [first, oldClick] } : first, oldClick] });
+          }), { type: 'EXECUTE', runId: 'run-e2e', operationId: `op-native-${action}-${nested}`, snapshotId: snap.snapshotId, approved: true, actions: [nested ? { action: 'repeat', times: 3, value: 60000, actions: [first, oldClick] } : first, oldClick] });
           await requested;
           assert.equal(url, fixtureUrl, '响应未释放前 location 仍必须是旧页');
           assert.equal(response.results[0].code, 'NAVIGATING', JSON.stringify(response));
@@ -819,7 +848,7 @@ for (const phase of ['paint', 'batch-wait', 'repeat-wait', 'wait', 'selector-wai
           const started = performance.now();
           setTimeout(() => location.assign(destination), 30);
           globalThis.__viasContentListener(message, {}, (response) => resolve({ response, clicks: window.fixtureCounts.button, elapsed: performance.now() - started }));
-        }), { message: { type: 'EXECUTE', runId: 'run-e2e', operationId: `op-boundary-${phase}`, snapshotId: snap.snapshotId, actions }, destination: pathname });
+        }), { message: { type: 'EXECUTE', runId: 'run-e2e', operationId: `op-boundary-${phase}`, snapshotId: snap.snapshotId, approved: true, actions }, destination: pathname });
         await requested;
         assert.equal(page.url(), fixtureUrl);
         assert.equal(response.results[0].code, 'NAVIGATING', JSON.stringify(response));
@@ -855,7 +884,7 @@ test('导航无提交后 finally 清理旗标，新 run/operation 和 EXTRACT �
           // 测试取消尚未提交的本地请求；生产执行器不得调用或替换此 API。
           setTimeout(() => { window.stop(); resolve(response); }, 100);
         });
-      }), { type: 'EXECUTE', runId: 'run-e2e', operationId: 'op-cancelled-navigation', snapshotId: snap.snapshotId, actions: [{ action: 'click', ref: refMatching(snap, /链接「Cancelled local navigation」/) }] });
+      }), { type: 'EXECUTE', runId: 'run-e2e', operationId: 'op-cancelled-navigation', snapshotId: snap.snapshotId, approved: true, actions: [{ action: 'click', ref: refMatching(snap, /链接「Cancelled local navigation」/) }] });
       assert.equal(response.results[0].code, 'NAVIGATING');
       assert.equal(response.page, undefined);
       assert.equal(page.url(), fixtureUrl);
@@ -864,7 +893,7 @@ test('导航无提交后 finally 清理旗标，新 run/operation 和 EXTRACT �
         const fresh = await extract(page, { runId });
         assert.ok(fresh.snapshotId);
         assert.equal(fresh.snapshotId.split(':')[0], snap.snapshotId.split(':')[0], '取消导航后仍为旧 documentId，由后台负责拒绝误判成功');
-        const result = await dispatch(page, { type: 'EXECUTE', runId, operationId: `op-fresh-${runId}`, snapshotId: fresh.snapshotId, actions: [{ action: 'click', ref: refMatching(fresh, /按钮「Count once」/) }] });
+        const result = await dispatch(page, { type: 'EXECUTE', runId, operationId: `op-fresh-${runId}`, snapshotId: fresh.snapshotId, approved: true, actions: [{ action: 'click', ref: refMatching(fresh, /按钮「Count once」/) }] });
         assert.equal(result.results[0].ok, true);
         assert.equal(result.results[0].code, undefined);
         assert.ok(result.page.snapshotId);

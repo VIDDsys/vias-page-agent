@@ -8,7 +8,7 @@ Edge 侧边栏网页操作 Agent（Manifest V3）。它读取当前页面，把�
 
 1. 从 [Release](https://github.com/VIDDsys/vias-page-agent/releases) 下载 zip，解压到一个固定目录（删除该目录扩展即失效）。
 2. Edge 打开 `edge://extensions`，开启「开发人员模式」，点「加载解压缩的扩展」，选中解压出的文件夹。
-3. 打开侧边栏，点右上角「设置」，填入 OpenAI 兼容接口地址、API Key、模型名，保存。
+3. 打开侧边栏，点右上角「设置」，点「添加模型」填入 OpenAI 兼容接口地址、API Key、模型名后保存。
 
 在任意网页打开侧边栏：「执行」自动操作页面，「问答」只读不改页面。修改源码后需在扩展管理页点「重新加载」。
 

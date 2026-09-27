@@ -319,22 +319,30 @@ async function screenshot(page, name) {
       await optionsA.locator('#btnCancel').click();
     });
 
-    await check('编辑保存不回传明文 Key：留空保留、清除生效、内容脚本不可读写设置', async () => {
+    await check('编辑时 Key 自动载入并可显隐：不改保留、清空即删除、内容脚本不可读写设置', async () => {
       await seed(optionsA, [{ id: 'k1', name: '带 Key 模型', baseUrl: `http://127.0.0.1:${modelPort}/v1`, apiKey: 'sk-keep-me', model: 'mock-k', vision: false }]);
       await optionsA.waitForFunction(() => models.length === 1 && models[0].id === 'k1');
-      assert.equal(await optionsA.evaluate(() => JSON.stringify(models).includes('sk-keep-me')), false, '设置页内存中不得持有明文 Key');
+      assert.equal(await optionsA.evaluate(() => JSON.stringify(models).includes('sk-keep-me')), false, '模型列表内存不得携带明文 Key');
       await optionsA.locator('#modelList .card').first().getByRole('button', { name: '编辑', exact: true }).click();
+      await optionsA.waitForFunction(() => document.querySelector('#fKey').value === 'sk-keep-me');
+      assert.equal(await optionsA.locator('#fKey').getAttribute('type'), 'password', '默认掩码显示');
+      await optionsA.locator('#toggleKey').click();
+      assert.equal(await optionsA.locator('#fKey').getAttribute('type'), 'text', '点眼睛后明文');
+      await optionsA.locator('#toggleKey').click();
+      assert.equal(await optionsA.locator('#fKey').getAttribute('type'), 'password', '再点恢复掩码');
       await optionsA.locator('#fName').fill('改名但不动 Key');
       await optionsA.locator('#btnSave').click();
       await optionsA.locator('#formWrap').waitFor({ state: 'hidden' });
-      const stored = await optionsA.evaluate(() => chrome.storage.local.get('models'));
-      assert.equal(stored.models[0].apiKey, 'sk-keep-me');
+      let stored = await optionsA.evaluate(() => chrome.storage.local.get('models'));
+      assert.equal(stored.models[0].apiKey, 'sk-keep-me', '未编辑 Key 时保存不得丢 Key');
       assert.equal(stored.models[0].name, '改名但不动 Key');
       await optionsA.locator('#modelList .card').first().getByRole('button', { name: '编辑', exact: true }).click();
-      await optionsA.locator('#fClearKey').check();
+      await optionsA.waitForFunction(() => document.querySelector('#fKey').value === 'sk-keep-me');
+      await optionsA.locator('#fKey').fill('');
       await optionsA.locator('#btnSave').click();
       await optionsA.locator('#formWrap').waitFor({ state: 'hidden' });
-      assert.equal((await optionsA.evaluate(() => chrome.storage.local.get('models'))).models[0].apiKey, '');
+      stored = await optionsA.evaluate(() => chrome.storage.local.get('models'));
+      assert.equal(stored.models[0].apiKey, '', '清空字段保存即删除 Key');
       await seed(optionsA, models(6));
       await optionsA.waitForFunction(() => models.length === 6);
     });

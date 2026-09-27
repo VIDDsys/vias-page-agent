@@ -26,6 +26,12 @@
     <option value="banana">香蕉</option>
     <option value="cherry">樱桃</option>
   </select>
+  <label for="pet">Pet</label>
+  <select id="pet">
+    <option value="cat">猫</option>
+    <option value="dog">狗</option>
+  </select>
+  <button id="spoof-nav">Spoof beforeunload</button>
   <label for="upload">Upload</label>
   <input id="upload" type="file">
   <section id="long-copy"></section>
@@ -38,6 +44,7 @@
     document.querySelector('#terms').addEventListener('change', () => { window.fixtureCounts.termsChange += 1; });
     document.querySelector('#note-form').addEventListener('submit', (event) => { event.preventDefault(); window.fixtureCounts.formSubmit += 1; });
     document.querySelector('#fruits').addEventListener('change', () => { window.fixtureCounts.fruitsChange += 1; });
+    document.querySelector('#spoof-nav').addEventListener('click', () => { window.dispatchEvent(new Event('beforeunload')); });
 
     const copy = document.querySelector('#long-copy');
     for (let index = 0; index < 100; index += 1) {

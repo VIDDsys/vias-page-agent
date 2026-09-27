@@ -29,8 +29,11 @@ marked.use({
   gfm: true,
   breaks: false,
   renderer: {
-    // DOMPurify 禁止 input，任务列表复选框改用自绘 span，避免被剥掉后丢失
-    checkbox(checked) { return `<span class="task-checkbox${checked ? ' checked' : ''}" aria-hidden="true"></span>`; },
+    // DOMPurify 禁止 input，任务列表复选框改用自绘 span；同时容忍未来 marked 传入 token 对象
+    checkbox(checked) {
+      const isChecked = typeof checked === 'boolean' ? checked : checked?.checked === true;
+      return `<span class="visually-hidden">${isChecked ? '已勾选' : '未勾选'}</span><span class="task-checkbox${isChecked ? ' checked' : ''}" aria-hidden="true"></span>`;
+    },
   },
   extensions: [{
     name: 'highlight',
@@ -46,12 +49,23 @@ marked.use({
 
 function renderMarkdown(text) {
   const raw = marked.parse(String(text ?? ''));
-  return DOMPurify.sanitize(raw, {
+  const clean = DOMPurify.sanitize(raw, {
     USE_PROFILES: { html: true },
     FORBID_TAGS: ['img', 'picture', 'source', 'audio', 'video', 'iframe', 'object', 'embed', 'style', 'form', 'input', 'button'],
     FORBID_ATTR: ['style', 'srcset', 'formaction', 'background', 'poster', 'ping', 'action', 'xlink:href'],
     ALLOWED_URI_REGEXP: /^(?:(?:https?|mailto):|[^a-z]|[a-z+.-]+(?:[^a-z+.-:]|$))/i,
-  }).replace(/<table>/g, '<div class="table-scroll"><table>').replace(/<\/table>/g, '</table></div>');
+  });
+  // 净化后的字符串不能再做正则手术（属性里的 <table> 会破坏词法）：经 detached DOM 包装表格
+  const template = document.createElement('template');
+  template.innerHTML = clean;
+  for (const table of [...template.content.querySelectorAll('table')]) {
+    if (table.parentElement?.classList.contains('table-scroll')) continue;
+    const wrap = document.createElement('div');
+    wrap.className = 'table-scroll';
+    table.replaceWith(wrap);
+    wrap.appendChild(table);
+  }
+  return template.innerHTML;
 }
 
 function hardenLinks(root) {
@@ -110,7 +124,7 @@ function addTools(round, actions) {
     name.textContent = action.action;
     const detail = document.createElement('span');
     detail.className = 'tool-detail';
-    const sensitive = /password|密码|验证码|token|secret|银行卡|cvv/i.test(String(action.selector || ''));
+    const sensitive = /password|密码|验证码|token|secret|银行卡|cvv|身份证/i.test(String(action.selector || ''));
     const value = sensitive ? '[已隐藏]' : action.value;
     detail.textContent = `${action.ref != null ? `@${action.ref}` : action.selector || ''}${value != null && value !== '' ? ` ← "${String(value).slice(0, 160)}"` : ''}`;
     const state = document.createElement('span');
@@ -527,7 +541,7 @@ formEl.addEventListener('submit', (event) => {
   else void send();
 });
 inputEl.addEventListener('keydown', (event) => {
-  if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); void send(); }
+  if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); if (activeRun) stopRun(); else void send(); }
 });
 
 function autosize() {

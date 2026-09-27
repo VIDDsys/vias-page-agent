@@ -29,7 +29,7 @@
   const mutationObserver = new MutationObserver((records) => {
     if (records.some((record) => record.type !== 'attributes' || ['id', 'role', 'type', 'name', 'class', 'style', 'hidden', 'disabled', 'readonly', 'href', 'value', 'aria-label', 'aria-hidden', 'aria-disabled', 'aria-checked', 'aria-expanded'].includes(record.attributeName))) mutationVersion++;
   });
-  mutationObserver.observe(document.documentElement, { childList: true, subtree: true, characterData: true, attributes: true });
+  mutationObserver.observe(document.documentElement, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['id', 'role', 'type', 'name', 'class', 'style', 'hidden', 'disabled', 'readonly', 'href', 'value', 'aria-label', 'aria-hidden', 'aria-disabled', 'aria-checked', 'aria-expanded'] });
   document.addEventListener('input', () => { mutationVersion++; }, true);
   document.addEventListener('change', () => { mutationVersion++; }, true);
   addEventListener('popstate', () => { mutationVersion++; });
@@ -592,8 +592,14 @@
         if (element instanceof HTMLTextAreaElement) {
           Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set?.call(element, element.value + '\n');
           element.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, inputType: 'insertLineBreak', data: '\n' }));
-          element.dispatchEvent(new Event('change', { bubbles: true }));
         } else if (element.isContentEditable) {
+          // fill 后无选区，光标通常在开头：先把选区折叠到末尾再插入换行
+          const selection = getSelection();
+          const range = document.createRange();
+          range.selectNodeContents(element);
+          range.collapse(false);
+          selection?.removeAllRanges();
+          selection?.addRange(range);
           try { document.execCommand('insertText', false, '\n'); } catch {}
         } else {
           const form = element.form || element.closest?.('form');
@@ -779,7 +785,8 @@
     }
     if (action.action === 'check' || action.action === 'checkRadio') {
       const checkbox = target instanceof HTMLInputElement && ['checkbox', 'radio'].includes(target.type) ? target : null;
-      if (checkbox?.checked || target.getAttribute('aria-checked') === 'true') return { ok: true, code: 'NO_CHANGE', msg: '目标已选中', state: '已选中' };
+      // 原生控件以 checked 为准（aria 可能与实际状态脱节）；仅非原生 ARIA 控件才信 aria-checked
+      if (checkbox?.checked || (!checkbox && target.getAttribute('aria-checked') === 'true')) return { ok: true, code: 'NO_CHANGE', msg: '目标已选中', state: '已选中' };
       // label 引用时 target 是其内部 input，直接点 input 保证原生翻转与 change 事件
       await clickOnce(checkbox || element, runId, verify);
       return { ok: true, msg: '已选中目标', state: readState(element) };
@@ -788,6 +795,12 @@
       const before = pageSignature();
       // 复选/单选目标直接点 input，避免合成点击 label 时激活行为不生效导致翻转失败
       const toggle = target instanceof HTMLInputElement && ['checkbox', 'radio'].includes(target.type);
+      // 预记链接目标：原生导航触发 beforeunload 时 URL 尚未提交，让跳过结果能带上 navigationUrl
+      try {
+        const anchor = element.closest('a');
+        const href = anchor?.getAttribute('href');
+        if (href) activeOperation.navigationUrl = new URL(href, document.baseURI).href;
+      } catch {}
       try { await clickOnce(toggle ? target : element, runId, verify); }
       catch (error) {
         if (typeof error.code === 'string') throw error;
@@ -835,6 +848,7 @@
     if (action.action === 'select') {
       if (!(target instanceof HTMLSelectElement)) return errorResult('NOT_SELECT', 'select 仅支持原生下拉框');
       // 多选下拉 value 传数组；标量赋值会清掉其余已选项
+      if (Array.isArray(action.value) && !target.multiple) return errorResult('INVALID_VALUE', '单选下拉不支持数组 value，请传单个选项');
       const requestedList = Array.isArray(action.value) ? action.value.map((item) => String(item ?? '')) : [String(action.value ?? '')];
       if (!requestedList.length || requestedList.includes('')) return errorResult('OPTION_NOT_FOUND', '选项不存在');
       const hits = [];
@@ -851,8 +865,10 @@
         verify();
         for (const option of target.options) option.selected = hits.includes(option);
         const changed = before !== signatureOf();
-        target.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true }));
-        if (changed) target.dispatchEvent(new Event('change', { bubbles: true }));
+        if (changed) {
+          target.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true }));
+          target.dispatchEvent(new Event('change', { bubbles: true }));
+        }
         return { ok: true, code: changed ? 'SELECTED' : 'NO_CHANGE', msg: changed ? (isSensitive(target) ? '已选择敏感选项（已隐藏）' : `已选择 ${hits.length} 项`) : '已是指定选项', state: readState(target) };
       }
       const hit = hits[0];
@@ -868,7 +884,14 @@
       }
       target.scrollIntoView({ block: 'center' });
       verify();
-      const valid = form.reportValidity();
+      // 预记表单提交目标，供原生导航的跳过结果携带 navigationUrl
+      try {
+        const formAction = form.getAttribute('action');
+        activeOperation.navigationUrl = new URL(formAction || location.href, document.baseURI).href;
+      } catch {}
+      // novalidate 表单本就不做约束校验，requestSubmit 会跳过；不能替它拦下
+      const skipValidation = form.novalidate === true || target.getAttribute?.('formnovalidate') != null;
+      const valid = skipValidation || form.reportValidity();
       verify();
       if (!valid) return errorResult('FORM_INVALID', '表单校验未通过，未提交');
       const submitter = (target instanceof HTMLButtonElement && target.type === 'submit')
@@ -900,7 +923,9 @@
     const operation = { runId: message.runId, startUrl: location.href, navigationStarted: false };
     activeOperation = operation;
     // 仅观察本次 operation；不阻断卸载、不改页面 API，finally 必须卸下监听。
-    const onBeforeUnload = () => {
+    // 页面脚本可合成 beforeunload 事件伪造导航跳过整批操作，必须只信浏览器派发的可信事件。
+    const onBeforeUnload = (event) => {
+      if (event.isTrusted !== true) return;
       if (activeOperation === operation) operation.navigationStarted = true;
     };
     addEventListener('beforeunload', onBeforeUnload, true);
@@ -909,7 +934,7 @@
       for (let index = 0; index < message.actions.length; index++) {
         assertActive(message.runId);
         try {
-          const result = await executeAction(message.actions[index], message.runId, 0, true); // 完全访问权限：不再要求审批
+          const result = await executeAction(message.actions[index], message.runId, 0, message.approved === true); // 完全访问权限：background 恒发 approved=true
           results.push(result);
           if (isNavigationResult(result)) {
             for (let rest = index + 1; rest < message.actions.length; rest++) results.push(skippedAfterNavigation());
@@ -983,7 +1008,17 @@
         return true;
       }
       const pending = executeBatch(message).catch((error) => ({ results: [errorResult(error.code || 'EXECUTE_ERROR', error.message || String(error))] }));
-      if (key) { operationCache.set(key, pending); pruneCache(); }
+      if (key) {
+        operationCache.set(key, pending);
+        pruneCache();
+        // 幂等缓存只该钉住「已执行」的结果：未执行成功的瞬态结局在结算后清除，允许同 operationId 重试；
+        // 成功结果也剥掉整页快照，避免缓存长期驻留大对象。
+        pending.then((result) => {
+          const code = result?.results?.[0]?.code;
+          if (['INVALID_REQUEST', 'STALE_SNAPSHOT', 'INVALID_ACTIONS', 'BUSY', 'EXECUTE_ERROR', 'CANCELLED'].includes(code)) operationCache.delete(key);
+          else if (result?.page) operationCache.set(key, Promise.resolve({ results: result.results }));
+        }).catch(() => {});
+      }
       pending.then(sendResponse);
       return true;
     }
