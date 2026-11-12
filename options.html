@@ -42,6 +42,13 @@
   #formWrap { display: none; }
   #formWrap.show { display: block; }
   .tag { font: inherit; font-size: 13px; color: var(--ink); border: 1px solid var(--line); border-radius: 999px; padding: 7px 16px; background: var(--page); }
+  .sponsors { margin-top: 32px; }
+  .sponsor-list { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 10px; }
+  .sponsor { display: flex; align-items: center; gap: 10px; padding: 7px 14px 7px 7px; background: var(--page); border: 1px solid var(--line); border-radius: 999px; }
+  .sponsor-avatar { width: 42px; height: 42px; border-radius: 50%; object-fit: cover; background: var(--line-soft); flex: none; }
+  .sponsor-name { font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }
+  .sponsor-fallback { display: grid; place-items: center; font-size: 16px; font-weight: 700; color: var(--muted); }
+  .sponsor-empty { margin-top: 8px; }
 </style>
 </head>
 <body>
@@ -92,6 +99,11 @@
   <label for="latestPrompt">最新已保存的提示词（只读）</label>
   <textarea id="latestPrompt" readonly></textarea>
   <button id="btnRebasePrompt" type="button">保留草稿并继续</button>
+</section>
+
+<section class="sponsors" aria-labelledby="sponsorTitle">
+  <h2 id="sponsorTitle">赞助者名单</h2>
+  <div id="sponsorList" class="sponsor-list"></div>
 </section>
 
 <script src="core.js"></script>
