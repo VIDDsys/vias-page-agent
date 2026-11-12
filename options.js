@@ -14,6 +14,55 @@ let promptBaseText = '';
 let promptEditVersion = 0;
 let promptSaving = false;
 let latestPromptState = null;
+const modelStatuses = new Map();
+const testingModels = new Map();
+
+// Settings revisions cover model credentials too, without exposing or retaining keys.
+function advanceSettingsRevision(revision) {
+  if (revision <= settingsRevision) return false;
+  settingsRevision = revision;
+  modelStatuses.clear();
+  testingModels.clear();
+  return true;
+}
+
+function modelStatus(id, message, ok = false) {
+  if (message) modelStatuses.set(id, { message, ok });
+  else modelStatuses.delete(id);
+  const status = [...$('modelList').querySelectorAll('.model-status')].find((item) => item.dataset.modelId === id);
+  if (status) {
+    status.textContent = message;
+    status.hidden = !message;
+    status.className = `status model-status ${ok ? 'ok' : 'fail'}`;
+  } else if (message) {
+    $('modelListStatus').textContent = message;
+    $('modelListStatus').hidden = false;
+  }
+  if (!message) {
+    $('modelListStatus').textContent = '';
+    $('modelListStatus').hidden = true;
+  }
+}
+
+function modelOperationError(error, action) {
+  if (error?.message === '设置已在其他窗口更新，列表已刷新，请重试') return error.message;
+  if (error?.message === '要启用的模型不存在') return '切换模型失败：该模型已不存在，请刷新列表后重试。';
+  return `${action}失败：无法保存设置，请检查模型列表后重试。`;
+}
+
+function connectionError(error) {
+  const message = String(error?.message || '');
+  const status = /^API (\d{3})(?:\D|$)/.exec(message)?.[1];
+  if (status === '401' || status === '403') return '连接失败：鉴权未通过，请检查 API Key 和接口权限。';
+  if (status === '404') return '连接失败：接口地址或模型不存在，请检查配置。';
+  if (status === '429') return '连接失败：请求受到限流，请稍后重试。';
+  if (status && Number(status) >= 500) return '连接失败：接口服务暂不可用，请稍后重试。';
+  if (status) return `连接失败：接口返回 HTTP ${status}，请检查模型配置。`;
+  if (/超时|timeout/i.test(message)) return '连接失败：请求超时，请检查网络和接口地址。';
+  if (message === '模型返回为空' || message.includes('缺少 choices[0].message.content')) return '连接失败：模型没有返回有效内容，请检查模型配置。';
+  if (message === '无法读取模型配置') return '连接失败：无法读取模型配置，请刷新列表后重试。';
+  return '连接失败：无法完成请求，请检查网络和模型配置后重试。';
+}
 
 function runtimeMessage(message) {
   return new Promise((resolve, reject) => {
@@ -32,7 +81,7 @@ async function load() {
   if (revision < settingsRevision) return;
   models = Array.isArray(state.models) ? state.models : [];
   activeModelId = state.activeModelId || '';
-  settingsRevision = revision;
+  advanceSettingsRevision(revision);
   latestPromptState = { revision, text: state.systemPrompt || DEFAULT_SYSTEM_PROMPT };
   syncPromptState();
   renderList();
@@ -100,15 +149,25 @@ function renderList() {
       row.appendChild(tag);
     }
     if (!active) row.appendChild(button('使用', 'primary', () => setActive(model.id)));
+    const testButton = button(testingModels.has(model.id) ? '测试中…' : '测试', '', () => testModel(model), testingModels.has(model.id));
+    testButton.dataset.testModelId = model.id;
     row.append(
-      button('编辑', '', () => openForm(model)),
-      button('测试', '', (event) => testModel(model, event.currentTarget)),
+      button(model.id === 'builtin-viddsys-api' && !model.hasApiKey ? '填写密钥' : '编辑', '', () => openForm(model)),
+      testButton,
       button('删除', 'danger', () => deleteModel(model)),
     );
     const meta = document.createElement('div');
     meta.className = 'meta';
     meta.textContent = `${model.baseUrl} · ${model.model} · Key: ${model.hasApiKey ? '已配置' : '免鉴权/未填'} · 图片: ${model.vision ? '允许' : '关闭'}`;
-    card.append(row, meta);
+    const status = document.createElement('div');
+    const previousStatus = modelStatuses.get(model.id);
+    status.dataset.modelId = model.id;
+    status.className = `status model-status ${previousStatus?.ok ? 'ok' : 'fail'}`;
+    status.setAttribute('role', 'status');
+    status.setAttribute('aria-live', 'polite');
+    status.hidden = !previousStatus;
+    status.textContent = previousStatus?.message || '';
+    card.append(row, meta, status);
     list.appendChild(card);
   }
 }
@@ -127,28 +186,31 @@ async function update(operation, fields = {}, expectedRevision = settingsRevisio
     }
     throw new Error(response?.error || '保存失败');
   }
-  settingsRevision = Math.max(settingsRevision, response.settingsRevision ?? settingsRevision + 1);
+  if (advanceSettingsRevision(response.settingsRevision ?? settingsRevision + 1)) renderList();
   return response;
 }
 
 async function setActive(id) {
+  modelStatus(id, '');
   try {
     await update('setActive', { id });
     activeModelId = id;
     renderList();
   } catch (error) {
-    setStatus('promptStatus', error.message, false, true);
+    modelStatus(id, modelOperationError(error, '切换模型'));
   }
 }
 
 async function deleteModel(model) {
   if (!confirm(`删除模型「${model.name}」？`)) return;
+  modelStatus(model.id, '');
   try {
     await update('deleteModel', { id: model.id });
+    modelStatuses.delete(model.id);
     if (editingId === model.id) closeForm();
     await load();
   } catch (error) {
-    setStatus('promptStatus', error.message, false, true);
+    modelStatus(model.id, modelOperationError(error, '删除模型'));
   }
 }
 
@@ -170,7 +232,7 @@ function openForm(model) {
   $('fVision').checked = model?.vision === true;
   $('formStatus').textContent = '';
   $('formWrap').classList.add('show');
-  $('fName').focus();
+  $(model?.id === 'builtin-viddsys-api' && !model.hasApiKey ? 'fKey' : 'fName').focus();
 }
 
 function closeForm() {
@@ -243,26 +305,43 @@ $('btnSave').addEventListener('click', async () => {
   }
 });
 
-async function testModel(model, testButton) {
-  const oldText = testButton.textContent;
-  testButton.disabled = true;
-  testButton.textContent = '测试中…';
+async function testModel(model) {
+  if (testingModels.has(model.id)) return;
+  const attempt = { revision: settingsRevision };
+  testingModels.set(model.id, attempt);
+  modelStatus(model.id, '正在测试连接…', true);
+  const testButton = [...$('modelList').querySelectorAll('[data-test-model-id]')].find((item) => item.dataset.testModelId === model.id);
+  if (testButton) { testButton.disabled = true; testButton.textContent = '测试中…'; }
   try {
-    const resolved = await runtimeMessage({ type: 'RESOLVE_MODEL', id: model.id });
-    if (!resolved?.ok) throw new Error(resolved?.error || '无法读取模型配置');
-    const text = await globalThis.ViasCore.callModel(resolved.model, [{ role: 'user', content: '请仅回复 OK' }], { timeoutMs: 60000, retries: 0 });
-    if (!text.trim()) throw new Error('模型返回为空');
-    testButton.textContent = '可用';
-    testButton.title = `返回：${text.slice(0, 120)}`;
-  } catch (error) {
-    testButton.textContent = '失败';
-    testButton.title = error.message;
+    let result;
+    try {
+      const resolved = await runtimeMessage({ type: 'RESOLVE_MODEL', id: model.id });
+      if (!resolved?.ok) throw new Error('无法读取模型配置');
+      const text = await globalThis.ViasCore.callModel(resolved.model, [{ role: 'user', content: '请仅回复 OK' }], { timeoutMs: 60000, retries: 0 });
+      if (!text.trim()) throw new Error('模型返回为空');
+      result = { message: '连接测试通过。', ok: true };
+    } catch (error) {
+      result = { message: connectionError(error), ok: false };
+    }
+    if (testingModels.get(model.id) !== attempt) return;
+    // Re-read the public revision to catch changes whose storage event has not arrived yet.
+    const state = await runtimeMessage({ type: 'GET_SETTINGS' });
+    if (testingModels.get(model.id) !== attempt) return;
+    if (!state?.ok || !Number.isInteger(state.settingsRevision)) throw new Error('无法确认设置版本');
+    if (state.settingsRevision !== attempt.revision || settingsRevision !== attempt.revision) {
+      modelStatus(model.id, '');
+      await load();
+      return;
+    }
+    modelStatus(model.id, result.message, result.ok);
+  } catch {
+    if (testingModels.get(model.id) === attempt) modelStatus(model.id, '无法确认模型配置，请刷新页面后重新测试。');
   } finally {
-    setTimeout(() => {
-      testButton.textContent = oldText;
-      testButton.disabled = false;
-      testButton.title = '';
-    }, 4000);
+    if (testingModels.get(model.id) === attempt) {
+      testingModels.delete(model.id);
+      const currentButton = [...$('modelList').querySelectorAll('[data-test-model-id]')].find((item) => item.dataset.testModelId === model.id);
+      if (currentButton) { currentButton.disabled = false; currentButton.textContent = '测试'; }
+    }
   }
 }
 

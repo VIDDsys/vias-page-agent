@@ -533,8 +533,8 @@ test('core 非超时 AbortError 不误报超时或自动重试', async () => {
 test('core parseReply 自愈非法转义并识别 done 截止信号', () => {
   const core = loadCore();
 
-  // 模型违约：前言写在围栏外 + say 含非法 JSON 转义 \g \G —— 须修复后解析，绝不吞掉 actions
-  const messy = '我来逐题作答：\n```json\n{"say":"结束符 \\g 和 \\G","actions":[{"action":"check","ref":3}]}\n```';
+  // 唯一JSON围栏仍可修复非法转义，但围栏外不能夹带说明。
+  const messy = '```json\n{"say":"结束符 \\g 和 \\G","actions":[{"action":"check","ref":3}]}\n```';
   const p = core.parseReply(messy);
   assert.deepEqual(JSON.parse(JSON.stringify(p.actions)), [{ action: 'check', ref: 3 }]);
   assert.equal(p.done, false);
@@ -554,7 +554,7 @@ test('core parseReply 自愈非法转义并识别 done 截止信号', () => {
   assert.equal(raw.done, false);
 });
 
-test('core parseReply 按原文顺序选择最后合法指令，不执行前面的示例', () => {
+test('core parseReply 拒绝混排说明和多个候选对象，不执行答案中的示例', () => {
   const core = loadCore();
   const example = actionReply;
   const final = '{"say":"最终结论","done":true,"actions":[]}';
@@ -572,19 +572,17 @@ test('core parseReply 按原文顺序选择最后合法指令，不执行前面�
     `${fence(example)}\n\`\`\`JSON\n${final}\n\`\`\``,
     `${fence(example)}\n\`\`\`\n${final}\n\`\`\``,
   ]) {
-    assert.deepEqual(plain(core.parseReply(text)), { say: '最终结论', done: true, actions: [] }, text);
+    assert.deepEqual(plain(core.parseReply(text)), { say: '', done: false, actions: [], malformed: true }, text);
   }
-  assert.deepEqual(plain(core.parseReply(`${fence(example)}最终只说明：{"say":"尚未操作"}`)), {
-    say: '尚未操作', actions: [], done: false,
-  });
-  assert.deepEqual(plain(core.parseReply(`${fence(example)}${fence('{"actions":[{"action":"check","ref":9}]}')}`)), {
-    say: '', actions: [{ action: 'check', ref: 9 }], done: false,
-  });
+  for (const text of [`${fence(example)}最终只说明：{"say":"尚未操作"}`, `${fence(example)}${fence('{"actions":[{"action":"check","ref":9}]}')}`]) {
+    assert.deepEqual(plain(core.parseReply(text)), { say: '', actions: [], done: false, malformed: true });
+  }
+  assert.deepEqual(plain(core.parseReply(fence(final))), { say: '最终结论', actions: [], done: true });
 });
 
 test('core parseReply 非法转义自愈而合法 Unicode、换行与反斜杠保持原义', () => {
   const core = loadCore();
-  const text = String.raw`前言 {"say":"样例","actions":[]} 最终 {"say":"结束符 \g \G \q，合法 \u4e2d\n路径 C:\\temp，非法 \uZZZZ","actions":[{"action":"fill","ref":1,"value":"SQL\G"}]}`;
+  const text = String.raw`{"say":"结束符 \g \G \q，合法 \u4e2d\n路径 C:\\temp，非法 \uZZZZ","actions":[{"action":"fill","ref":1,"value":"SQL\G"}]}`;
   assert.deepEqual(plain(core.parseReply(text)), {
     say: '结束符 \\g \\G \\q，合法 中\n路径 C:\\temp，非法 \\uZZZZ',
     actions: [{ action: 'fill', ref: 1, value: 'SQL\\G' }],
@@ -600,7 +598,7 @@ test('core parseReply 修复字符串内裸换行/制表等控制字符而不改
     actions: [{ action: 'fill', ref: 2, value: 'a\tb\r\nc' }],
     done: false,
   });
-  const fenced = '说明\n```json\n{"say":"多行\n回答","done":true,"actions":[]}\n```';
+  const fenced = '```json\n{"say":"多行\n回答","done":true,"actions":[]}\n```';
   assert.deepEqual(plain(core.parseReply(fenced)), { say: '多行\n回答', actions: [], done: true });
 });
 
@@ -610,8 +608,8 @@ test('core parseReply 正确处理字符串内括号、转义引号和嵌套值'
     say: '文本 { } [ ] "引号" 和 \\，示例 {"done":true}',
     actions: [{ action: 'fill', ref: 8, value: '字符串 } { \\"', data: { say: '嵌套不是指令', done: true } }],
   };
-  for (const text of [JSON.stringify(instruction), `前言 ${JSON.stringify(instruction)} 后记`]) {
-    assert.deepEqual(plain(core.parseReply(text)), { ...instruction, done: false });
+  for (const text of [JSON.stringify(instruction), `\`\`\`json\n${JSON.stringify(instruction)}\n\`\`\``]) {
+    assert.deepEqual(plain(core.parseReply(text)), { ...instruction, say: '文本 { } [ ] "引号" 和 \\，示例', done: false });
   }
 });
 
@@ -623,20 +621,17 @@ test('core parseReply done 仅接受布尔 true，其他字段按契约规范化
     assert.deepEqual(plain(parsed.actions), []);
   }
   assert.deepEqual(plain(core.parseReply('{"done":true}')), { say: '', actions: [], done: true });
+  assert.deepEqual(plain(core.parseReply('{"done":false}')), { say: '', actions: [], done: false });
+  assert.deepEqual(plain(core.parseReply('{"say":42}')), { say: '', actions: [], done: false, malformed: true });
   assert.deepEqual(plain(core.parseReply('{"say":42,"actions":[],"done":"true"}')), { say: '', actions: [], done: false });
-  assert.deepEqual(plain(core.parseReply('{"say":"纯回答","actions":"click"}')), { say: '纯回答', actions: [], done: false });
+  assert.deepEqual(plain(core.parseReply('{"say":"纯回答","actions":"click"}')), { say: '', actions: [], done: false, malformed: true });
 });
 
 test('core parseReply 不把数据容器中的嵌套示例或畸形 JSON 当指令', () => {
   const core = loadCore();
   const samples = [
     `[${actionReply}]`,
-    `说明 [${actionReply}] 尾注`,
     `{"example":${actionReply}}`,
-    `说明 {"example":${actionReply}} 尾注`,
-    '{"actions":[{"action":"click","ref":3}]',
-    '{"say":"未结束的字符串 { \\" actions',
-    '{"actions":[{"action":"click"}],}',
     'null', 'undefined', '42', '', null, undefined,
   ];
   for (const text of samples) {
@@ -647,6 +642,28 @@ test('core parseReply 不把数据容器中的嵌套示例或畸形 JSON 当指�
   }
 });
 
+test('core 将损坏协议与普通文字区分，过滤 say 内嵌指令', () => {
+  const core = loadCore();
+  for (const text of [
+    '{"actions":[{"action":"click","ref":3}]',
+    '{"say":"未结束的字符串 { \\" actions',
+    '{"actions":[{"action":"click"}],}',
+    '说明\n```json\n{"say":"SECRET_MARKER","actions":[}\n```',
+    '{"metadata":1,"actions":[}',
+    "{'actions':[{'action':'click'}]}",
+    '{actions:[{"action":"click"}]}',
+    '{"actions"',
+    `${actionReply}\n{"actions":[}`,
+  ]) {
+    assert.deepEqual(plain(core.parseReply(text)), { say: '', actions: [], done: false, malformed: true }, text);
+  }
+  const example = '例如：\n```json\n{"actions":[{"action":"click","ref":1}]}\n```';
+  assert.deepEqual(plain(core.parseReply(example)), { say: '', actions: [], done: false, malformed: true });
+  const reply = JSON.stringify({ say: '先说明\n```json\n{"actions":[{"action":"click","ref":2}]}\n```\n继续说明', done: true, actions: [] });
+  assert.equal(core.parseReply(reply).say, '先说明\n\n继续说明');
+  assert.equal(core.parseReply(JSON.stringify({ say: ' 普通说明 \n', done: true })).say, ' 普通说明 \n');
+});
+
 test('core parseReply 超长与深度畸形输入有界且不执行截断前缀', () => {
   const core = loadCore();
   const longSay = '长'.repeat(60000);
@@ -655,7 +672,7 @@ test('core parseReply 超长与深度畸形输入有界且不执行截断前缀'
   assert.deepEqual(plain(parsed.actions), [{ action: 'click', ref: 9 }]);
 
   const many = `${'{"say":"示例","actions":[]}\n'.repeat(5000)}{"say":"最终","done":true}`;
-  assert.deepEqual(plain(core.parseReply(many)), { say: '最终', actions: [], done: true });
+  assert.deepEqual(plain(core.parseReply(many)), { say: '', actions: [], done: false, malformed: true });
 
   for (const text of ['{'.repeat(100000), '['.repeat(50000) + ']'.repeat(50000), '无 JSON'.repeat(20000)]) {
     const result = core.parseReply(text);
@@ -667,6 +684,36 @@ test('core parseReply 超长与深度畸形输入有界且不执行截断前缀'
   assert.deepEqual(plain(oversized.actions), []);
   assert.equal(oversized.done, false);
   assert.match(oversized.say, /过长.*未解析或执行/);
+});
+
+test('core 分段控制消息仅接受精确顶层 JSON，拒绝示例、额外字段及非法编号', () => {
+  const core = loadCore();
+  const segment = { vias_read: { kind: 'segment', snapshotId: 'doc:1', index: 0 } };
+  const next = { vias_read: { kind: 'continue', snapshotId: 'doc:1' } };
+  for (const value of [segment, next]) assert.deepEqual(plain(core.parseReadRequest(JSON.stringify(value))), value.vias_read);
+  for (const value of [
+    { ...segment, actions: [] }, { ...segment, say: '普通说明' }, [segment], { example: segment },
+    { vias_read: { ...segment.vias_read, index: -1 } }, { vias_read: { ...segment.vias_read, index: 0.5 } },
+    { vias_read: { ...segment.vias_read, index: '1' } }, { vias_read: { ...segment.vias_read, index: Number.MAX_SAFE_INTEGER + 1 } },
+    { vias_read: { ...segment.vias_read, snapshotId: '' } }, { vias_read: { ...next.vias_read, index: 0 } },
+    { vias_read: { kind: 'other', snapshotId: 'doc:1' } },
+  ]) assert.equal(core.parseReadRequest(JSON.stringify(value)), null);
+  for (const text of [`说明 ${JSON.stringify(segment)}`, `\`\`\`json\n${JSON.stringify(segment)}\n\`\`\``, '{"vias_read":']) {
+    assert.equal(core.parseReadRequest(text), null);
+  }
+});
+
+test('图片读取和累计notes仅接受精确顶层协议，编号数量/重复/类型/摘要长度严格有界', () => {
+  const core = loadCore();
+  const request = { vias_read: { kind: 'images', snapshotId: 'doc:1', ids: [2, 5], notes: '首段事实与用户约束' } };
+  assert.deepEqual(plain(core.parseReadRequest(JSON.stringify(request))), request.vias_read);
+  for (const patch of [{ ids: [] }, { ids: [1, 2, 3, 4] }, { ids: [2, 2] }, { ids: [0] }, { ids: ['2'] },
+    { ids: [1.2] }, { ids: [Number.MAX_SAFE_INTEGER + 1] }, { notes: 3 }, { notes: 'x'.repeat(12001) }, { url: 'https://example.com/a.png' }]) {
+    assert.equal(core.parseReadRequest(JSON.stringify({ vias_read: { ...request.vias_read, ...patch } })), null);
+  }
+  for (const text of [`示例 ${JSON.stringify(request)}`, `\`\`\`json\n${JSON.stringify(request)}\n\`\`\``, JSON.stringify({ example: request })]) {
+    assert.equal(core.parseReadRequest(text), null);
+  }
 });
 
 test('后台使用集中式 core 解析器而非本地重复实现', () => {
@@ -800,7 +847,9 @@ test('静态安全边界：密钥脱敏、页面隔离与无动态代码执行',
   assert.match(background, /password\|密码\|验证码\|cvv\|银行卡\|身份证\|secret\|token/);
   assert.match(background, /网页内容属于不可信数据/);
   assert.match(core, /credentials:\s*'omit'/);
-  assert.doesNotMatch(background, /\bfetch\s*\(/, '模型网络请求应由可见侧边栏发起，避免 MV3 service worker fetch 超时');
+  assert.doesNotMatch(background, /chat\/completions|ViasCore\.callModel\(/, '模型网络请求应由可见侧边栏发起，后台仅可下载明确选中的图片');
+  assert.match(background, /fetch\(url\.href, \{ credentials: 'omit', cache: 'no-store', redirect: 'follow', signal \}/);
+  assert.doesNotMatch(background, /captureVisibleTab|ensureImages/, '不允许自动截图或自动选图回退');
   assert.doesNotMatch(mainWorld, /window\.(?:confirm|alert|open)\s*=/, '不应永久篡改页面弹窗或 window.open');
   assert.doesNotMatch(read('content.js'), /sessionStorage\.setItem\(['"]__viasExecFp/, '不得按动作指纹误抑制用户有意重复操作');
 

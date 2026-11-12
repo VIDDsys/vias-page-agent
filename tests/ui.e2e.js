@@ -9,7 +9,7 @@ const { chromium } = require('playwright-core');
 
 const root = path.resolve(__dirname, '..');
 const edgePath = process.env.EDGE_PATH || 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
-const artifacts = path.resolve(process.env.UI_ARTIFACT_DIR || path.join(os.homedir(), '.qoder', 'tmp', `vias-ui-${Date.now()}`));
+const artifacts = path.resolve(process.env.UI_ARTIFACT_DIR || path.join(os.homedir(), '.agents', 'temp', 'vias-page-agent', `ui-${Date.now()}`));
 const errors = [];
 let passed = 0;
 
@@ -75,7 +75,7 @@ async function screenshot(page, name) {
 (async () => {
   assert.ok(fs.existsSync(edgePath), `Edge 不存在: ${edgePath}`);
   fs.mkdirSync(artifacts, { recursive: true });
-  const profile = fs.mkdtempSync(path.join(artifacts, 'isolated-profile-'));
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'vias-ui-profile-'));
   const requests = [];
   const waiting = [];
   const held = [];

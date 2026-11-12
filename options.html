@@ -4,9 +4,9 @@
 <meta charset="UTF-8">
 <title>Vias 页面助手 - 设置</title>
 <style>
-  :root { color-scheme: light dark; --ink: #111; --page: #fff; --bg: #fafafa; --line: #e5e7eb; --line-soft: #f1f2f4; --muted: #8a8f98; --ok: #107c10; --fail: #c42b1c; }
+  :root { color-scheme: light dark; --ink: #111; --page: #fff; --bg: #fafafa; --line: #e5e7eb; --line-soft: #f1f2f4; --muted: #646a73; --ok: #107c10; --fail: #c42b1c; }
   @media (prefers-color-scheme: dark) {
-    :root { --ink: #f4f4f5; --page: #1c1c1f; --bg: #161618; --line: #2e2e33; --line-soft: #26262b; --muted: #7c7f87; }
+    :root { --ink: #f4f4f5; --page: #1c1c1f; --bg: #161618; --line: #2e2e33; --line-soft: #26262b; --muted: #a9abb2; --ok: #81cf91; --fail: #ff8c82; }
   }
   * { box-sizing: border-box; }
   body { font: 14px/1.7 "Segoe UI", "Microsoft YaHei", sans-serif; max-width: 660px; margin: 40px auto; padding: 0 16px; color: var(--ink); background: var(--bg); }
@@ -35,6 +35,8 @@
   .eye-btn { flex: none; width: 42px; padding: 0; display: inline-flex; align-items: center; justify-content: center; border-radius: 8px; color: var(--muted); }
   .eye-btn:hover { color: var(--ink); }
   .status { font-size: 12px; }
+  .model-status { margin-top: 6px; overflow-wrap: anywhere; }
+  .model-status[hidden] { display: none; }
   .ok { color: var(--ok); }
   .fail { color: var(--fail); }
   #formWrap { display: none; }
@@ -48,6 +50,7 @@
 
 <h2>模型列表</h2>
 <div id="modelList"></div>
+<div id="modelListStatus" class="status fail" role="status" aria-live="polite" hidden></div>
 <div class="row" style="margin-top:12px">
   <button id="btnAdd" class="primary">＋ 添加模型</button>
 </div>
@@ -60,7 +63,8 @@
   <label for="fName">显示名称（侧边栏切换菜单里显示的名字）</label>
   <input id="fName" autocomplete="off" placeholder="VIDDsys API">
   <label for="fBase">API 地址（Base URL）</label>
-  <input id="fBase" type="url" autocomplete="url" placeholder="https://api.viddsys.xyz/v1">
+  <input id="fBase" type="url" autocomplete="url" aria-describedby="baseHint" placeholder="https://api.viddsys.xyz/v1">
+  <p id="baseHint" class="hint">远程接口建议使用 HTTPS；HTTP 会明文传输密钥和页面内容。本机模型可使用 HTTP。</p>
   <label for="fKey">API Key</label>
   <div class="key-row">
     <input id="fKey" type="password" autocomplete="new-password" placeholder="sk-******key">
@@ -68,7 +72,8 @@
   </div>
   <label for="fModel">模型名</label>
   <input id="fModel" autocomplete="off" placeholder="deepseek-v4.1-flash">
-  <label><input id="fVision" type="checkbox" style="width:auto;margin-right:8px">允许向模型发送页面图片</label>
+  <label><input id="fVision" type="checkbox" style="width:auto;margin-right:8px" aria-describedby="visionHint">模型支持图片输入（按需识别）</label>
+  <p id="visionHint" class="hint">请自行确认模型及接口支持图片输入，无法根据模型名或连接测试判断。默认不自动附图；开启后先提供图片候选描述，由模型按任务选择指定图片识别，问答与执行模式均支持。不截图，不自动附带其它图片。</p>
   <div class="row" style="margin-top:16px">
     <button id="btnSave" class="primary">保存</button>
     <button id="btnCancel">取消</button>

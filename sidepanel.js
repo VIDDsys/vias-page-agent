@@ -108,6 +108,26 @@ function addMessage(role, text) {
   return element;
 }
 
+const ACTION_FAILURES = {
+  INVALID_SELECTOR: '目标选择器无效，请检查页面后重试。',
+  TARGET_NOT_FOUND: '找不到目标，请重新读取页面后重试。',
+  STALE_TARGET: '目标已变化，请重新读取页面后重试。',
+  STALE_SNAPSHOT: '页面已变化，请重新读取页面后重试。',
+  TARGET_HIDDEN: '目标当前不可见，请检查页面状态。',
+  TARGET_DISABLED: '目标当前不可操作，请检查页面状态。',
+  NOT_EDITABLE: '目标不可编辑，请检查目标或手动操作。',
+  READ_ONLY: '目标为只读，请检查页面状态。',
+  WAIT_TIMEOUT: '等待目标超时，请检查页面后重试。',
+  FORM_INVALID: '表单校验未通过，请检查表单内容。',
+  OPTION_NOT_FOUND: '找不到匹配选项，请检查页面选项。',
+  CLICK_BLOCKED: '点击未能完成，请检查页面后重试。',
+  CHECK_NOT_APPLIED: '点击后目标仍未选中，请重读页面核对，必要时手动选择。',
+  SKIPPED_AFTER_NAVIGATION: '页面正在跳转，此操作已跳过，请检查新页面。',
+  SKIPPED_AFTER_FAILURE: '前序操作失败，此操作已跳过，请检查前面的结果。',
+  BUSY: '页面正在处理其他操作，请稍后重试。',
+  CANCELLED: '操作已取消，请检查页面状态。',
+};
+
 function addTools(round, actions) {
   const block = document.createElement('div');
   block.className = 'tools';
@@ -130,9 +150,12 @@ function addTools(round, actions) {
     const state = document.createElement('span');
     state.className = 'tool-state';
     state.textContent = '…';
-    row.append(name, detail, state);
+    const reason = document.createElement('span');
+    reason.className = 'tool-reason';
+    reason.hidden = true;
+    row.append(name, detail, state, reason);
     block.appendChild(row);
-    slots.push({ row, state });
+    slots.push({ row, state, reason });
   }
   chatEl.appendChild(block);
   scrollBottom();
@@ -437,7 +460,18 @@ async function handleModelRequest(context, message) {
   const controller = new AbortController();
   context.modelControllers.set(message.requestId, controller);
   try {
-    const text = await globalThis.ViasCore.callModel(message.cfg, message.messages, { signal: controller.signal, timeoutMs: 180000, retries: 2 });
+    const policy = globalThis.ViasCore.MODEL_REQUEST_POLICY;
+    const hasImages = message.messages.some((item) => Array.isArray(item.content) && item.content.some((part) => part?.type === 'image_url'));
+    const beforeAttempt = hasImages ? async () => {
+      const state = await runtimeMessage({ type: 'GET_SETTINGS' });
+      const current = state?.ok ? state.models?.find((model) => model.id === message.cfg?.id) : null;
+      if (message.cfg?.vision !== true || !current || current.vision !== true || current.baseUrl !== message.cfg.baseUrl || current.model !== message.cfg.model) {
+        throw new Error('当前模型未启用图片能力或配置已变更，未发送图片；请检查模型设置后重新运行');
+      }
+    } : undefined;
+    const text = await globalThis.ViasCore.callModel(message.cfg, message.messages, {
+      signal: controller.signal, timeoutMs: policy.timeoutMs, totalTimeoutMs: policy.totalTimeoutMs, retries: policy.retries, beforeAttempt,
+    });
     if (!context.finished && !context.stopRequested && activeRun === context) context.port.postMessage({ t: 'model_response', runId: context.runId, requestId: message.requestId, text });
   } catch (error) {
     if (!context.finished && !context.stopRequested && activeRun === context) context.port.postMessage({ t: 'model_response', runId: context.runId, requestId: message.requestId, error: error.name === 'AbortError' ? '模型请求已取消' : error.message });
@@ -507,7 +541,8 @@ async function send() {
           slot.row.classList.remove('pending');
           slot.row.classList.add(message.ok ? 'ok' : 'fail');
           slot.state.textContent = message.ok ? (message.state?.replace('当前值=', '') || '完成') : '失败';
-          slot.row.title = message.msg || message.code || '';
+          slot.reason.hidden = message.ok;
+          slot.reason.textContent = message.ok ? '' : (Object.hasOwn(ACTION_FAILURES, message.code) ? ACTION_FAILURES[message.code] : '操作未完成，请检查页面状态后重试。');
         }
       } else if (message.t === 'model_request') {
         void handleModelRequest(context, message);

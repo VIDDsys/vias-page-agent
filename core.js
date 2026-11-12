@@ -2,6 +2,7 @@
   'use strict';
 
   const DEFAULT_TIMEOUT_MS = 180000;
+  const MODEL_REQUEST_POLICY = Object.freeze({ timeoutMs: DEFAULT_TIMEOUT_MS, totalTimeoutMs: DEFAULT_TIMEOUT_MS, retries: 2, coordinationTimeoutMs: DEFAULT_TIMEOUT_MS + 15000 });
   const MAX_ERROR_BODY = 500;
   const MAX_REPLY_LENGTH = 1000000;
 
@@ -61,6 +62,19 @@
     });
   }
 
+  function beforeAttempt(check, signal) {
+    if (signal.aborted) return Promise.reject(abortError());
+    return new Promise((resolve, reject) => {
+      const cleanup = () => signal.removeEventListener('abort', onAbort);
+      const onAbort = () => { cleanup(); reject(abortError()); };
+      signal.addEventListener('abort', onAbort, { once: true });
+      Promise.resolve().then(() => {
+        if (signal.aborted) throw abortError();
+        return check(signal);
+      }).then((value) => { cleanup(); resolve(value); }, (error) => { cleanup(); reject(error); });
+    });
+  }
+
   function retryAfterMs(resp, attempt) {
     const header = resp.headers.get('retry-after');
     if (header) {
@@ -96,6 +110,11 @@
     if (!Array.isArray(messages) || !messages.length) throw new Error('模型消息不能为空');
     const timeoutMs = Math.min(300000, Math.max(1000, Number(options.timeoutMs) || DEFAULT_TIMEOUT_MS));
     const retries = Math.floor(Math.min(3, Math.max(0, Number(options.retries) || 0)));
+    const totalTimeoutMs = Number.isFinite(Number(options.totalTimeoutMs))
+      ? Math.min(900000, Math.max(1000, Number(options.totalTimeoutMs))) : Infinity;
+    const now = () => globalThis.performance?.now?.() ?? Date.now();
+    const deadline = now() + totalTimeoutMs;
+    const budgetError = () => Object.assign(new Error('模型请求总时限已用尽或不足以重试，请稍后重试'), { retryable: false });
     const url = cfg.baseUrl + '/chat/completions';
     let lastError;
     let omitTemperature = false;
@@ -103,11 +122,17 @@
 
     for (let attempt = 0; attempt <= retries + extraAttempt; attempt++) {
       if (options.signal?.aborted) throw abortError();
+      const remainingMs = deadline - now();
+      if (remainingMs <= 0) throw budgetError();
+      const attemptTimeoutMs = Math.min(timeoutMs, remainingMs);
       const ctrl = new AbortController();
       const unlink = linkAbort(options.signal, ctrl);
-      const timer = setTimeout(() => ctrl.abort('timeout'), timeoutMs);
+      const timer = setTimeout(() => ctrl.abort('timeout'), attemptTimeoutMs);
       let responseRetryable;
       try {
+        if (options.beforeAttempt) await beforeAttempt(options.beforeAttempt, ctrl.signal);
+        if (ctrl.signal.aborted) throw abortError();
+        if (now() >= deadline) throw budgetError();
         const headers = { 'Content-Type': 'application/json' };
         if (cfg.apiKey) headers.Authorization = `Bearer ${cfg.apiKey}`;
         const resp = await fetch(url, {
@@ -124,7 +149,9 @@
           responseRetryable = resp.status === 408 || resp.status === 429 || resp.status >= 500;
           let body;
           try {
-            body = redactErrorText(await resp.text(), cfg.apiKey).replace(/[\r\n\t]+/g, ' ').slice(0, MAX_ERROR_BODY);
+            const raw = await resp.text();
+            if (raw.length > 2000000) throw new Error('模型错误响应过大，已停止读取');
+            body = redactErrorText(raw, cfg.apiKey).replace(/[\r\n\t]+/g, ' ').slice(0, MAX_ERROR_BODY);
           } catch (error) {
             if (ctrl.signal.aborted) throw error;
             body = '错误响应正文读取失败';
@@ -166,11 +193,14 @@
         if (typeof content !== 'string' || !content.trim()) {
           throw new Error('模型响应缺少 choices[0].message.content 最终回答（推理内容不会执行）');
         }
+        if (content.length > 1000000) throw new Error('模型回复过长，已拒绝接收，未执行任何操作');
+        if (now() >= deadline) throw budgetError();
         return content;
       } catch (error) {
         if (options.signal?.aborted) throw abortError();
+        if (now() >= deadline) throw budgetError();
         if (ctrl.signal.aborted) {
-          lastError = new Error(`模型请求超时（${Math.round(timeoutMs / 1000)} 秒）`);
+          lastError = new Error(`模型请求超时（${Math.round(attemptTimeoutMs / 1000)} 秒）`);
           // 已收到 401 等非重试状态时，读取正文超时也不能再次请求。
           lastError.retryable = responseRetryable !== false;
         } else if (error?.name === 'AbortError') {
@@ -187,7 +217,9 @@
         unlink();
       }
       // 退避不再保留上一请求的超时计时器与父信号监听器，且 Retry-After: 0 有效。
-      await wait(lastError.retryDelay ?? Math.min(4000, 500 * (2 ** attempt)), options.signal);
+      const retryDelay = lastError.retryDelay ?? Math.min(4000, 500 * (2 ** attempt));
+      if (retryDelay >= deadline - now()) throw budgetError();
+      await wait(retryDelay, options.signal);
     }
     throw lastError || new Error('模型请求失败');
   }
@@ -230,12 +262,29 @@
 
   function isInstructionObject(value) {
     return !!value && typeof value === 'object' && !Array.isArray(value)
-      && (Array.isArray(value.actions) || typeof value.say === 'string' || value.done === true);
+      && (Array.isArray(value.actions) || typeof value.say === 'string' || typeof value.done === 'boolean');
+  }
+
+  function looksLikeProtocol(text) {
+    return /[\{｛]/u.test(text)
+      && /(?:["'“”‘’＂＇`]\s*(?:say|actions|done|vias_read)\s*["'“”‘’＂＇`]|\b(?:say|actions|done|vias_read)\b)\s*(?:[:：]|$)/u.test(text);
   }
 
   // 只扫描顶层容器，忽略 JSON 字符串内括号；前言中的孤立引号不应吞掉后续指令。
-  function extractLastInstruction(text) {
-    let found = null;
+  function scanInstructions(text) {
+    const found = [];
+    const malformed = [];
+    const inspect = (start, end) => {
+      const fragment = text.slice(start, end);
+      if (!fragment.startsWith('{') && !fragment.startsWith('｛')) return;
+      const value = tryParseJson(fragment);
+      if (isInstructionObject(value) && (!Object.hasOwn(value, 'actions') || Array.isArray(value.actions))) {
+        found.push({ value, index: start, end });
+      } else if ((value === null && looksLikeProtocol(fragment))
+        || (value && ['say', 'actions', 'done', 'vias_read'].some((key) => Object.hasOwn(value, key)))) {
+        malformed.push(start);
+      }
+    };
     let depth = 0;
     let start = -1;
     let inStr = false;
@@ -249,25 +298,38 @@
         continue;
       }
       if (ch === '"' && depth > 0) { inStr = true; continue; }
-      if (ch === '{' || ch === '[') {
+      if (ch === '{' || ch === '[' || ch === '｛' || ch === '［') {
         if (depth === 0) start = i;
         depth++;
-      } else if (ch === '}' || ch === ']') {
+      } else if (ch === '}' || ch === ']' || ch === '｝' || ch === '］') {
         if (depth === 0) continue;
         depth--;
         if (depth === 0 && start >= 0) {
-          const value = tryParseJson(text.slice(start, i + 1));
-          if (isInstructionObject(value)) found = { value, index: start };
+          inspect(start, i + 1);
           start = -1;
         }
       }
     }
-    return found;
+    if (start >= 0) inspect(start, text.length);
+    return { found, malformed };
+  }
+
+  function cleanSay(value) {
+    const text = typeof value === 'string' ? value.slice(0, 50000) : '';
+    const scan = scanInstructions(text);
+    if (scan.malformed.length) return '';
+    let cleaned = text;
+    let removed = false;
+    for (const item of scan.found.reverse()) {
+      cleaned = cleaned.slice(0, item.index) + cleaned.slice(item.end);
+      removed = true;
+    }
+    return removed ? cleaned.replace(/```(?:json)?\s*```/gi, '').trim() : text;
   }
 
   function normalizeInstruction(value) {
     return {
-      say: typeof value.say === 'string' ? value.say.slice(0, 50000) : '',
+      say: cleanSay(value.say),
       actions: Array.isArray(value.actions) ? value.actions : [],
       done: value.done === true,
     };
@@ -280,29 +342,44 @@
     if (source.length > MAX_REPLY_LENGTH) {
       return { say: '模型回复过长，未解析或执行操作；请缩小任务后重试', actions: [], done: false };
     }
-    const value = tryParseJson(source.trim());
-    if (isInstructionObject(value)) return normalizeInstruction(value);
-    // 完整的数组/普通对象是数据，不应挖出其中的示例操作。
+    const trimmed = source.trim();
+    const fence = /^```(?:json)?\s*([\s\S]*?)\s*```$/i.exec(trimmed);
+    const value = tryParseJson(fence ? fence[1] : trimmed);
+    if (isInstructionObject(value) && (!Object.hasOwn(value, 'actions') || Array.isArray(value.actions))) return normalizeInstruction(value);
+    if (value && typeof value === 'object' && !Array.isArray(value)
+      && ['say', 'actions', 'done', 'vias_read'].some((key) => Object.hasOwn(value, key))) {
+      return { say: '', actions: [], done: false, malformed: true };
+    }
+    // 完整的数据容器不挖掘嵌套指令。动作只接受整条回复的唯一指令，避免把示例当成执行请求。
     if (value !== null) return { say: source.slice(0, 50000), actions: [], done: false };
-
-    let last = extractLastInstruction(source);
-    function consider(segment, offset) {
-      const candidate = extractLastInstruction(segment);
-      if (!candidate) return;
-      candidate.index += offset;
-      if (!last || candidate.index > last.index) last = candidate;
+    const scan = scanInstructions(source);
+    if (scan.found.length || scan.malformed.length || looksLikeProtocol(source)) {
+      return { say: '', actions: [], done: false, malformed: true };
     }
-    // 围栏内外均按原文位置比较；独立扫描各段可容忍前言中未配对的括号。
-    let cursor = 0;
-    for (const match of source.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)) {
-      consider(source.slice(cursor, match.index), cursor);
-      consider(match[1], match.index + match[0].indexOf(match[1]));
-      cursor = match.index + match[0].length;
-    }
-    if (cursor) consider(source.slice(cursor), cursor);
-    if (last) return normalizeInstruction(last.value);
     return { say: source.slice(0, 50000), actions: [], done: false };
   }
 
-  globalThis.ViasCore = Object.freeze({ normalizeBaseUrl, validateModel, callModel, parseReply });
+  // 控制消息必须是完整且精确的顶层 JSON，不从普通答案或代码块中挖取。
+  function parseReadRequest(text) {
+    let value;
+    try { value = JSON.parse(String(text)); } catch { return null; }
+    if (!value || typeof value !== 'object' || Array.isArray(value)
+      || Object.keys(value).length !== 1 || !Object.hasOwn(value, 'vias_read')) return null;
+    const read = value.vias_read;
+    if (!read || typeof read !== 'object' || Array.isArray(read)
+      || typeof read.snapshotId !== 'string' || !read.snapshotId || read.snapshotId.length > 300) return null;
+    const hasNotes = Object.hasOwn(read, 'notes');
+    if (hasNotes && (typeof read.notes !== 'string' || read.notes.length > 12000)) return null;
+    const fields = Object.keys(read).length - Number(hasNotes);
+    if (read.kind === 'segment' && fields === 3 && Object.hasOwn(read, 'index')
+      && Number.isSafeInteger(read.index) && read.index >= 0) return read;
+    if (read.kind === 'continue' && fields === 2) return read;
+    if (read.kind === 'images' && fields === 3 && Array.isArray(read.ids)
+      && read.ids.length >= 1 && read.ids.length <= 3
+      && read.ids.every((id) => Number.isSafeInteger(id) && id > 0)
+      && new Set(read.ids).size === read.ids.length) return read;
+    return null;
+  }
+
+  globalThis.ViasCore = Object.freeze({ MODEL_REQUEST_POLICY, normalizeBaseUrl, validateModel, callModel, parseReply, parseReadRequest });
 })();

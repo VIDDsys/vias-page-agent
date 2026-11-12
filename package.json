@@ -1,6 +1,6 @@
 {
   "name": "vias-page-agent",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "private": true,
   "description": "Vias Edge MV3 page agent",
   "engines": { "node": ">=21" },
@@ -10,8 +10,9 @@
     "test:e2e": "node tests/content.e2e.js",
     "test:extension": "node tests/extension.smoke.js",
     "test:agent": "node tests/agent.integration.js",
-    "test:ui": "node tests/ui.e2e.js",
-    "test:all": "npm run check && npm test && npm run test:e2e && npm run test:extension && npm run test:agent && npm run test:ui"
+    "test:ui": "node tests/ui.e2e.js && node tests/ui-feedback.e2e.js",
+    "test:privacy": "node tests/sensitive-fields.e2e.js",
+    "test:all": "npm run check && npm test && npm run test:e2e && npm run test:extension && npm run test:agent && npm run test:ui && npm run test:privacy"
   },
   "devDependencies": {
     "playwright-core": "1.55.0"

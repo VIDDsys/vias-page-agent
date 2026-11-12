@@ -14,12 +14,26 @@
   const documentId = crypto.randomUUID?.() || `doc-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
   const refMap = new Map();
   const refFingerprints = new Map();
+  const labelControls = new Map();
+  const optionRecords = new Map();
+  const RECOVERABLE_TARGET_ERRORS = new Set(['WAIT_TIMEOUT', 'TARGET_NOT_FOUND', 'STALE_TARGET', 'TARGET_HIDDEN', 'CHECK_NOT_APPLIED']);
+  let navigationEpoch = 0;
+  addEventListener('beforeunload', (event) => {
+    if (event.isTrusted !== true) return;
+    navigationEpoch++;
+    if (activeOperation) activeOperation.navigationStarted = true;
+  }, true);
+  const targetIdentities = new WeakMap();
+  let lastTargetIdentity = 0;
   const operationCache = new Map();
   const cancelledRuns = new Set();
   let snapshotEpoch = 0;
+  let lastRef = 0; // Never reuse a ref within this document, including continuation windows.
   let currentSnapshotId = '';
   let currentSnapshotUrl = '';
+  let frozenSnapshot = null;
   let mutationVersion = 0;
+  let continuationVersion = 0;
   let currentSnapshotMutationVersion = -1;
   let extracting = false;
   let executing = false;
@@ -30,8 +44,11 @@
     if (records.some((record) => record.type !== 'attributes' || ['id', 'role', 'type', 'name', 'class', 'style', 'hidden', 'disabled', 'readonly', 'href', 'value', 'aria-label', 'aria-hidden', 'aria-disabled', 'aria-checked', 'aria-expanded'].includes(record.attributeName))) mutationVersion++;
   });
   mutationObserver.observe(document.documentElement, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['id', 'role', 'type', 'name', 'class', 'style', 'hidden', 'disabled', 'readonly', 'href', 'value', 'aria-label', 'aria-hidden', 'aria-disabled', 'aria-checked', 'aria-expanded'] });
-  document.addEventListener('input', () => { mutationVersion++; }, true);
-  document.addEventListener('change', () => { mutationVersion++; }, true);
+  const continuationObserver = new MutationObserver(() => { continuationVersion++; });
+  continuationObserver.observe(document.documentElement, { childList: true, subtree: true, characterData: true, attributes: true });
+  const continuationStamp = () => { if (continuationObserver.takeRecords().length) continuationVersion++; return continuationVersion; };
+  document.addEventListener('input', () => { mutationVersion++; continuationVersion++; }, true);
+  document.addEventListener('change', () => { mutationVersion++; continuationVersion++; }, true);
   addEventListener('popstate', () => { mutationVersion++; });
   addEventListener('hashchange', () => { mutationVersion++; });
 
@@ -43,14 +60,61 @@
     return { ok: false, code, error: message, msg: message };
   }
 
+  function safeSlice(value, max) {
+    const text = String(value || '');
+    if (text.length <= max) return text;
+    let out = '';
+    for (const char of text) {
+      if (out.length + char.length > max) break;
+      out += char;
+    }
+    return out;
+  }
+
   function cleanText(value, max = 80) {
-    return String(value || '').replace(/\s+/g, ' ').trim().slice(0, max);
+    return safeSlice(String(value || '').replace(/\s+/g, ' ').trim(), max);
+  }
+
+  // 只读取标签文字，不把标签内控件的正文或选项当成字段提示。
+  function fieldHintText(root) {
+    if (!root) return '';
+    const parts = [];
+    const visit = (node) => {
+      if (node.nodeType === Node.TEXT_NODE) { parts.push(node.textContent); return; }
+      if (node.nodeType !== Node.ELEMENT_NODE) return;
+      const role = (node.getAttribute('role') || '').toLowerCase();
+      if (['INPUT', 'TEXTAREA', 'SELECT'].includes(node.tagName) || node.isContentEditable || ['textbox', 'combobox'].includes(role)) return;
+      for (const child of node.childNodes) visit(child);
+    };
+    visit(root);
+    return parts.join(' ');
+  }
+
+  function sensitiveHint(value) {
+    const hint = String(value || '').replace(/([a-z\d])([A-Z])/g, '$1 $2').replace(/[_\-.]+/g, ' ').toLowerCase().trim();
+    return /密码|口令|验证码|校验码|安全码|身份证|银行卡|信用卡|借记卡|密钥|令牌/.test(hint)
+      || /\b(?:password|passcode|passwd|otp|cvv|cvc|captcha)\b/.test(hint)
+      || /\b(?:verification|verify|security|one\s*time|2fa|mfa)\s+code\b/.test(hint)
+      || /\b(?:api|access|private|secret)\s+key\b/.test(hint)
+      || /\b(?:access|refresh|auth|authentication|bearer)\s+token\b/.test(hint)
+      || /\b(?:client|api)\s+secret\b/.test(hint)
+      || /^(?:token|secret)$/.test(hint);
   }
 
   function isSensitive(el) {
     if (!(el instanceof Element)) return false;
-    return (el.tagName === 'INPUT' && String(el.type).toLowerCase() === 'password')
-      || SENSITIVE_AUTOCOMPLETE.test(el.getAttribute('autocomplete') || '');
+    if ((el.tagName === 'INPUT' && String(el.type).toLowerCase() === 'password')
+      || SENSITIVE_AUTOCOMPLETE.test(el.getAttribute('autocomplete') || '')) return true;
+    const role = (el.getAttribute('role') || '').toLowerCase();
+    if (!['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName) && !el.isContentEditable && !['textbox', 'combobox'].includes(role)) return false;
+    const hints = ['name', 'id', 'placeholder', 'aria-label', 'title'].map((attr) => el.getAttribute(attr) || '');
+    const root = el.getRootNode();
+    for (const id of (el.getAttribute('aria-labelledby') || '').split(/\s+/)) {
+      if (id) hints.push(fieldHintText(root.getElementById?.(id) || document.getElementById(id)));
+    }
+    for (const label of el.labels || []) hints.push(fieldHintText(label));
+    if (!el.labels?.length) hints.push(fieldHintText(el.closest('label')));
+    return hints.some(sensitiveHint);
   }
 
   function navigationResult() {
@@ -158,14 +222,22 @@
       || (el.hasAttribute('contenteditable') && el.getAttribute('contenteditable') !== 'false');
   }
 
-  function visibleText(node, max = 120) {
+  function visibleText(node, max = 120, coveredText = null) {
     const parts = [];
+    let length = 0;
     function visit(current) {
-      if (isSensitive(current) || parts.join(' · ').length >= max) return;
+      if (!current || isSensitive(current) || length >= max) return;
       for (const child of current.childNodes || []) {
         if (child.nodeType === Node.TEXT_NODE) {
           const text = cleanText(child.textContent, max);
-          if (text && text !== parts.at(-1)) parts.push(text);
+          if (text && text !== parts.at(-1)) {
+            const offset = length + (parts.length ? 3 : 0);
+            if (coveredText && offset < max) {
+              coveredText.set(child, Math.max(coveredText.get(child) || 0, Math.min(text.length, max - offset)));
+            }
+            parts.push(text);
+            length = offset + text.length;
+          }
         } else if (child.nodeType === Node.ELEMENT_NODE && !SKIP_TAGS.has(child.tagName.toLowerCase()) && !isHidden(child)) {
           visit(child);
           if (child.shadowRoot) visit(child.shadowRoot);
@@ -173,7 +245,7 @@
       }
     }
     visit(node);
-    return parts.join(' · ').slice(0, max);
+    return safeSlice(parts.join(' · '), max);
   }
 
   function labelOf(el) {
@@ -181,7 +253,8 @@
     if (aria) return cleanText(aria, 60);
     const labelledBy = el.getAttribute('aria-labelledby');
     if (labelledBy) {
-      const text = labelledBy.split(/\s+/).map((id) => document.getElementById(id)?.textContent || '').join(' ');
+      const root = el.getRootNode();
+      const text = labelledBy.split(/\s+/).map((id) => visibleText(root.getElementById?.(id) || document.getElementById(id), 60)).join(' ');
       if (cleanText(text)) return cleanText(text, 60);
     }
     if (el.labels?.length) return visibleText(el.labels[0], 60);
@@ -190,9 +263,118 @@
     return cleanText(el.placeholder || el.name || el.id, 60);
   }
 
+  function choiceTarget(element) {
+    const target = element.tagName === 'LABEL' ? targetForLabel(element) || element : element;
+    return ['checkbox', 'radio', 'option'].includes(element.getAttribute('role'))
+      || (target instanceof HTMLInputElement && ['checkbox', 'radio'].includes(target.type)) ? target : null;
+  }
+
+  // 身份文字不随滚动、焦点或选中样式的可见性改变，也不含字段的可变值。
+  function identityText(element) {
+    const parts = [];
+    const visit = (node) => {
+      if (node.nodeType === Node.TEXT_NODE) { parts.push(node.textContent); return; }
+      if (node.nodeType !== Node.ELEMENT_NODE && !(node instanceof ShadowRoot)) return;
+      if (node instanceof Element && (SKIP_TAGS.has(node.tagName.toLowerCase())
+        || ['INPUT', 'TEXTAREA', 'SELECT'].includes(node.tagName) || node.isContentEditable)) return;
+      for (const child of node.childNodes) visit(child);
+      if (node.shadowRoot) visit(node.shadowRoot);
+    };
+    visit(element);
+    return cleanText(parts.join(' '), Infinity);
+  }
+
+  function optionPathOf(element) {
+    const steps = [];
+    let node = element;
+    while (node && node !== document.body) {
+      const parent = node.parentNode;
+      if (!parent?.children) return null;
+      const index = [...parent.children].indexOf(node);
+      if (index < 0) return null;
+      steps.push({ tag: node.tagName, role: node.getAttribute('role') || '', id: node.id, index });
+      if (parent instanceof ShadowRoot) { steps.push({ shadow: true }); node = parent.host; }
+      else node = parent;
+    }
+    return node === document.body ? steps.reverse() : null;
+  }
+
+  function optionAt(path) {
+    if (!path?.length) return null;
+    let node = document.body;
+    for (const step of path) {
+      if (step.shadow) { node = node?.shadowRoot; if (!node) return null; continue; }
+      // index 是全部 children 的下标，不能在 tag/role 过滤后再取一次下标。
+      const next = node?.children?.[step.index];
+      if (!next || next.tagName !== step.tag || (next.getAttribute('role') || '') !== step.role || next.id !== step.id) return null;
+      node = next;
+    }
+    return node instanceof Element ? node : null;
+  }
+
+  const CHOICE_SELECTOR = 'input[type="radio"],input[type="checkbox"],[role="radio"],[role="checkbox"],[role="option"]';
+  const HEADING_SELECTOR = 'h1,h2,h3,h4,h5,h6,legend';
+
+  function optionContextText(element) {
+    const parts = [];
+    const visit = (node) => {
+      if (node.nodeType === Node.TEXT_NODE) { parts.push(node.textContent); return; }
+      if (!(node instanceof Element)) return;
+      const role = node.getAttribute('role');
+      if (SKIP_TAGS.has(node.tagName.toLowerCase()) || ['INPUT', 'TEXTAREA', 'SELECT', 'OUTPUT', 'PROGRESS'].includes(node.tagName)
+        || node.isContentEditable || node.hasAttribute('aria-live') || ['status', 'timer', 'progressbar', 'alert', 'log'].includes(role)
+        || choiceTarget(node)) return;
+      for (const child of node.childNodes) visit(child);
+    };
+    // 页级容器只取标题；进度等全局状态不能成为每一道题的身份。
+    if (['MAIN', 'BODY', 'HTML'].includes(element.tagName)) {
+      for (const heading of element.querySelectorAll(HEADING_SELECTOR)) parts.push(identityText(heading));
+    } else visit(element);
+    const labelled = (element.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
+      .map((id) => element.getRootNode().getElementById?.(id)).filter(Boolean).map(identityText);
+    return JSON.stringify([element.getAttribute('aria-label') || '', labelled, cleanText(parts.join(' '), Infinity)]);
+  }
+
+  function optionContext(element) {
+    const scopes = [];
+    let parent = element.parentElement || element.getRootNode().host;
+    while (parent && parent !== document.body && parent !== document.documentElement) {
+      scopes.push({ element: parent, path: optionPathOf(parent), text: optionContextText(parent) });
+      const container = parent.parentElement;
+      const peer = container && [...container.children].some((sibling) => sibling !== parent
+        && !choiceTarget(sibling) && sibling.querySelector(CHOICE_SELECTOR));
+      // 沿任意层包装找到题干/语义分组或重复题块边界，不越界读入整张试卷状态。
+      if (parent.matches('section,article,fieldset') || parent.querySelector(HEADING_SELECTOR) || peer) break;
+      parent = parent.parentElement || parent.getRootNode().host;
+    }
+    return scopes;
+  }
+
+  function optionContextMatches(record) {
+    return record.scopes.every((scope) => {
+      const current = scope.element.isConnected ? scope.element : optionAt(scope.path);
+      return current && optionContextText(current) === scope.text;
+    });
+  }
+
+  function optionRecordOf(element) {
+    const target = choiceTarget(element);
+    if (!target) return null;
+    return { path: optionPathOf(element), fingerprint: fingerprintOf(element), targetFingerprint: fingerprintOf(target), target,
+      controlValue: target instanceof HTMLInputElement ? target.value : null,
+      labelFor: element.getAttribute('for'), scopes: optionContext(element) };
+  }
+
+  function optionMatches(element, record) {
+    const target = element && choiceTarget(element);
+    return !!target && fingerprintOf(element) === record.fingerprint && fingerprintOf(target) === record.targetFingerprint
+      && (target === record.target || !(target instanceof HTMLInputElement) || target.value === record.controlValue)
+      && element.getAttribute('for') === record.labelFor && optionContextMatches(record);
+  }
+
   function targetForLabel(label) {
-    if (label.htmlFor) return document.getElementById(label.htmlFor);
-    return label.querySelector('input,select,textarea,button');
+    // label.control follows the label's own tree, including an enclosing Shadow root.
+    return label instanceof HTMLLabelElement ? label.control : null;
   }
 
   function readState(el) {
@@ -208,10 +390,11 @@
     return '';
   }
 
-  function descriptionOf(el, ref) {
+  function descriptionOf(el, ref, coveredText = null) {
     const tag = el.tagName.toLowerCase();
     const role = (el.getAttribute('role') || '').toLowerCase();
-    const text = visibleText(el, 80) || labelOf(el);
+    const usesText = !['input', 'textarea', 'select'].includes(tag) && !el.isContentEditable && role !== 'textbox';
+    const text = visibleText(el, 80, usesText ? coveredText : null) || labelOf(el);
     if (tag === 'input') {
       if (['checkbox', 'radio'].includes(el.type)) return `[${ref}] 选项「${labelOf(el)}」 类型:${el.type === 'radio' ? '单选' : '复选'} ${el.checked ? '已选中' : '未选'}`;
       return `[${ref}] 输入框(${el.type}) 标签:${labelOf(el)} ${readState(el)}`;
@@ -239,7 +422,7 @@
   function fingerprintOf(el) {
     if (el === document.body || el === document.documentElement) return el === document.body ? 'body' : 'html';
     const tag = el.tagName.toLowerCase();
-    if (tag === 'label') return `label|${visibleText(el, 120)}`;
+    if (tag === 'label') return `label|${safeSlice(identityText(el), 120)}`;
     if (tag === 'input') return `input|${String(el.type || '').toLowerCase()}|${cleanText(el.getAttribute('aria-label') || el.getAttribute('title') || el.placeholder || el.name || el.id || '')}`;
     if (tag === 'textarea') return `textarea|${cleanText(el.getAttribute('aria-label') || el.getAttribute('title') || el.placeholder || el.name || el.id || '')}`;
     if (tag === 'select') return `select|${labelOf(el)}`;
@@ -258,114 +441,257 @@
     return `${tag}|${role}|${text}|${href}`;
   }
 
-  async function fetchImage(url, timeoutMs = 2500) {
+  // Candidate enumeration never reads pixels or fetches URLs. Pixels are requested separately.
+  const IMAGE_POLICY = Object.freeze({ count: 3, candidates: 300, pixels: 16000000, edge: 1024, encoded: 524288, totalEncoded: 1048576, timeout: 8000 });
+  let activeImageRead = null;
+
+  function imageIdentity(el) {
+    const img = el.tagName === 'IMG';
+    return JSON.stringify([img ? el.currentSrc || el.src : '', img ? el.naturalWidth : el.width,
+      img ? el.naturalHeight : el.height, el.getAttribute('src'), el.getAttribute('srcset'), el.getAttribute('sizes')]);
+  }
+
+  function nearbyImageText(root) {
+    if (!root) return '';
+    let text = '';
+    let nodes = 0;
+    const visit = (node) => {
+      if (++nodes > 60 || text.length >= 400) return;
+      if (node.nodeType === Node.TEXT_NODE) { text += ` ${node.textContent.slice(0, 400 - text.length)}`; return; }
+      if (node.nodeType !== Node.ELEMENT_NODE || isSensitive(node)
+        || ['INPUT', 'TEXTAREA', 'SELECT', 'SCRIPT', 'STYLE'].includes(node.tagName) || node.isContentEditable || isHidden(node)) return;
+      for (const child of node.childNodes) { if (nodes >= 60 || text.length >= 400) break; visit(child); }
+    };
+    visit(root);
+    return cleanText(text, 180);
+  }
+
+  function imageCandidate(el, id) {
+    const rect = el.getBoundingClientRect();
+    const img = el.tagName === 'IMG';
+    const nearby = el.closest('figure,li,p,label') || el.parentElement || el.getRootNode().host;
+    return {
+      id, kind: img ? 'img' : 'canvas', width: img ? el.naturalWidth : el.width,
+      height: img ? el.naturalHeight : el.height, displayWidth: Math.round(rect.width), displayHeight: Math.round(rect.height),
+      x: Math.round(rect.left), y: Math.round(rect.top),
+      inViewport: rect.bottom > 0 && rect.right > 0 && rect.top < innerHeight && rect.left < innerWidth,
+      alt: cleanText(el.getAttribute('alt') || el.getAttribute('aria-label') || el.title, 180),
+      nearby: nearbyImageText(nearby),
+      decorative: el.getAttribute('role') === 'presentation' || (img && el.getAttribute('alt') === ''),
+    };
+  }
+
+  function validateImageRead(message) {
+    if (cancelledRuns.has(message.runId)) return errorResult('CANCELLED', '任务已取消');
+    if (!frozenSnapshot || frozenSnapshot.runId !== message.runId || currentSnapshotId !== message.snapshotId
+      || currentSnapshotUrl !== location.href) return errorResult('STALE_SNAPSHOT', '图片快照已失效');
+    if (!frozenSnapshot.allowImages || message.allowImages !== true) return errorResult('VISION_DISABLED', '当前模型未启用图片能力');
+    if (!Array.isArray(message.ids) || message.ids.length < 1 || message.ids.length > IMAGE_POLICY.count
+      || new Set(message.ids).size !== message.ids.length
+      || message.ids.some((id) => !Number.isSafeInteger(id) || !frozenSnapshot.deliveredImages.has(id))) {
+      return errorResult('INVALID_IMAGE', '只能读取当前快照已经展示的1至3个图片编号');
+    }
+    return null;
+  }
+
+  function verifyImage(message, id) {
+    const invalid = validateImageRead(message);
+    if (invalid) return invalid;
+    const candidate = frozenSnapshot.imageMap.get(id);
+    if (!candidate?.element.isConnected || isHidden(candidate.element)
+      || imageIdentity(candidate.element) !== candidate.identity) return errorResult('STALE_IMAGE', '图片节点或来源已变化，请重新读取页面');
+    return { ok: true, candidate };
+  }
+
+  async function readImages(message) {
+    const invalid = validateImageRead(message);
+    if (invalid) return invalid;
+    if (executing || extracting || activeImageRead) return errorResult('BUSY', '页面正在处理另一项请求');
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    let bitmap;
+    activeImageRead = { runId: message.runId, controller };
+    const deadline = performance.now() + IMAGE_POLICY.timeout;
+    const timer = setTimeout(() => controller.abort('TIMEOUT'), IMAGE_POLICY.timeout);
+    const results = [];
+    let encoded = 0;
+    const assertImageActive = () => {
+      assertActive(message.runId);
+      if (performance.now() >= deadline) controller.abort('TIMEOUT');
+      if (controller.signal.aborted) throw Object.assign(new Error('图片读取已取消或超时'), { code: controller.signal.reason || 'CANCELLED' });
+    };
     try {
-      const response = await fetch(url, { credentials: 'include', signal: controller.signal });
-      if (!response.ok) return null;
-      const blob = await response.blob();
-      if (!blob.type.startsWith('image/') || blob.type === 'image/svg+xml' || blob.size > 12_000_000) return null;
-      bitmap = await createImageBitmap(blob);
-      const scale = Math.min(1, 1024 / Math.max(bitmap.width, bitmap.height));
-      const canvas = document.createElement('canvas');
-      canvas.width = Math.max(1, Math.round(bitmap.width * scale));
-      canvas.height = Math.max(1, Math.round(bitmap.height * scale));
-      canvas.getContext('2d').drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-      return canvas.toDataURL('image/jpeg', 0.8);
-    } catch {
-      return null;
+      for (const id of message.ids) {
+        assertImageActive();
+        const verified = verifyImage(message, id);
+        if (!verified.ok) { results.push({ id, ...verified }); continue; }
+        const { element: el } = verified.candidate;
+        const width = el.tagName === 'IMG' ? el.naturalWidth : el.width;
+        const height = el.tagName === 'IMG' ? el.naturalHeight : el.height;
+        if (width * height > IMAGE_POLICY.pixels || Math.max(width, height) > 32768) {
+          results.push({ id, ...errorResult('PIXEL_LIMIT', '图片解码像素超出上限') }); continue;
+        }
+        if (!width || !height || (el.tagName === 'IMG' && !el.complete)) {
+          results.push({ id, ...errorResult('IMAGE_NOT_READY', '图片尚未加载完成') }); continue;
+        }
+        const copy = document.createElement('canvas');
+        try {
+          const scale = Math.min(1, IMAGE_POLICY.edge / Math.max(width, height));
+          copy.width = Math.max(1, Math.round(width * scale));
+          copy.height = Math.max(1, Math.round(height * scale));
+          copy.getContext('2d').drawImage(el, 0, 0, copy.width, copy.height);
+          const blob = await new Promise((resolve, reject) => {
+            const onAbort = () => { cleanup(); reject(Object.assign(new Error('图片读取已取消或超时'), { code: controller.signal.reason || 'CANCELLED' })); };
+            const cleanup = () => controller.signal.removeEventListener('abort', onAbort);
+            controller.signal.addEventListener('abort', onAbort, { once: true });
+            try { copy.toBlob((value) => { cleanup(); resolve(value); }, 'image/jpeg', 0.8); }
+            catch (error) { cleanup(); reject(error); }
+          });
+          assertImageActive();
+          const after = verifyImage(message, id);
+          if (!after.ok) { results.push({ id, ...after }); continue; }
+          if (!blob) throw new Error('图片编码失败');
+          const size = 23 + 4 * Math.ceil(blob.size / 3);
+          if (size > IMAGE_POLICY.encoded || encoded + size > IMAGE_POLICY.totalEncoded) {
+            results.push({ id, ...errorResult('ENCODED_LIMIT', '图片编码后体积超出上限') }); continue;
+          }
+          const bytes = new Uint8Array(await blob.arrayBuffer());
+          assertImageActive();
+          let binary = '';
+          for (let offset = 0; offset < bytes.length; offset += 8192) binary += String.fromCharCode(...bytes.subarray(offset, offset + 8192));
+          encoded += size;
+          results.push({ id, ok: true, dataUrl: `data:image/jpeg;base64,${btoa(binary)}` });
+        } catch (error) {
+          assertImageActive();
+          const after = verifyImage(message, id);
+          if (!after.ok) results.push({ id, ...after });
+          else if (error.name === 'SecurityError' && el.tagName === 'IMG' && /^https?:/.test(el.currentSrc)) {
+            // Only the trusted currentSrc of this selected candidate may be fetched by the background.
+            results.push({ id, ok: false, code: 'FETCH_REQUIRED', source: el.currentSrc });
+          } else results.push({ id, ...errorResult(error.code || 'IMAGE_UNREADABLE', '图片不可读取或canvas已被跨域内容污染') });
+        } finally { copy.width = 0; copy.height = 0; }
+      }
+      assertImageActive();
+      return { snapshotId: message.snapshotId, results };
+    } catch (error) {
+      return errorResult(error.code || 'CANCELLED', error.message);
     } finally {
       clearTimeout(timer);
-      bitmap?.close?.();
+      activeImageRead = null;
     }
   }
 
-  async function collectImages(runId, enabled) {
-    if (!enabled) return { images: [], found: document.querySelectorAll('img,canvas').length };
-    const started = performance.now();
-    const images = [];
-    const seen = new Set();
-    let found = 0;
-    const push = (value) => { if (value && !seen.has(value) && images.length < 6) { seen.add(value); images.push(value); } };
-    for (const img of document.querySelectorAll('img')) {
-      assertActive(runId);
-      if (images.length >= 4 || performance.now() - started > 9000) break;
-      if (!img.currentSrc || isHidden(img)) continue;
-      const rect = img.getBoundingClientRect();
-      if (Math.max(img.naturalWidth, rect.width, rect.height) < 80) continue;
-      found++;
-      push(await fetchImage(img.currentSrc));
-    }
-    for (const canvas of document.querySelectorAll('canvas')) {
-      if (images.length >= 6 || performance.now() - started > 9000) break;
-      if (isHidden(canvas) || Math.max(canvas.width, canvas.height) < 100) continue;
-      found++;
-      try {
-        const scale = Math.min(1, 1024 / Math.max(canvas.width, canvas.height));
-        const copy = document.createElement('canvas');
-        copy.width = Math.max(1, Math.round(canvas.width * scale));
-        copy.height = Math.max(1, Math.round(canvas.height * scale));
-        copy.getContext('2d').drawImage(canvas, 0, 0, copy.width, copy.height);
-        push(copy.toDataURL('image/jpeg', 0.8));
-      } catch {}
-    }
-    return { images, found };
-  }
-
-  async function buildSnapshot(runId, maxLen = 16000, includeImages = false) {
+  async function buildSnapshot(runId, maxLen = 32000, includeImages = false, continuation = null) {
     assertActive(runId);
-    // 图片读取可能持续数秒；必须先完成异步工作，再在同一个同步阶段构建 ref 与版本戳。
-    const imageResult = await collectImages(runId, includeImages);
+    const previous = frozenSnapshot;
+    if (continuation && (!previous || previous.runId !== runId || previous.snapshotId !== continuation
+      || currentSnapshotUrl !== location.href || !previous.cursor || continuationStamp() !== previous.continuationVersion
+      || previous.navigationEpoch !== navigationEpoch || pageStateSignature() !== previous.signature)) {
+      throw Object.assign(new Error('续读失败：页面已变化或续读位置失效，请重新开始'), { code: 'STALE_CONTINUATION' });
+    }
+    // Snapshot construction collects metadata only; image reads never rebuild refs.
     await waitForStable(runId, 1000, 150);
     assertActive(runId);
+    const shadowRoots = rootsFrom(document).slice(1);
+    if (continuation && (continuationStamp() !== previous.continuationVersion || location.href !== previous.url
+      || shadowRoots.length !== previous.shadowRoots.length || shadowRoots.some((root, i) => root !== previous.shadowRoots[i]))) {
+      throw Object.assign(new Error('续读失败：页面内容已变化，请重新开始'), { code: 'STALE_CONTINUATION' });
+    }
+    for (const root of shadowRoots) continuationObserver.observe(root, { childList: true, subtree: true, characterData: true, attributes: true });
     refMap.clear();
     refFingerprints.clear();
+    labelControls.clear();
+    optionRecords.clear();
     // 重建期间旧快照立即失效：若 walk 中途抛错，绝不让旧编号解析到新元素
     currentSnapshotId = '';
-    const targets = {};
-    const targetMeta = {};
+    frozenSnapshot = null;
     const mappedControls = new Set();
-    const budget = Math.min(50000, Math.max(1000, Number(maxLen) || 16000));
-    let ref = 0;
-    let text = '';
-    let previousLine = '';
-    const append = (line) => {
-      if (!line || line === previousLine || text.length >= budget) return false;
-      previousLine = line;
-      const addition = (text ? '\n' : '') + line;
-      const complete = text.length + addition.length <= budget;
-      text += addition.slice(0, budget - text.length);
-      return complete;
+    const coveredText = new Map(); // Normalized text prefixes already included in target titles.
+    const segmentLimit = Math.min(50000, Math.max(1000, Number(maxLen) || 32000));
+    const totalLimit = 512000; // UTF-16 代码单元，非 token
+    const nodeLimit = 30000;
+    const segments = [{ text: '', targets: {}, targetMeta: {}, imageCandidates: [] }];
+    const imageMap = new Map();
+    let omittedImages = false;
+    let total = 0;
+    let nodes = 0;
+    let currentNode = 0;
+    let cursor = null;
+    const start = continuation ? previous.cursor : { node: 1, offset: 0 };
+    let truncated = '';
+    let ref = lastRef;
+    let segment = segments[0];
+    const nextSegment = () => { segment = { text: '', targets: {}, targetMeta: {}, imageCandidates: [] }; segments.push(segment); };
+    const append = (line, atomicTitle = false) => {
+      if (!line || truncated || currentNode < start.node) return false;
+      const initialOffset = currentNode === start.node ? start.offset : 0;
+      line = line.slice(initialOffset);
+      if (!line) return true;
+      const prefixLength = segment.text || (currentNode === start.node && start.prefix) ? 1 : 0;
+      let remaining = (prefixLength ? '\n' : '') + line;
+      let consumed = 0;
+      if (atomicTitle && segment.text && segmentLimit - segment.text.length < line.split('\n')[0].length + 1) {
+        nextSegment();
+        remaining = line;
+      }
+      while (remaining) {
+        if (segment.text.length === segmentLimit && total < totalLimit) nextSegment();
+        let size = Math.min(remaining.length, segmentLimit - segment.text.length, totalLimit - total);
+        if (size && size < remaining.length && /[\uD800-\uDBFF]/.test(remaining[size - 1]) && /[\uDC00-\uDFFF]/.test(remaining[size])) size--;
+        if (!size) {
+          // 总预算只剩一个代码单元时不能切开代理对，也不能反复创建空段。
+          if (totalLimit - total < 2) {
+            truncated = '达到快照总量上限';
+            cursor = { node: currentNode, offset: initialOffset + Math.max(0, consumed - prefixLength), prefix: prefixLength > 0 && consumed === 0 };
+            return false;
+          }
+          nextSegment();
+          continue;
+        }
+        segment.text += remaining.slice(0, size);
+        total += size;
+        consumed += size;
+        remaining = remaining.slice(size);
+      }
+      return true;
     };
-    const addTarget = (el, describe = (id) => descriptionOf(el, id)) => {
+    const addTarget = (el, describe = (id) => descriptionOf(el, id, coveredText)) => {
       const target = el.tagName === 'LABEL' ? targetForLabel(el) || el : el;
       if (mappedControls.has(target)) return;
       mappedControls.add(target);
       const id = ref + 1;
+      // Rebuild coverage before the continuation cursor too, so a long control's
+      // remaining text uses the same offsets in every window.
       let description = describe(id);
-      const remaining = budget - text.length - (text ? 1 : 0);
-      if (description.length > remaining) {
-        const title = description.split('\n')[0];
-        // 编号与完整标题是原子记录；只截短多行详情，绝不输出无法执行的半条 ref。
-        if (title.length > remaining) return;
-        const omitted = ' …（选项已省略）';
-        const detailBudget = remaining - title.length - 1 - omitted.length;
-        description = title;
-        if (detailBudget >= 0) {
-          const detail = describe(id).slice(title.length + 1, title.length + 1 + detailBudget);
-          description += `\n${detail}${omitted}`;
-        } else if (remaining >= title.length + 4) description += '（省略）';
+      if (currentNode < start.node) return;
+      const title = description.split('\n')[0];
+      if (title.length > segmentLimit || totalLimit - total < title.length + (segment.text ? 1 : 0)) {
+        truncated = '达到快照总量上限，后续目标未知';
+        cursor = { node: currentNode, offset: 0 };
+        return;
       }
-      if (!append(description)) return;
-      ref = id;
+      // 控件标题及其详情同段登记；详情过长明确提示省略。
+      if (description.length > segmentLimit) {
+        const omitted = ' …（选项已省略）';
+        description = safeSlice(description, segmentLimit - omitted.length) + omitted;
+      }
+      if (segment.text && segment.text.length + 1 + description.length > segmentLimit) nextSegment();
+      if (totalLimit - total < description.length + (segment.text ? 1 : 0)) {
+        truncated = '达到快照总量上限，后续目标未知';
+        cursor = { node: currentNode, offset: 0 };
+        return;
+      }
+      if (!append(description, true)) return;
+      lastRef = ref = id;
       refMap.set(id, el);
       refFingerprints.set(id, fingerprintOf(el));
-      targets[id] = description;
+      if (el.tagName === 'LABEL') labelControls.set(id, target);
+      const optionRecord = optionRecordOf(el);
+      if (optionRecord) optionRecords.set(id, optionRecord);
+      segment.targets[id] = description;
       const tagName = target.tagName.toLowerCase();
       const inputType = tagName === 'input' || tagName === 'button' ? String(target.type || '').toLowerCase() : '';
-      targetMeta[id] = {
+      if (!targetIdentities.has(target)) targetIdentities.set(target, `${documentId}:target:${++lastTargetIdentity}`);
+      segment.targetMeta[id] = {
+        identity: targetIdentities.get(target),
         tag: el.tagName === 'LABEL' ? 'label' : tagName,
         type: inputType,
         role: (target.getAttribute('role') || '').toLowerCase(),
@@ -377,8 +703,15 @@
       };
     };
     const walk = (root, controlsOnly = false) => {
-      for (const el of root.children || []) {
-        if (text.length >= budget) return;
+      for (const el of root.childNodes || []) {
+        if (truncated) return;
+        currentNode = ++nodes;
+        if (nodes - start.node >= nodeLimit) { truncated = '达到遍历节点上限'; cursor = { node: currentNode, offset: 0 }; return; }
+        if (el.nodeType === Node.TEXT_NODE) {
+          if (!controlsOnly) append(cleanText(el.textContent, Infinity).slice(coveredText.get(el) || 0));
+          continue;
+        }
+        if (el.nodeType !== Node.ELEMENT_NODE) continue;
         const tag = el.tagName.toLowerCase();
         if (SKIP_TAGS.has(tag)) continue;
         const style = getComputedStyle(el);
@@ -387,40 +720,52 @@
           if (!controlsOnly) append(`嵌入页面: ${cleanText(el.title || el.src, 120)}（跨域内容可能无法读取）`);
           continue;
         }
+        if (includeImages && currentNode >= start.node && (tag === 'img' || tag === 'canvas')) {
+          if (imageMap.size < IMAGE_POLICY.candidates) {
+            const id = imageMap.size + 1;
+            const candidate = imageCandidate(el, id);
+            const line = `图片候选 ${JSON.stringify(candidate)}`;
+            if (segment.text && segment.text.length + line.length + 1 > segmentLimit) nextSegment();
+            if (line.length <= segmentLimit && totalLimit - total >= line.length + (segment.text ? 1 : 0) && append(line, true)) {
+              imageMap.set(id, { element: el, identity: imageIdentity(el) });
+              segment.imageCandidates.push(candidate);
+            } else {
+              truncated = '达到快照总量上限，后续图片候选未知'; cursor = { node: currentNode, offset: 0 }; return;
+            }
+          } else omittedImages = true;
+        }
         if (tag === 'label') {
           // 隐藏原生 input 的组件仍通过 label 操作；同一控件只发一个 ref。
           const controlled = targetForLabel(el);
           const isToggle = controlled instanceof HTMLInputElement && ['checkbox', 'radio'].includes(controlled.type);
-          const own = visibleText(el, 120);
-          if (isToggle && own) {
+          const own = isToggle ? visibleText(el, 60, coveredText) : '';
+          if (isToggle) {
             addTarget(el, (id) => `[${id}] 选项「${cleanText(own, 60)}」 类型:${controlled.type === 'radio' ? '单选' : '复选'} ${controlled.checked ? '已选中' : '未选'}`);
-            walk(el, true);
-            if (el.shadowRoot) walk(el.shadowRoot, true);
+            walk(el, false);
+            if (el.shadowRoot) walk(el.shadowRoot, false);
             continue;
           }
         }
         if (isInteractive(el)) {
           addTarget(el);
-          // 父级描述已包含普通文字，但不能吞掉内部真正的 input/button 等控件。
+          // Only omit text prefixes actually shown in a title; keep tails and
+          // continue enumerating native/Shadow controls independently.
           if (!isSensitive(el) && !['select', 'textarea'].includes(tag)) {
-            walk(el, true);
-            if (el.shadowRoot) walk(el.shadowRoot, true);
+            walk(el, false);
+            if (el.shadowRoot) walk(el.shadowRoot, false);
           }
           continue;
         }
         if (tag === 'label') {
-          if (!controlsOnly) append(visibleText(el, 120));
-          walk(el, true);
-          if (el.shadowRoot) walk(el.shadowRoot, true);
+          walk(el, false);
+          if (el.shadowRoot) walk(el.shadowRoot, false);
           continue;
         } else if (!controlsOnly && tag === 'li' && !el.children.length) {
-          const own = directText(el, 120);
-          if (own) {
+          const own = directText(el, Infinity);
+          if (own && own.length <= 120) {
             addTarget(el, (id) => `[${id}] 列表项「${own}」`);
             continue;
           }
-        } else if (!controlsOnly) {
-          append(directText(el));
         }
         walk(el, controlsOnly);
         if (el.shadowRoot) walk(el.shadowRoot, controlsOnly);
@@ -430,15 +775,32 @@
     currentSnapshotUrl = location.href;
     currentSnapshotMutationVersion = mutationVersion;
     currentSnapshotId = `${documentId}:${++snapshotEpoch}:${currentSnapshotMutationVersion}`;
+    const signature = pageStateSignature();
+    frozenSnapshot = {
+      runId, snapshotId: currentSnapshotId, url: currentSnapshotUrl, title: document.title,
+      segments, deliveredRefs: new Set(), imageMap, deliveredImages: new Set(), allowImages: includeImages,
+      omittedImages, truncated, totalChars: total, cursor,
+      continuationVersion: continuationStamp(), shadowRoots, navigationEpoch, signature,
+    };
+    return readFrozenSegment(runId, currentSnapshotId, 0, true);
+  }
+
+  function readFrozenSegment(runId, snapshotId, index, internal = false) {
+    if (cancelledRuns.has(runId)) return errorResult('CANCELLED', '任务已取消');
+    if (!frozenSnapshot || runId !== frozenSnapshot.runId || snapshotId !== currentSnapshotId || currentSnapshotUrl !== location.href) {
+      return errorResult('STALE_SNAPSHOT', '快照已失效或不属于当前任务，请重新读取页面');
+    }
+    if (!internal && (executing || extracting)) return errorResult('BUSY', '页面正在处理另一项请求');
+    if (!Number.isSafeInteger(index) || index < 0 || index >= frozenSnapshot.segments.length) return errorResult('INVALID_SEGMENT', '分段编号超出范围');
+    const item = frozenSnapshot.segments[index];
+    Object.keys(item.targets).forEach((id) => frozenSnapshot.deliveredRefs.add(Number(id)));
+    item.imageCandidates.forEach(({ id }) => frozenSnapshot.deliveredImages.add(id));
     return {
-      snapshotId: currentSnapshotId,
-      url: currentSnapshotUrl,
-      title: document.title,
-      text,
-      targets,
-      targetMeta,
-      images: imageResult.images,
-      hasImgElements: imageResult.found > 0,
+      snapshotId, url: frozenSnapshot.url, title: frozenSnapshot.title, index,
+      segmentCount: frozenSnapshot.segments.length, totalChars: frozenSnapshot.totalChars,
+      truncated: frozenSnapshot.truncated, canContinue: !!frozenSnapshot.cursor, signature: frozenSnapshot.signature,
+      text: item.text, targets: item.targets, targetMeta: item.targetMeta,
+      imageCandidates: item.imageCandidates, omittedImages: frozenSnapshot.omittedImages,
     };
   }
 
@@ -472,8 +834,20 @@
 
   async function resolveTarget(action, runId, options = {}) {
     let element;
-    if (action.ref != null) element = refMap.get(Number(action.ref));
-    else if (action.selector) {
+    let optionRecord;
+    if (action.ref != null) {
+      const ref = Number(action.ref);
+      if (!frozenSnapshot?.deliveredRefs.has(ref)) return { error: errorResult('TARGET_NOT_FOUND', `编号 ${action.ref} 未在当前快照中提供，请重新读取页面`) };
+      element = refMap.get(ref);
+      optionRecord = optionRecords.get(ref);
+      if (optionRecord) {
+        if (!element?.isConnected) element = optionAt(optionRecord.path);
+        if (!optionMatches(element, optionRecord)) return { error: errorResult('STALE_TARGET', `编号 ${action.ref} 的题目、选项内容或关联控件已变化，请重新读取页面`) };
+        // 只接受当前快照中同题同选项的等价重绘，随后派发阶段仍固定这次解析的节点。
+        refMap.set(ref, element);
+        if (element.tagName === 'LABEL') labelControls.set(ref, targetForLabel(element) || element);
+      }
+    } else if (action.selector) {
       try { element = queryDeep(String(action.selector)) || await waitForSelector(String(action.selector), 3000, runId); }
       catch (error) {
         if (typeof error.code === 'string') throw error;
@@ -486,14 +860,17 @@
     if (action.ref != null && options.verifyFingerprint !== false) {
       const recorded = refFingerprints.get(Number(action.ref));
       if (recorded && fingerprintOf(element) !== recorded) return { error: errorResult('STALE_TARGET', `编号 ${action.ref} 的目标内容已变化，请重新读取页面`) };
+      if (element.tagName === 'LABEL' && labelControls.has(Number(action.ref)) && (targetForLabel(element) || element) !== labelControls.get(Number(action.ref))) {
+        return { error: errorResult('STALE_TARGET', `编号 ${action.ref} 关联的控件已变化，请重新读取页面`) };
+      }
     }
     if (!options.allowHidden && isHidden(element)) return { error: errorResult('TARGET_HIDDEN', '目标元素当前不可见') };
     const target = element.tagName === 'LABEL' ? targetForLabel(element) || element : element;
     if (target.disabled || target.getAttribute('aria-disabled') === 'true') return { error: errorResult('TARGET_DISABLED', '目标元素已禁用') };
-    return bindTarget(element, runId);
+    return bindTarget(element, runId, optionRecord);
   }
 
-  function bindTarget(element, runId) {
+  function bindTarget(element, runId, optionRecord = null) {
     const target = element.tagName === 'LABEL' ? targetForLabel(element) || element : element;
     const recorded = fingerprintOf(element);
     const targetRecorded = fingerprintOf(target);
@@ -507,6 +884,7 @@
       if (!element.isConnected || !target.isConnected || fingerprintOf(element) !== recorded
           || fingerprintOf(target) !== targetRecorded
           || (element.tagName === 'LABEL' && (targetForLabel(element) || element) !== target)
+          || (optionRecord && !optionContextMatches(optionRecord))
           || (target.form || target.closest('form')) !== form || formIdentity() !== formRecorded
           || (click && (element.closest('a') !== anchor || (anchor && fingerprintOf(anchor) !== linkRecorded)))) {
         throw Object.assign(new Error('目标身份在操作准备期间变化，请重新读取页面'), { code: 'STALE_TARGET' });
@@ -543,16 +921,16 @@
     return anchor;
   }
 
-  async function clickOnce(element, runId, verify, detail = 1) {
+  async function clickOnce(element, runId, verify, detail = 1, visualElement = element) {
     verify(true);
-    element.scrollIntoView({ block: 'center', inline: 'nearest' });
+    visualElement.scrollIntoView({ block: 'center', inline: 'nearest' });
     await sleep(TIMING.paint, runId);
     verify(true);
     const anchor = safeLink(element);
     const originalTarget = anchor?.getAttribute('target');
     if (anchor && /^_blank$/i.test(originalTarget || '')) anchor.setAttribute('target', '_self');
     try {
-      const rect = element.getBoundingClientRect();
+      const rect = visualElement.getBoundingClientRect();
       const init = { bubbles: true, cancelable: true, composed: true, view: window, button: 0, detail, clientX: Math.round(rect.left + rect.width / 2), clientY: Math.round(rect.top + rect.height / 2) };
       // 每个前置事件都可能同步复用/移除节点或发起导航，不能只在整串事件前检查一次。
       for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
@@ -573,6 +951,22 @@
 
   function pageSignature() {
     return `${location.href}|${cleanText(document.body?.innerText, 1000)}`;
+  }
+
+  function pageStateSignature() {
+    let hash = 2166136261;
+    const mix = (text) => { for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 16777619); };
+    const fields = [];
+    const visit = (root) => {
+      if (!root?.querySelectorAll) return;
+      for (const el of root.querySelectorAll('input,textarea,select')) fields.push(el);
+      for (const el of root.querySelectorAll('*')) if (el.shadowRoot) visit(el.shadowRoot);
+    };
+    const signatureText = (document.body?.innerText || '').slice(0, 2000000);
+    mix(signatureText);
+    visit(document);
+    for (const el of fields) mix(`${el.value}|${el.checked}|${el.selectedIndex}|`);
+    return `${signatureText.length}:${fields.length}:${hash >>> 0}`;
   }
 
   async function performPress(element, value, runId, verify) {
@@ -715,8 +1109,13 @@
             for (let rest = subIndex + 1; rest < action.actions.length; rest++) roundResults.push(skippedAfterNavigation());
             return { ...result, msg: `循环执行 ${index + 1}/${times} 轮后因导航停止`, results: roundResults };
           }
-          if (!result.ok) return errorResult(result.code || 'REPEAT_FAILED', `循环在第 ${index + 1} 轮停止：${result.msg || result.error}`);
+          if (!result.ok && !RECOVERABLE_TARGET_ERRORS.has(result.code)) {
+            for (let rest = subIndex + 1; rest < action.actions.length; rest++) roundResults.push(errorResult('SKIPPED_AFTER_FAILURE', '前序操作失败，已跳过'));
+            return { ...errorResult(result.code || 'REPEAT_FAILED', `循环在第 ${index + 1} 轮停止：${result.msg || result.error}`), results: roundResults };
+          }
         }
+        const failed = roundResults.find((result) => !result.ok);
+        if (failed) return { ...errorResult(failed.code, `循环第 ${index + 1} 轮存在失败目标，有效目标已执行，请核对结果`), results: roundResults };
         if (index < times - 1) await sleep(Math.max(0, interval - (performance.now() - started)), runId);
       }
       return { ok: true, msg: `已按 ${Math.round(interval)}ms 周期循环 ${times} 轮。${summaries.slice(-2).join('；').slice(0, 240)}` };
@@ -788,8 +1187,14 @@
       // 原生控件以 checked 为准（aria 可能与实际状态脱节）；仅非原生 ARIA 控件才信 aria-checked
       if (checkbox?.checked || (!checkbox && target.getAttribute('aria-checked') === 'true')) return { ok: true, code: 'NO_CHANGE', msg: '目标已选中', state: '已选中' };
       // label 引用时 target 是其内部 input，直接点 input 保证原生翻转与 change 事件
-      await clickOnce(checkbox || element, runId, verify);
-      return { ok: true, msg: '已选中目标', state: readState(element) };
+      await clickOnce(checkbox || element, runId, verify, 1, element);
+      const record = action.ref != null && optionRecords.get(Number(action.ref));
+      const observedElement = element.isConnected ? element : record && optionAt(record.path);
+      if (record && !optionMatches(observedElement, record)) return errorResult('STALE_TARGET', '点击后题目或选项身份已变化，请重新读取页面核对实际状态');
+      const observed = observedElement && (choiceTarget(observedElement) || observedElement);
+      const checked = observed instanceof HTMLInputElement ? observed.checked : observed?.getAttribute('aria-checked') === 'true';
+      if (!checked) return errorResult('CHECK_NOT_APPLIED', '点击后目标仍未选中，页面可能阻止了合成点击，请重新读取页面或手动选择');
+      return { ok: true, msg: '已选中目标', state: readState(observedElement) };
     }
     if (action.action === 'click') {
       const before = pageSignature();
@@ -801,7 +1206,7 @@
         const href = anchor?.getAttribute('href');
         if (href) activeOperation.navigationUrl = new URL(href, document.baseURI).href;
       } catch {}
-      try { await clickOnce(toggle ? target : element, runId, verify); }
+      try { await clickOnce(toggle ? target : element, runId, verify, 1, element); }
       catch (error) {
         if (typeof error.code === 'string') throw error;
         return errorResult('CLICK_BLOCKED', error.message);
@@ -912,11 +1317,12 @@
 
   async function executeBatch(message) {
     if (!message.runId || !message.operationId || !message.snapshotId) return { results: [errorResult('INVALID_REQUEST', '缺少 runId、operationId 或 snapshotId')] };
-    if (message.snapshotId !== currentSnapshotId || currentSnapshotUrl !== location.href) {
+    if (message.snapshotId !== currentSnapshotId || currentSnapshotUrl !== location.href || message.runId !== frozenSnapshot?.runId
+      || frozenSnapshot.navigationEpoch !== navigationEpoch) {
       return { results: [errorResult('STALE_SNAPSHOT', '页面已跳转或快照已重建，请重新读取页面')] };
     }
     if (!Array.isArray(message.actions) || message.actions.length < 1 || message.actions.length > 20) return { results: [errorResult('INVALID_ACTIONS', '操作数量必须为 1-20')] };
-    if (executing || extracting) return { results: [errorResult('BUSY', '页面正在处理另一项请求')] };
+    if (executing || extracting || activeImageRead) return { results: [errorResult('BUSY', '页面正在处理另一项请求')] };
     assertActive(message.runId);
     activeRunId = message.runId;
     executing = true;
@@ -940,7 +1346,7 @@
             for (let rest = index + 1; rest < message.actions.length; rest++) results.push(skippedAfterNavigation());
             break;
           }
-          if (!result.ok && !['WAIT_TIMEOUT', 'TARGET_NOT_FOUND', 'STALE_TARGET', 'TARGET_HIDDEN'].includes(result.code)) {
+          if (!result.ok && !RECOVERABLE_TARGET_ERRORS.has(result.code)) {
             for (let rest = index + 1; rest < message.actions.length; rest++) results.push(errorResult('SKIPPED_AFTER_FAILURE', '前序操作失败，已跳过'));
             break;
           }
@@ -956,10 +1362,12 @@
       // beforeunload 后 URL 仍可能是旧页；绝不能返回旧文档快照。
       if (navigationResult() || results.some(isNavigationResult)) return { results };
       let page;
-      try { page = await buildSnapshot(message.runId, 12000, message.includeImages === true); }
+      try { page = await buildSnapshot(message.runId, 32000, message.includeImages === true); }
       catch (error) {
-        if (error.name !== 'CancelledError') throw error;
-        return { results };
+        if (isNavigationResult(error)) throw error;
+        if (error.name === 'CancelledError') return { results };
+        // 已发生的点击不能被后续观察异常抹掉；后台可独立重读，不能重放整批。
+        return { results, observationError: errorResult('EXTRACT_ERROR', '操作已执行，但读取操作后页面失败，请重新读取页面') };
       }
       assertActive(message.runId);
       return { results, page };
@@ -980,20 +1388,41 @@
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (!message || typeof message !== 'object') return;
-    if (message.type === 'ABORT') {
+    if (message.type === 'ABORT' || message.type === 'CANCEL_IMAGES') {
+      if (activeImageRead?.runId === message.runId) activeImageRead.controller.abort('CANCELLED');
+      if (message.type === 'CANCEL_IMAGES') {
+        if (message.disable === true && frozenSnapshot?.runId === message.runId) frozenSnapshot.allowImages = false;
+        sendResponse({ ok: true }); return;
+      }
       if (message.runId) cancelledRuns.add(message.runId);
       if (cancelledRuns.size > 100) cancelledRuns.delete(cancelledRuns.values().next().value);
       return;
     }
+    if (message.type === 'READ_IMAGES') {
+      readImages(message).then(sendResponse, (error) => sendResponse(errorResult(error.code || 'IMAGE_UNREADABLE', error.message)));
+      return true;
+    }
+    if (message.type === 'VERIFY_IMAGES') {
+      const invalid = validateImageRead(message);
+      sendResponse(invalid || { snapshotId: message.snapshotId, results: message.ids.map((id) => {
+        const result = verifyImage(message, id);
+        return result.ok ? { id, ok: true } : { id, ...result };
+      }) });
+      return;
+    }
+    if (message.type === 'READ_SEGMENT') {
+      sendResponse(readFrozenSegment(message.runId, message.snapshotId, message.index));
+      return;
+    }
     if (message.type === 'EXTRACT') {
       if (!message.runId) { sendResponse(errorResult('INVALID_REQUEST', '缺少 runId')); return; }
-      if (executing || extracting) { sendResponse(errorResult('BUSY', '页面正在处理另一项请求')); return; }
+      if (executing || extracting || activeImageRead) { sendResponse(errorResult('BUSY', '页面正在处理另一项请求')); return; }
       activeRunId = message.runId;
       extracting = true;
       (async () => {
         try {
           await waitForStable(message.runId, 1500, 250);
-          return await buildSnapshot(message.runId, message.maxLen, message.includeImages === true);
+          return await buildSnapshot(message.runId, message.maxLen, message.includeImages === true, message.continueSnapshotId || null);
         } finally {
           extracting = false;
           if (activeRunId === message.runId) activeRunId = '';
