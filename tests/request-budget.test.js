@@ -179,7 +179,7 @@ function backgroundHarness(reply) {
   const snapshot = () => ({ snapshotId: `document:${++serial}`, url: 'https://page.example.test/', title: 'Fixture', text: `Page ${serial}`, images: [], targets: { 1: '[1] Next', 2: '[2] Notes' }, targetMeta: { 1: { tag: 'button', submitsForm: false, inForm: false }, 2: { tag: 'textarea', inForm: true, submitsForm: false } } });
   const event = () => ({ addListener() {}, removeListener() {} });
   const context = vm.createContext({
-    URL, crypto: webcrypto, console, AbortController, TypeError, Date, setTimeout, clearTimeout, setInterval, clearInterval,
+    URL, TextEncoder, crypto: webcrypto, console, AbortController, TypeError, Date, setTimeout, clearTimeout, setInterval, clearInterval,
     chrome: {
       sidePanel: { setPanelBehavior: async () => {} },
       storage: { local: { get: async (keys) => Array.isArray(keys) ? state : { ...keys, ...state }, set: async () => {}, remove: async () => {} } },
@@ -187,7 +187,25 @@ function backgroundHarness(reply) {
         onCreated: event(), onRemoved: event(), onUpdated: event(), get: async () => ({ id: 1, status: 'complete', url: 'https://page.example.test/' }),
         sendMessage: async (_id, message) => {
           if (message.type === 'EXTRACT') { extracts.push(message); return snapshot(); }
-          if (message.type === 'EXECUTE') { executions.push(message); return { results: [{ ok: executions.length > 1, msg: 'Local result' }], page: snapshot() }; }
+          if (message.type === 'EXECUTE') {
+            executions.push(message);
+            const ok = executions.length > 1;
+            const results = message.actions.map((action) => {
+              const result = { ok, code: ok ? 'APPLIED' : 'TARGET_NOT_FOUND', msg: 'Local result' };
+              if (action.action === 'repeat') {
+                const times = action.times || 1;
+                result.results = Array.from({ length: times }, (_item, iteration) => action.actions.map((child, index) => ({
+                  ...result, action: child.action, iteration: iteration + 1, subIndex: index + 1,
+                }))).flat();
+                result.repeatSummary = {
+                  plannedIterations: times, completedIterations: ok ? times : 0, iteration: times, subIndex: action.actions.length,
+                  successCount: ok ? result.results.length : 0, failureCount: ok ? 0 : result.results.length, skippedCount: 0, omittedCount: 0,
+                };
+              }
+              return result;
+            });
+            return { results, page: snapshot() };
+          }
         },
       },
       scripting: { executeScript: async () => {} },
@@ -229,10 +247,10 @@ for (const action of [
   { action: 'repeat', times: 2, actions: [{ action: 'click', selector: '#submit' }] },
   { action: 'repeat', times: 2, actions: [{ action: 'press', value: 'Enter' }] },
 ]) {
-  test(`零成功后的 ${JSON.stringify(action)} 先重读一次，之后可继续执行`, async () => {
+  test(`零成功后的 ${JSON.stringify(action)} 先重读一次，继续执行不掩盖旧失败`, async () => {
     const h = backgroundHarness((round) => round === 1 ? { actions: [{ action: 'click', ref: 1 }] }
       : round < 4 ? { actions: [action] } : { say: 'Finished', done: true, actions: [] });
-    assert.equal((await h.start()).outcome, 'completed');
+    assert.equal((await h.start()).outcome, 'unverified');
     assert.equal(h.executions.length, 2);
     assert.equal(h.extracts.length, 2);
     assert.ok(h.events.some((item) => item.t === 'status' && item.text.includes('提交前重新读取')));

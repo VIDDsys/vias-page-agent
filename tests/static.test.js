@@ -668,7 +668,7 @@ test('core parseReply 超长与深度畸形输入有界且不执行截断前缀'
   const core = loadCore();
   const longSay = '长'.repeat(60000);
   const parsed = core.parseReply(JSON.stringify({ say: longSay, actions: [{ action: 'click', ref: 9 }] }));
-  assert.equal(parsed.say.length, 50000);
+  assert.equal(parsed.say, longSay, '合法 say 不能静默截短');
   assert.deepEqual(plain(parsed.actions), [{ action: 'click', ref: 9 }]);
 
   const many = `${'{"say":"示例","actions":[]}\n'.repeat(5000)}{"say":"最终","done":true}`;
@@ -678,9 +678,9 @@ test('core parseReply 超长与深度畸形输入有界且不执行截断前缀'
     const result = core.parseReply(text);
     assert.deepEqual(plain(result.actions), []);
     assert.equal(result.done, false);
-    assert.ok(result.say.length <= 50000);
+    assert.ok(result.say.length <= core.TEXT_LIMITS.say);
   }
-  const oversized = core.parseReply(`${actionReply}${' '.repeat(1000000)}{"done":true}`);
+  const oversized = core.parseReply(`${actionReply}${' '.repeat(core.TEXT_LIMITS.reply)}{"done":true}`);
   assert.deepEqual(plain(oversized.actions), []);
   assert.equal(oversized.done, false);
   assert.match(oversized.say, /过长.*未解析或执行/);
@@ -751,8 +751,8 @@ test('侧边栏与设置页使用任务隔离、可取消请求和集中设置�
   assert.match(options, /expectedRevision(?:\s*=\s*settingsRevision|,)/);
   assert.match(options, /formRevision\s*=\s*settingsRevision/);
   assert.match(options, /ViasCore\.callModel/);
-  assert.ok(sidepanelHtml.indexOf('core.js') < sidepanelHtml.indexOf('sidepanel.js'));
-  assert.ok(optionsHtml.indexOf('core.js') < optionsHtml.indexOf('options.js'));
+  assert.ok(sidepanelHtml.indexOf('src="core.js"') < sidepanelHtml.indexOf('src="sidepanel.js"'));
+  assert.ok(optionsHtml.indexOf('src="core.js"') < optionsHtml.indexOf('src="options.js"'));
 });
 
 test('侧边栏任务列表复选框用自绘 span 而非被净化的 input', () => {
@@ -817,10 +817,10 @@ test('导航观察与幂等缓存的防伪与自净', () => {
   assert.match(content, /if \(event\.isTrusted !== true\) return;/, 'beforeunload 只信浏览器可信事件，页面可合成该事件伪造导航瘫痪整批');
   assert.match(content, /message\.approved === true\); \/\/ 完全访问权限/, 'EXECUTE 的 approved 字段必须真实透传，不能硬编码');
   assert.match(content, /单选下拉不支持数组 value/, '单选下拉收到数组应报错而不是悄悄取第一项');
-  assert.match(content, /form\.novalidate === true/, 'novalidate 表单不应被 reportValidity 拦下');
+  assert.match(content, /form\.noValidate === true/, 'novalidate 表单使用正确 DOM 属性，行为由表单 E2E 回归验证');
   assert.match(content, /operationCache\.delete\(key\)/, '幂等缓存须清除未执行的瞬态结局，允许同 operationId 重试');
   assert.match(content, /Promise\.resolve\(\{ results: result\.results \}\)/, '幂等缓存瘦身须存 Promise，回放路径会调用 .then');
-  assert.match(background, /if \(result\.navigationUrl\) item\.navigationUrl/, '结果摘要须透传 navigationUrl 给模型');
+  assert.match(background, /if \(result\?\.navigationUrl\) item\.navigationUrl/, '结果摘要须透传 navigationUrl 给模型');
   assert.match(background, /index < 0\) throw new Error\('该模型已被删除/, 'keepApiKey 遇已删除模型须报错，不能以空 Key 重建');
   assert.match(background, /select 数组 value 最多 50 项/, 'select 数组超限应明确报错而非静默截断');
 });
@@ -830,7 +830,7 @@ test('后台任务循环的候选标签治理与熔断边界', () => {
   const options = read('options.js');
 
   assert.match(background, /run\.candidateTabs = run\.candidateTabs\.filter/, '标签页关闭须同步清理候选列表，否则死候选会打断健康任务');
-  assert.match(background, /candidateTab\?\.url && \/\^https\?:\//, '跟随新标签前须确认其存活且为 http(s)');
+  assert.match(background, /if \(!tab\?\.url \|\| !\/\^https\?:\/.test\(tab\.url\)\)/, '跟随新标签前须确认其存活且为 http(s)，候选生命周期由后台行为测试验证');
   assert.match(background, /noProgressRounds/, '交替式空转须有界熔断，不能烧满 50 轮');
   assert.match(background, /if \(stateError\) throw stateError;/, '迁移失败不得被吞掉后按空状态继续');
   assert.match(background, /提交前无法取得新快照，任务已停止（/, '提交前重读的通信错误须走统一出口');
@@ -860,5 +860,26 @@ test('静态安全边界：密钥脱敏、页面隔离与无动态代码执行',
 
   for (const htmlFile of ['options.html', 'sidepanel.html']) {
     assert.doesNotMatch(read(htmlFile), /<script\b[^>]*\bsrc\s*=\s*["']https?:/i, `${htmlFile} 不应加载远程脚本`);
+  }
+});
+
+test('设置页赞助者条目格式统一且头像文件存在', () => {
+  const match = /const SPONSORS = (\[[\s\S]*?\n\]);/.exec(read('options.js'));
+  assert.ok(match, '未找到 SPONSORS 数组');
+  const sponsors = vm.runInNewContext(`(${match[1]})`);
+  assert.ok(sponsors.length > 0, '至少保留一位赞助者');
+  const names = new Set();
+  const avatars = new Set();
+  for (const sponsor of sponsors) {
+    assert.deepEqual(Object.keys(sponsor).sort(), ['avatar', 'name'], '固定格式只允许 name 与 avatar');
+    assert.equal(typeof sponsor.name, 'string');
+    assert.ok(sponsor.name.length >= 1 && sponsor.name.length <= 40, '名称须为 1-40 字符');
+    assert.equal(sponsor.name.trim(), sponsor.name, '名称首尾不能有空白');
+    assert.match(sponsor.avatar, /^sponsors\/[a-z0-9]+(?:-[a-z0-9]+)*\.(?:png|jpe?g|webp)$/, '头像须为 sponsors/<小写连字符 slug>.<png|jpg|jpeg|webp>');
+    assert.ok(fs.existsSync(path.join(root, sponsor.avatar)), `头像文件不存在: ${sponsor.avatar}`);
+    assert.equal(names.has(sponsor.name), false, `赞助者名称重复: ${sponsor.name}`);
+    assert.equal(avatars.has(sponsor.avatar), false, `头像重复: ${sponsor.avatar}`);
+    names.add(sponsor.name);
+    avatars.add(sponsor.avatar);
   }
 });

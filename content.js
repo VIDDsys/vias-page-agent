@@ -24,7 +24,9 @@
     if (activeOperation) activeOperation.navigationStarted = true;
   }, true);
   const targetIdentities = new WeakMap();
+  const choiceIdentities = new WeakMap();
   let lastTargetIdentity = 0;
+  let lastChoiceIdentity = 0;
   const operationCache = new Map();
   const cancelledRuns = new Set();
   let snapshotEpoch = 0;
@@ -269,13 +271,19 @@
       || (target instanceof HTMLInputElement && ['checkbox', 'radio'].includes(target.type)) ? target : null;
   }
 
-  // 身份文字不随滚动、焦点或选中样式的可见性改变，也不含字段的可变值。
+  function isIdentityState(element) {
+    // aria-live 也用于宣布动态题干，不能单凭它丢弃整块身份文字。
+    return ['OUTPUT', 'PROGRESS'].includes(element.tagName)
+      || ['status', 'timer', 'progressbar', 'alert', 'log'].includes(element.getAttribute('role'));
+  }
+
+  // 身份文字不随滚动、焦点或选中样式的可见性改变，也不含字段值和语义状态提示。
   function identityText(element) {
     const parts = [];
     const visit = (node) => {
       if (node.nodeType === Node.TEXT_NODE) { parts.push(node.textContent); return; }
       if (node.nodeType !== Node.ELEMENT_NODE && !(node instanceof ShadowRoot)) return;
-      if (node instanceof Element && (SKIP_TAGS.has(node.tagName.toLowerCase())
+      if (node instanceof Element && (SKIP_TAGS.has(node.tagName.toLowerCase()) || isIdentityState(node)
         || ['INPUT', 'TEXTAREA', 'SELECT'].includes(node.tagName) || node.isContentEditable)) return;
       for (const child of node.childNodes) visit(child);
       if (node.shadowRoot) visit(node.shadowRoot);
@@ -320,10 +328,8 @@
     const visit = (node) => {
       if (node.nodeType === Node.TEXT_NODE) { parts.push(node.textContent); return; }
       if (!(node instanceof Element)) return;
-      const role = node.getAttribute('role');
-      if (SKIP_TAGS.has(node.tagName.toLowerCase()) || ['INPUT', 'TEXTAREA', 'SELECT', 'OUTPUT', 'PROGRESS'].includes(node.tagName)
-        || node.isContentEditable || node.hasAttribute('aria-live') || ['status', 'timer', 'progressbar', 'alert', 'log'].includes(role)
-        || choiceTarget(node)) return;
+      if (SKIP_TAGS.has(node.tagName.toLowerCase()) || ['INPUT', 'TEXTAREA', 'SELECT'].includes(node.tagName)
+        || node.isContentEditable || isIdentityState(node) || choiceTarget(node)) return;
       for (const child of node.childNodes) visit(child);
     };
     // 页级容器只取标题；进度等全局状态不能成为每一道题的身份。
@@ -339,37 +345,81 @@
     const scopes = [];
     let parent = element.parentElement || element.getRootNode().host;
     while (parent && parent !== document.body && parent !== document.documentElement) {
-      scopes.push({ element: parent, path: optionPathOf(parent), text: optionContextText(parent) });
+      const text = optionContextText(parent);
+      scopes.push({ element: parent, path: optionPathOf(parent), text });
       const container = parent.parentElement;
-      const peer = container && [...container.children].some((sibling) => sibling !== parent
-        && !choiceTarget(sibling) && sibling.querySelector(CHOICE_SELECTOR));
-      // 沿任意层包装找到题干/语义分组或重复题块边界，不越界读入整张试卷状态。
+      const choices = new Set([...parent.querySelectorAll(CHOICE_SELECTOR)].map(choiceTarget).filter(Boolean));
+      const hasPrompt = [...parent.childNodes].some((node) => node.nodeType === Node.TEXT_NODE ? !!cleanText(node.textContent)
+        : node instanceof Element && !choiceTarget(node) && !node.querySelector(CHOICE_SELECTOR) && !!identityText(node));
+      const namedGroup = parent.matches('[role="group"],[role="radiogroup"],[role="listbox"]')
+        && !!(parent.getAttribute('aria-label') || parent.getAttribute('aria-labelledby'));
+      const peer = (namedGroup || (choices.size > 1 && hasPrompt)) && container
+        && !container.matches('ul,ol,[role="list"],[role="listbox"],[role="radiogroup"]')
+        && [...container.children].some((sibling) => sibling !== parent
+          && !choiceTarget(sibling) && sibling.querySelector(CHOICE_SELECTOR));
+      // 序号/说明不证明单个 .option 是题目；多选项分组还须有独立于选项分支的题干。
       if (parent.matches('section,article,fieldset') || parent.querySelector(HEADING_SELECTOR) || peer) break;
       parent = parent.parentElement || parent.getRootNode().host;
     }
     return scopes;
   }
 
-  function optionContextMatches(record) {
+  function withinScope(element, scope) {
+    for (let current = element; current; current = current.parentElement || current.getRootNode().host) {
+      if (current === scope) return true;
+    }
+    return false;
+  }
+
+  function optionContextMatches(record, element = null) {
     return record.scopes.every((scope) => {
       const current = scope.element.isConnected ? scope.element : optionAt(scope.path);
-      return current && optionContextText(current) === scope.text;
+      return current?.ownerDocument === document && (!element || withinScope(element, current))
+        && optionContextText(current) === scope.text;
     });
+  }
+
+  function choiceFormIdentity(form) {
+    return form ? JSON.stringify([form.id, form.getAttribute('name'), form.action, form.method, form.target]) : '';
   }
 
   function optionRecordOf(element) {
     const target = choiceTarget(element);
     if (!target) return null;
+    const form = target.form || target.closest('form');
+    const anchor = element.closest('a');
     return { path: optionPathOf(element), fingerprint: fingerprintOf(element), targetFingerprint: fingerprintOf(target), target,
       controlValue: target instanceof HTMLInputElement ? target.value : null,
-      labelFor: element.getAttribute('for'), scopes: optionContext(element) };
+      labelFor: element.getAttribute('for'), scopes: optionContext(element),
+      form, formPath: form && optionPathOf(form), formIdentity: choiceFormIdentity(form),
+      anchor, anchorPath: anchor && optionPathOf(anchor), anchorFingerprint: anchor && fingerprintOf(anchor) };
+  }
+
+  function choiceIdentityOf(record) {
+    // 原始题干/标签/提交值只留内容脚本内存，后台仅得到无内容的不透明语义 token。
+    const signature = JSON.stringify([record.fingerprint, record.targetFingerprint, record.controlValue, record.labelFor,
+      record.scopes.map((scope) => scope.text), record.formIdentity, record.anchorFingerprint]);
+    let identity = choiceIdentities.get(record.target);
+    if (!identity || identity.signature !== signature) {
+      identity = { signature, token: `${documentId}:choice:${++lastChoiceIdentity}` };
+      choiceIdentities.set(record.target, identity);
+    }
+    return identity.token;
   }
 
   function optionMatches(element, record) {
     const target = element && choiceTarget(element);
-    return !!target && fingerprintOf(element) === record.fingerprint && fingerprintOf(target) === record.targetFingerprint
-      && (target === record.target || !(target instanceof HTMLInputElement) || target.value === record.controlValue)
-      && element.getAttribute('for') === record.labelFor && optionContextMatches(record);
+    if (!target || !element.isConnected || !target.isConnected || element.ownerDocument !== document || target.ownerDocument !== document) return false;
+    const form = target.form || target.closest('form');
+    const anchor = element.closest('a');
+    return fingerprintOf(element) === record.fingerprint && fingerprintOf(target) === record.targetFingerprint
+      // radio/checkbox value 是选项身份，即使原节点未替换也必须核验。
+      && (!(target instanceof HTMLInputElement) || target.value === record.controlValue)
+      && element.getAttribute('for') === record.labelFor && optionContextMatches(record, element)
+      && choiceFormIdentity(form) === record.formIdentity
+      && (form === record.form || (!record.form?.isConnected && optionAt(record.formPath) === form))
+      && (anchor === record.anchor || (!record.anchor?.isConnected && optionAt(record.anchorPath) === anchor))
+      && (!anchor || fingerprintOf(anchor) === record.anchorFingerprint);
   }
 
   function targetForLabel(label) {
@@ -417,11 +467,19 @@
     return cleanText(text, max);
   }
 
-  // 目标身份指纹：只含稳定特征（标签/类型/角色/名称/文字），刻意排除 checked、value 等会被操作改变的属性。
-  // 用于执行前逐目标核验：若编号指向的节点已被复用成别的内容（乱序页常见），据指纹不符判定失效，避免点错。
+  // 排除 checked、普通字段 value 等可变状态；radio/checkbox 的 value 属于选项身份。
+  // 用于执行前逐目标核验：若节点被复用成别的内容，拒绝旧编号，避免点错。
   function fingerprintOf(el) {
     if (el === document.body || el === document.documentElement) return el === document.body ? 'body' : 'html';
     const tag = el.tagName.toLowerCase();
+    const choice = choiceTarget(el);
+    if (choice) {
+      const native = choice instanceof HTMLInputElement;
+      const text = native && el === choice ? [...(choice.labels || [])].map(identityText).join(' ') : identityText(el);
+      // 有真实标签时，ARIA 可增补选中/焦点提示；没有标签时仍以无障碍名称防止错认。
+      return JSON.stringify([tag, el.getAttribute('role') || '', el.id, text || labelOf(el),
+        native ? [choice.type, choice.id, choice.name, choice.value] : el.getAttribute('value')]);
+    }
     if (tag === 'label') return `label|${safeSlice(identityText(el), 120)}`;
     if (tag === 'input') return `input|${String(el.type || '').toLowerCase()}|${cleanText(el.getAttribute('aria-label') || el.getAttribute('title') || el.placeholder || el.name || el.id || '')}`;
     if (tag === 'textarea') return `textarea|${cleanText(el.getAttribute('aria-label') || el.getAttribute('title') || el.placeholder || el.name || el.id || '')}`;
@@ -692,6 +750,7 @@
       if (!targetIdentities.has(target)) targetIdentities.set(target, `${documentId}:target:${++lastTargetIdentity}`);
       segment.targetMeta[id] = {
         identity: targetIdentities.get(target),
+        ...(optionRecord ? { choiceIdentity: choiceIdentityOf(optionRecord) } : {}),
         tag: el.tagName === 'LABEL' ? 'label' : tagName,
         type: inputType,
         role: (target.getAttribute('role') || '').toLowerCase(),
@@ -881,10 +940,10 @@
     const formRecorded = formIdentity();
     const verify = (click = false) => {
       assertActive(runId);
-      if (!element.isConnected || !target.isConnected || fingerprintOf(element) !== recorded
-          || fingerprintOf(target) !== targetRecorded
+      if (!element.isConnected || !target.isConnected || element.ownerDocument !== document || target.ownerDocument !== document
+          || fingerprintOf(element) !== recorded || fingerprintOf(target) !== targetRecorded
           || (element.tagName === 'LABEL' && (targetForLabel(element) || element) !== target)
-          || (optionRecord && !optionContextMatches(optionRecord))
+          || (optionRecord && !optionMatches(element, optionRecord))
           || (target.form || target.closest('form')) !== form || formIdentity() !== formRecorded
           || (click && (element.closest('a') !== anchor || (anchor && fingerprintOf(anchor) !== linkRecorded)))) {
         throw Object.assign(new Error('目标身份在操作准备期间变化，请重新读取页面'), { code: 'STALE_TARGET' });
@@ -894,22 +953,137 @@
       }
       if (click) safeLink(element);
     };
-    return { element, target, verify };
+    const recoverChoice = optionRecord ? () => {
+      assertActive(runId);
+      // 只对快照内的选项恢复等价重绘；不重查 selector，不从其他题/其他文档搜索。
+      if (element.ownerDocument !== document || target.ownerDocument !== document) {
+        throw Object.assign(new Error('目标已移入其他文档，请重新读取页面'), { code: 'STALE_TARGET' });
+      }
+      const current = element.isConnected ? element : optionAt(optionRecord.path);
+      if (!optionMatches(current, optionRecord)) {
+        throw Object.assign(new Error('题目、选项或关联控件已变化，请重新读取页面'), { code: 'STALE_TARGET' });
+      }
+      return bindTarget(current, runId, optionRecord);
+    } : null;
+    return { element, target, verify, recoverChoice };
   }
 
-  function setNativeValue(el, value, emitChange = true, verify = () => {}) {
+  function setNativeValue(el, value, verify) {
     const next = String(value ?? '');
     if (el.value === next) return false;
-    const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype
-      : el instanceof HTMLSelectElement ? HTMLSelectElement.prototype
-      : HTMLInputElement.prototype;
+    const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
     const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
     if (!setter) throw new Error('目标不支持设置值');
     verify();
     setter.call(el, next);
-    el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: next }));
-    if (emitChange) { verify(); el.dispatchEvent(new Event('change', { bubbles: true })); }
     return true;
+  }
+
+  function normalizedFieldValue(element, value) {
+    const text = String(value ?? '');
+    if (element instanceof HTMLTextAreaElement) return text.replace(/\r\n?/g, '\n');
+    if (element instanceof HTMLInputElement) {
+      if (['text', 'search', 'tel', 'password', 'url', 'email'].includes(element.type)) {
+        const line = text.replace(/[\r\n]/g, '');
+        const trim = (part) => part.replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, '');
+        if (element.type === 'email' && element.multiple) return line.split(',').map(trim).join(',');
+        if (element.type === 'url' || element.type === 'email') return trim(line);
+        return line;
+      }
+      if (element.type === 'datetime-local') {
+        // HTML normalizes valid local date/times to T and the shortest time.
+        // A rejected nonempty request still expects nonempty text and must fail.
+        const probe = document.createElement('input');
+        probe.type = 'datetime-local';
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(probe, text);
+        return probe.value || text;
+      }
+    }
+    // Do not accept a rejected/defaulted setter result as the expected value:
+    // number/date rejection and range/color clamping remain observable failures.
+    return text;
+  }
+
+  function valueNotApplied() {
+    // Neither requested nor actual values belong in errors, including secrets.
+    return errorResult('VALUE_NOT_APPLIED', '页面未保留完整的预期内容或选区，可能存在字段限制或页面回退；本批后续操作已停止，请重新读取并核对');
+  }
+
+  function exceedsFieldLimit(element, value) {
+    return (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement)
+      && element.maxLength >= 0 && value.length > element.maxLength;
+  }
+
+  function fieldValueState(element) {
+    return [element.isContentEditable ? element.textContent : element.value,
+      typeof element.selectionStart === 'number' ? element.selectionStart : null,
+      typeof element.selectionEnd === 'number' ? element.selectionEnd : null,
+      element.selectionStart === element.selectionEnd ? 'none' : element.selectionDirection];
+  }
+
+  function expectedFieldState(element, text, changed) {
+    const state = fieldValueState(element);
+    return [text, changed && state[1] != null ? text.length : state[1],
+      changed && state[2] != null ? text.length : state[2], changed ? 'none' : state[3]];
+  }
+
+  function sameValueState(left, right) {
+    return left.length === right.length && left.every((value, index) => value === right[index]);
+  }
+
+  function valueTargetObserver(target, verify, runId) {
+    const path = optionPathOf(target);
+    const identityOf = (element) => JSON.stringify([fingerprintOf(element), element.id, element.getAttribute('name'), labelOf(element),
+      element.getAttribute('autocomplete'), element.getAttribute('aria-labelledby'), element.isContentEditable,
+      element instanceof HTMLSelectElement ? element.multiple : null]);
+    const identity = identityOf(target);
+    const scopes = optionContext(target);
+    const form = target.form || target.closest('form');
+    const formPath = form && optionPathOf(form);
+    const formIdentityOf = (element) => element ? JSON.stringify([element.id, element.getAttribute('name'), element.action, element.method, element.target]) : '';
+    const formIdentity = formIdentityOf(form);
+    return () => {
+      assertActive(runId);
+      if (target.isConnected) {
+        try { verify(); } catch (error) { if (error.code === 'STALE_TARGET' || error.code === 'TARGET_DISABLED') return null; throw error; }
+        return identityOf(target) === identity ? target : null;
+      }
+      // Recovery is read-only and only after writing. Never re-resolve a selector
+      // to dispatch events or continue typing into a replacement node.
+      const current = optionAt(path);
+      if (!current || identityOf(current) !== identity || !optionContextMatches({ scopes })) return null;
+      const currentForm = current.form || current.closest('form');
+      if (formIdentityOf(currentForm) !== formIdentity || (form && currentForm !== form && (form.isConnected || optionAt(formPath) !== currentForm))) return null;
+      return current;
+    };
+  }
+
+  function canContinueValueEvents(target, verify, runId) {
+    assertActive(runId);
+    if (!target.isConnected || target.readOnly) return false;
+    try { verify(); return true; }
+    catch (error) { if (error.code === 'STALE_TARGET' || error.code === 'TARGET_DISABLED') return false; throw error; }
+  }
+
+  async function confirmValueApplied(observe, read, expected, runId) {
+    const started = performance.now();
+    let stableSince = started;
+    let previousTarget;
+    let previousState;
+    // Property-only rollbacks do not produce MutationObserver records. Poll the
+    // complete value/selection as well as identity, allowing a bounded quiet period.
+    while (performance.now() - started < 1200) {
+      const current = observe();
+      const state = current ? read(current) : [];
+      if (current !== previousTarget || !previousState || !sameValueState(state, previousState)) {
+        stableSince = performance.now(); previousTarget = current; previousState = state;
+      }
+      if (performance.now() - stableSince >= TIMING.settle) {
+        return current && sameValueState(state, expected) ? { target: current } : { error: valueNotApplied() };
+      }
+      await sleep(40, runId);
+    }
+    return { error: valueNotApplied() };
   }
 
   function safeLink(element) {
@@ -921,11 +1095,20 @@
     return anchor;
   }
 
-  async function clickOnce(element, runId, verify, detail = 1, visualElement = element) {
-    verify(true);
+  async function clickOnce(element, runId, verify, detail = 1, visualElement = element, recoverChoice = null) {
+    const prepare = () => {
+      if (recoverChoice) {
+        const current = recoverChoice();
+        visualElement = current.element;
+        element = current.target instanceof HTMLInputElement ? current.target : current.element;
+        verify = current.verify;
+      }
+      verify(true);
+    };
+    prepare();
     visualElement.scrollIntoView({ block: 'center', inline: 'nearest' });
     await sleep(TIMING.paint, runId);
-    verify(true);
+    prepare();
     const anchor = safeLink(element);
     const originalTarget = anchor?.getAttribute('target');
     if (anchor && /^_blank$/i.test(originalTarget || '')) anchor.setAttribute('target', '_self');
@@ -934,7 +1117,7 @@
       const init = { bubbles: true, cancelable: true, composed: true, view: window, button: 0, detail, clientX: Math.round(rect.left + rect.width / 2), clientY: Math.round(rect.top + rect.height / 2) };
       // 每个前置事件都可能同步复用/移除节点或发起导航，不能只在整串事件前检查一次。
       for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
-        verify(true);
+        prepare();
         if (type.startsWith('pointer')) {
           if (window.PointerEvent) element.dispatchEvent(new PointerEvent(type, { ...init, pointerId: 1, pointerType: 'mouse', isPrimary: true }));
         } else element.dispatchEvent(new MouseEvent(type, init));
@@ -953,101 +1136,296 @@
     return `${location.href}|${cleanText(document.body?.innerText, 1000)}`;
   }
 
-  function pageStateSignature() {
+  function pageStateSignature(root = document.body) {
     let hash = 2166136261;
-    const mix = (text) => { for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 16777619); };
-    const fields = [];
-    const visit = (root) => {
-      if (!root?.querySelectorAll) return;
-      for (const el of root.querySelectorAll('input,textarea,select')) fields.push(el);
-      for (const el of root.querySelectorAll('*')) if (el.shadowRoot) visit(el.shadowRoot);
+    let nodes = 0;
+    let targets = 0;
+    let remaining = 2000000;
+    const mix = (value, limit = 200000) => {
+      const text = String(value ?? '').slice(0, Math.min(limit, remaining));
+      remaining -= text.length;
+      for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 16777619);
+      hash = Math.imul(hash ^ 0, 16777619); // Separate values, including absent/empty states.
     };
-    const signatureText = (document.body?.innerText || '').slice(0, 2000000);
-    mix(signatureText);
-    visit(document);
-    for (const el of fields) mix(`${el.value}|${el.checked}|${el.selectedIndex}|`);
-    return `${signatureText.length}:${fields.length}:${hash >>> 0}`;
+    const stateAttributes = ['aria-checked', 'aria-selected', 'aria-expanded', 'aria-pressed', 'aria-valuenow', 'aria-valuemin', 'aria-valuemax', 'aria-valuetext', 'aria-disabled', 'aria-readonly', 'aria-required', 'aria-invalid'];
+    const visit = (node, clock = false) => {
+      if (++nodes > 30000 || remaining <= 0) return;
+      if (node.nodeType === Node.TEXT_NODE) {
+        // Clock/timer ticks are not task progress. Keep ordinary content changes,
+        // but ignore explicit timers and the seconds of standalone clock text.
+        if (!clock) mix(cleanText(node.textContent, remaining).replace(/^\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/, '[clock]'), remaining);
+        return;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE && !(node instanceof ShadowRoot)) return;
+      if (node instanceof Element) {
+        if (SKIP_TAGS.has(node.tagName.toLowerCase()) || isHidden(node)) return;
+        clock ||= node.tagName === 'TIME' || node.getAttribute('role') === 'timer';
+        const target = node.tagName === 'LABEL' ? targetForLabel(node) : node;
+        if (target && (isInteractive(target) || target.hasAttribute('tabindex')) && targets < 4096) {
+          targets++;
+          mix(`${target.tagName}|${target.getAttribute('role') || ''}`);
+          for (const name of stateAttributes) mix(target.getAttribute(name), 256);
+          if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement) {
+            mix(target.value);
+            mix(`${target.checked}|${target.indeterminate}|${target.disabled}|${target.readOnly}|${target.selectedIndex}`);
+            // The first value/index alone cannot distinguish multi-select changes.
+            if (target instanceof HTMLSelectElement) {
+              for (const option of [...target.options].slice(0, 4096)) mix(option.selected ? '1' : '0');
+            }
+          }
+          if (target.tagName === 'SUMMARY') mix(target.parentElement?.open);
+        }
+      }
+      for (const child of node.childNodes) {
+        if (nodes >= 30000 || remaining <= 0) break;
+        visit(child, clock);
+      }
+      if (node.shadowRoot && nodes < 30000 && remaining > 0) visit(node.shadowRoot, clock);
+    };
+    if (root) visit(root);
+    return `${targets}:${hash >>> 0}`;
+  }
+
+  function focusedElement() {
+    let element = document.activeElement;
+    while (element?.shadowRoot?.activeElement) element = element.shadowRoot.activeElement;
+    return element || document.body;
+  }
+
+  function textFieldState(element) {
+    return JSON.stringify([element.value, element.selectionStart, element.selectionEnd, element.selectionStart === element.selectionEnd ? 'none' : element.selectionDirection]);
+  }
+
+  function textBoundary(text, offset, forward) {
+    // Do not split emoji, surrogate pairs or combining characters when deleting/moving.
+    let previous = 0;
+    for (const { index, segment } of new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(text)) {
+      if (forward && index + segment.length > offset) return index + segment.length;
+      if (!forward && index >= offset) return previous;
+      previous = index;
+    }
+    return forward ? text.length : previous;
+  }
+
+  function pressTextField(element, key, modifiers, verify) {
+    const { shiftKey, ctrlKey, metaKey } = modifiers;
+    const text = element.value;
+    const start = element.selectionStart;
+    const end = element.selectionEnd;
+    if ((ctrlKey || metaKey) && key.toLowerCase() === 'a') {
+      element.setSelectionRange(0, text.length, 'forward');
+      verify();
+      return null;
+    }
+    if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(key)) {
+      const backward = element.selectionDirection === 'backward';
+      const anchor = backward ? end : start;
+      const focus = backward ? start : end;
+      let next;
+      if (key === 'Home') next = element instanceof HTMLTextAreaElement && !ctrlKey && !metaKey && focus > 0 ? text.lastIndexOf('\n', focus - 1) + 1 : 0;
+      else if (key === 'End') {
+        const newline = text.indexOf('\n', focus);
+        next = element instanceof HTMLTextAreaElement && !ctrlKey && !metaKey && newline >= 0 ? newline : text.length;
+      } else if (!shiftKey && start !== end) next = key === 'ArrowLeft' ? start : end;
+      else next = textBoundary(text, focus, key === 'ArrowRight');
+      element.setSelectionRange(shiftKey ? Math.min(anchor, next) : next, shiftKey ? Math.max(anchor, next) : next, shiftKey && next < anchor ? 'backward' : 'forward');
+      verify();
+      return null;
+    }
+    if (element.readOnly) return errorResult('READ_ONLY', '目标为只读');
+    let from = start;
+    let to = end;
+    let replacement = key === 'Enter' ? '\n' : key;
+    let inputType = key === 'Enter' ? 'insertLineBreak' : 'insertText';
+    if (key === 'Backspace' || key === 'Delete') {
+      replacement = '';
+      inputType = key === 'Backspace' ? 'deleteContentBackward' : 'deleteContentForward';
+      if (start === end) {
+        if (key === 'Backspace') from = textBoundary(text, start, false);
+        else to = textBoundary(text, end, true);
+      }
+    }
+    if (from === to && !replacement) return errorResult('NO_EFFECT', '光标已在边界，没有可删除的内容');
+    if (replacement && element.maxLength >= 0 && text.length - (to - from) + replacement.length > element.maxLength) return errorResult('NO_EFFECT', '输入将超过字段长度限制');
+    const before = textFieldState(element);
+    verify();
+    const proceed = element.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, cancelable: true, composed: true, inputType, data: replacement || null }));
+    verify();
+    if (!proceed) return errorResult('NO_EFFECT', '页面阻止了 beforeinput，未修改字段');
+    if (focusedElement() !== element) return errorResult('NO_EFFECT', '页面在 beforeinput 中转移了焦点，未修改字段');
+    if (element.readOnly) return errorResult('READ_ONLY', '目标为只读');
+    if (textFieldState(element) !== before) return errorResult('NO_EFFECT', '页面在 beforeinput 中改变了字段，请重新读取后操作');
+    const proto = element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const next = text.slice(0, from) + replacement + text.slice(to);
+    Object.getOwnPropertyDescriptor(proto, 'value').set.call(element, next);
+    element.setSelectionRange(from + replacement.length, from + replacement.length);
+    verify();
+    element.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, inputType, data: replacement || null }));
+    verify();
+    if (element.value !== next || element.selectionStart !== from + replacement.length || element.selectionEnd !== from + replacement.length) return errorResult('NO_EFFECT', '页面未保留预期的字段值或选区，请重新读取后操作');
+    return null;
   }
 
   async function performPress(element, value, runId, verify) {
-    const requested = String(value || '').trim();
-    const aliases = { esc: 'Escape', space: ' ', enter: 'Enter', tab: 'Tab', arrowdown: 'ArrowDown', arrowup: 'ArrowUp', arrowleft: 'ArrowLeft', arrowright: 'ArrowRight', backspace: 'Backspace', delete: 'Delete' };
-    const key = aliases[requested.toLowerCase()] || requested;
-    if (!key || key.length > 20) return errorResult('INVALID_KEY', '按键名称无效');
+    const requested = String(value ?? '').trim();
+    if (!requested || requested.length > 60) return errorResult('INVALID_KEY', '按键名称无效');
+    const parts = requested.length === 1 ? [requested] : requested.split('+');
+    const rawKey = parts.pop();
+    const modifiers = { shiftKey: false, ctrlKey: false, metaKey: false };
+    for (const part of parts) {
+      const modifier = { shift: 'shiftKey', ctrl: 'ctrlKey', control: 'ctrlKey', meta: 'metaKey' }[part.toLowerCase()];
+      if (!modifier || modifiers[modifier]) return errorResult('UNSUPPORTED_KEY', '不支持此修饰键组合');
+      modifiers[modifier] = true;
+    }
+    const aliases = { esc: 'Escape', escape: 'Escape', space: ' ', enter: 'Enter', tab: 'Tab', arrowdown: 'ArrowDown', arrowup: 'ArrowUp', arrowleft: 'ArrowLeft', arrowright: 'ArrowRight', home: 'Home', end: 'End', backspace: 'Backspace', delete: 'Delete' };
+    const key = aliases[rawKey.toLowerCase()] || rawKey;
+    const command = modifiers.ctrlKey || modifiers.metaKey;
+    const textField = element instanceof HTMLTextAreaElement || (element instanceof HTMLInputElement && ['text', 'search', 'url', 'tel', 'password'].includes(element.type));
+    const textKey = textField && ((!command && ['Backspace', 'Delete', 'ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(key))
+      || (command && ['Home', 'End'].includes(key)) || (command && !modifiers.shiftKey && key.toLowerCase() === 'a')
+      || (!command && !modifiers.shiftKey && ([...key].length === 1 || (key === 'Enter' && element instanceof HTMLTextAreaElement))));
+    const form = element.form || element.closest?.('form');
+    const submitter = (element instanceof HTMLButtonElement && element.type === 'submit')
+      || (element instanceof HTMLInputElement && ['submit', 'image'].includes(element.type)) ? element : null;
+    const submit = !command && !modifiers.shiftKey && key === 'Enter' && form && (submitter
+      || (element instanceof HTMLInputElement && !['button', 'reset', 'checkbox', 'radio', 'file', 'hidden'].includes(element.type)));
+    const toggle = !command && !modifiers.shiftKey && key === ' ' && element instanceof HTMLInputElement && ['checkbox', 'radio'].includes(element.type);
+    const tab = !command && key === 'Tab';
+    const custom = !textKey && !submit && !toggle && !tab;
     verify();
     element.focus?.();
     verify();
-    const init = { key, code: key === ' ' ? 'Space' : key, bubbles: true, cancelable: true, composed: true };
+    if (focusedElement() !== element) return errorResult('NO_EFFECT', '目标未获得键盘焦点');
+    const before = textField ? textFieldState(element) : null;
+    // Event-driven widgets may implement their own keys. Only local semantic
+    // effects/focus count as evidence; unrelated page timers/animation do not.
+    const effectRoot = element.closest?.('[role="menu"],[role="listbox"],[role="radiogroup"],[role="tablist"]') || element;
+    const beforeEffect = custom ? pageStateSignature(effectRoot) : null;
+    const beforeFocus = focusedElement();
+    const init = { key, code: key === ' ' ? 'Space' : /^[a-z]$/i.test(key) ? `Key${key.toUpperCase()}` : key, ...modifiers, bubbles: true, cancelable: true, composed: true };
     const proceed = element.dispatchEvent(new KeyboardEvent('keydown', init));
     verify();
-    if (proceed) {
-      if (key === 'Enter') {
-        // 浏览器原生行为：textarea/富文本内 Enter 是换行而不是提交表单
-        if (element instanceof HTMLTextAreaElement) {
-          Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set?.call(element, element.value + '\n');
-          element.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, inputType: 'insertLineBreak', data: '\n' }));
-        } else if (element.isContentEditable) {
-          // fill 后无选区，光标通常在开头：先把选区折叠到末尾再插入换行
-          const selection = getSelection();
-          const range = document.createRange();
-          range.selectNodeContents(element);
-          range.collapse(false);
-          selection?.removeAllRanges();
-          selection?.addRange(range);
-          try { document.execCommand('insertText', false, '\n'); } catch {}
-        } else {
-          const form = element.form || element.closest?.('form');
-          if (form?.requestSubmit) form.requestSubmit();
-        }
-      } else if (key === ' ' && element instanceof HTMLInputElement && ['checkbox', 'radio'].includes(element.type)) {
-        element.click();
-      } else if (key === 'Tab') {
-        const focusable = [...document.querySelectorAll('button,input,select,textarea,a[href],[tabindex]')].filter((item) => !isHidden(item) && !item.disabled && item.tabIndex >= 0);
+    let failure = custom ? null : !proceed ? errorResult('NO_EFFECT', '页面阻止了 keydown，未执行默认按键行为')
+      : focusedElement() !== element ? errorResult('NO_EFFECT', '页面在 keydown 中转移了焦点，未执行默认按键行为') : null;
+    let expected;
+    let expectedFocus;
+    let expectedChecked;
+    if (!failure && !custom) {
+      if (tab) {
+        // Flatten open shadow roots in composed traversal order; positive tabindex first.
+        const focusable = [];
+        const visit = (root) => {
+          for (const child of root.children) {
+            if (isHidden(child) || child.inert) continue;
+            if (!child.disabled && child.tabIndex >= 0) focusable.push(child);
+            visit(child.shadowRoot || child);
+          }
+        };
+        visit(document.body);
+        focusable.sort((a, b) => (a.tabIndex || Infinity) - (b.tabIndex || Infinity));
         const index = focusable.indexOf(element);
-        focusable[(index + 1) % focusable.length]?.focus();
+        expectedFocus = focusable[(index + (modifiers.shiftKey ? -1 : 1) + focusable.length) % focusable.length];
+        verify();
+        expectedFocus?.focus();
+        verify();
+        if (!expectedFocus || expectedFocus === element || focusedElement() !== expectedFocus) failure = errorResult('NO_EFFECT', 'Tab 未移动到另一个可聚焦目标');
+      } else if (textKey) {
+        failure = pressTextField(element, key, modifiers, verify);
+        expected = textFieldState(element);
+        if (!failure && before === expected) failure = errorResult('NO_EFFECT', '按键未改变字段值或选区');
+      } else if (toggle) {
+        const checked = element.checked;
+        verify();
+        element.click();
+        verify();
+        expectedChecked = element.checked;
+        if (checked === expectedChecked) failure = errorResult('NO_EFFECT', 'Space 未改变选中状态');
+      } else if (submit) {
+        let submitted = false;
+        let submissionError;
+        // Implicit submission activates the first form-associated submit button
+        // in tree order, even when disabled. It never falls through to a second.
+        const defaultSubmitter = !submitter && [...form.getRootNode().querySelectorAll('button,input')].find((candidate) => candidate.form === form
+          && ((candidate instanceof HTMLButtonElement && candidate.type === 'submit')
+            || (candidate instanceof HTMLInputElement && ['submit', 'image'].includes(candidate.type))));
+        const defaultVerify = defaultSubmitter && bindTarget(defaultSubmitter, runId).verify;
+        const onSubmit = (event) => {
+          try { verify(); if (defaultVerify) defaultVerify(true); }
+          catch (error) { event.preventDefault(); submissionError = error; return; }
+          submitted = true;
+        };
+        form.addEventListener('submit', onSubmit, true);
+        try {
+          verify();
+          if (submitter) form.requestSubmit(submitter);
+          else if (defaultSubmitter) {
+            // Native click activation preserves submitter, name/value,
+            // formaction/formnovalidate and the page's click cancellation.
+            if (!defaultSubmitter.disabled && !defaultSubmitter.matches(':disabled')) {
+              defaultVerify(true);
+              defaultSubmitter.click();
+            }
+          } else {
+            const blockers = [...form.elements].filter((candidate) => candidate instanceof HTMLInputElement
+              && ['text', 'search', 'url', 'tel', 'email', 'password', 'date', 'month', 'week', 'time', 'datetime-local', 'number'].includes(candidate.type));
+            if (blockers.length <= 1) form.requestSubmit();
+          }
+          if (submissionError) throw submissionError;
+          verify();
+          if (!submitted) failure = errorResult('NO_EFFECT', 'Enter 未触发表单提交事件，请检查默认提交按钮、页面事件或原生约束校验');
+        } finally { form.removeEventListener('submit', onSubmit, true); }
       }
     }
-    assertActive(runId);
+    verify();
     element.dispatchEvent(new KeyboardEvent('keyup', init));
+    verify();
     await sleep(TIMING.settle, runId);
-    return { ok: true, msg: `已按键 ${requested}`, state: readState(element) };
+    verify();
+    if (expected != null && textFieldState(element) !== expected) failure = errorResult('NO_EFFECT', '按键后页面未保留预期字段值或选区');
+    if (expectedFocus && focusedElement() !== expectedFocus) failure = errorResult('NO_EFFECT', '按键后页面未保留预期焦点');
+    if (expectedChecked != null && element.checked !== expectedChecked) failure = errorResult('NO_EFFECT', '按键后页面未保留预期选中状态');
+    if (custom && beforeEffect === pageStateSignature(effectRoot) && beforeFocus === focusedElement()) failure = errorResult('UNSUPPORTED_KEY', '未观察到此按键的局部语义或焦点效果；无法保证自定义控件/富文本或未实现按键的浏览器默认行为');
+    return failure || { ok: true, msg: `已按键 ${requested}`, state: readState(element) };
   }
 
   async function typeText(element, value, runId, verify) {
     if (!(element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element.isContentEditable)) return errorResult('NOT_EDITABLE', '目标不是可编辑元素');
     if (element instanceof HTMLInputElement && element.type === 'file') return errorResult('NOT_EDITABLE', '文件上传暂不支持，请手动选择文件');
     if (element.readOnly) return errorResult('READ_ONLY', '目标为只读');
-    const text = String(value ?? '');
     verify();
     element.scrollIntoView({ block: 'center' });
     verify();
     element.focus();
     verify();
     if (element.readOnly) return errorResult('READ_ONLY', '目标为只读');
-    if (!element.isContentEditable && element.value === text) return { ok: true, code: 'NO_CHANGE', msg: '目标已是指定内容', state: readState(element) };
-    if (element.isContentEditable) {
-      if (element.textContent === text) return { ok: true, code: 'NO_CHANGE', msg: '目标已是指定内容', state: readState(element) };
-      element.textContent = '';
-    } else {
-      const proto = element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-      Object.getOwnPropertyDescriptor(proto, 'value')?.set?.call(element, '');
-    }
-    for (const char of text) {
-      verify();
-      const down = element.dispatchEvent(new KeyboardEvent('keydown', { key: char, bubbles: true, cancelable: true, composed: true }));
-      verify();
-      if (down) {
-        if (element.isContentEditable) element.textContent += char;
-        else Object.getOwnPropertyDescriptor(element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype, 'value')?.set?.call(element, element.value + char);
-        element.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, inputType: 'insertText', data: char }));
+    const text = normalizedFieldValue(element, value);
+    if (exceedsFieldLimit(element, text)) return valueNotApplied();
+    const changed = fieldValueState(element)[0] !== text;
+    const expected = expectedFieldState(element, text, changed);
+    const observe = valueTargetObserver(element, verify, runId);
+    if (changed) {
+      if (element.isContentEditable) element.textContent = '';
+      else setNativeValue(element, '', verify);
+      // type retains its whole-field replacement contract; each native append
+      // places the caret at the end, rather than inserting at the old selection.
+      for (const char of text) {
+        if (!canContinueValueEvents(element, verify, runId)) break;
+        const down = element.dispatchEvent(new KeyboardEvent('keydown', { key: char, bubbles: true, cancelable: true, composed: true }));
+        if (!canContinueValueEvents(element, verify, runId)) break;
+        if (down) {
+          if (element.isContentEditable) element.textContent += char;
+          else setNativeValue(element, element.value + char, verify);
+          element.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, inputType: 'insertText', data: char }));
+        }
+        if (!canContinueValueEvents(element, verify, runId)) break;
+        element.dispatchEvent(new KeyboardEvent('keyup', { key: char, bubbles: true, cancelable: true, composed: true }));
+        await sleep(12, runId);
       }
-      verify();
-      element.dispatchEvent(new KeyboardEvent('keyup', { key: char, bubbles: true, cancelable: true, composed: true }));
-      await sleep(12, runId);
+      if (canContinueValueEvents(element, verify, runId)) element.dispatchEvent(new Event('change', { bubbles: true }));
     }
-    verify();
-    element.dispatchEvent(new Event('change', { bubbles: true }));
-    return { ok: true, msg: '已逐字输入', state: readState(element) };
+    const confirmed = await confirmValueApplied(observe, fieldValueState, expected, runId);
+    if (confirmed.error) return confirmed.error;
+    return { ok: true, ...(changed ? {} : { code: 'NO_CHANGE' }), msg: changed ? '已逐字输入' : '目标已是指定内容', state: readState(confirmed.target) };
   }
 
   function isNavigationResult(result) {
@@ -1095,30 +1473,49 @@
       const times = Number(action.times);
       const interval = Number(action.value ?? 1000);
       if (!Number.isInteger(times) || times < 1 || times > 100 || !Number.isFinite(interval) || interval < 0 || interval > 60000) return errorResult('INVALID_REPEAT', 'repeat 参数无效');
-      if (!Array.isArray(action.actions) || !action.actions.length || action.actions.some((item) => item?.action === 'repeat')) return errorResult('INVALID_REPEAT', 'repeat 子操作无效');
-      const summaries = [];
-      for (let index = 0; index < times; index++) {
-        assertActive(runId);
-        const started = performance.now();
-        const roundResults = [];
-        for (let subIndex = 0; subIndex < action.actions.length; subIndex++) {
-          const result = await executeAction(action.actions[subIndex], runId, depth + 1, approved);
-          roundResults.push(result);
-          summaries.push(`第${index + 1}轮:${result.msg || result.error || ''}`);
-          if (isNavigationResult(result)) {
-            for (let rest = subIndex + 1; rest < action.actions.length; rest++) roundResults.push(skippedAfterNavigation());
-            return { ...result, msg: `循环执行 ${index + 1}/${times} 轮后因导航停止`, results: roundResults };
-          }
-          if (!result.ok && !RECOVERABLE_TARGET_ERRORS.has(result.code)) {
-            for (let rest = subIndex + 1; rest < action.actions.length; rest++) roundResults.push(errorResult('SKIPPED_AFTER_FAILURE', '前序操作失败，已跳过'));
-            return { ...errorResult(result.code || 'REPEAT_FAILED', `循环在第 ${index + 1} 轮停止：${result.msg || result.error}`), results: roundResults };
+      if (!Array.isArray(action.actions) || !action.actions.length || action.actions.length > 20 || action.actions.some((item) => item?.action === 'repeat')) return errorResult('INVALID_REPEAT', 'repeat 子操作必须为1至20项且不可嵌套');
+      const history = [];
+      const summary = { plannedIterations: times, completedIterations: 0, iteration: 0, subIndex: 0, successCount: 0, failureCount: 0, skippedCount: 0, omittedCount: 0 };
+      const record = (result, subIndex, skipped = false) => {
+        if (!skipped) summary[result.ok ? 'successCount' : 'failureCount']++;
+        history.push({ action: safeSlice(action.actions[subIndex]?.action, 32), iteration: summary.iteration, subIndex: subIndex + 1,
+          ok: result.ok === true, ...(result.code ? { code: safeSlice(result.code, 64) } : {}), msg: safeSlice(result.msg || result.error, 300) });
+        if (history.length > 100) { history.shift(); summary.omittedCount++; }
+      };
+      const finish = (result, skipCurrentRound = false) => {
+        if (skipCurrentRound) {
+          for (let rest = summary.subIndex; rest < action.actions.length; rest++) {
+            record(isNavigationResult(result) ? skippedAfterNavigation() : errorResult('SKIPPED_AFTER_FAILURE', '前序操作中止，已跳过'), rest, true);
           }
         }
-        const failed = roundResults.find((result) => !result.ok);
-        if (failed) return { ...errorResult(failed.code, `循环第 ${index + 1} 轮存在失败目标，有效目标已执行，请核对结果`), results: roundResults };
-        if (index < times - 1) await sleep(Math.max(0, interval - (performance.now() - started)), runId);
+        summary.skippedCount = times * action.actions.length - summary.successCount - summary.failureCount;
+        return { ...result, results: history, repeatSummary: summary };
+      };
+      try {
+        for (let index = 0; index < times; index++) {
+          assertActive(runId);
+          summary.iteration = index + 1;
+          summary.subIndex = 0;
+          const started = performance.now();
+          let failed;
+          for (let subIndex = 0; subIndex < action.actions.length; subIndex++) {
+            summary.subIndex = subIndex + 1;
+            let result;
+            try { result = await executeAction(action.actions[subIndex], runId, depth + 1, approved); }
+            catch (error) { result = isNavigationResult(error) ? navigationResult() : errorResult(error.code || 'ACTION_ERROR', error.message || String(error)); }
+            record(result, subIndex);
+            if (isNavigationResult(result)) return finish({ ...result, msg: `循环执行 ${index + 1}/${times} 轮后因导航停止` }, true);
+            if (!result.ok && !RECOVERABLE_TARGET_ERRORS.has(result.code)) return finish(errorResult(result.code || 'REPEAT_FAILED', `循环在第 ${index + 1} 轮停止：${result.msg || result.error}`), true);
+            if (!result.ok) failed ||= result;
+          }
+          summary.completedIterations++;
+          if (failed) return finish(errorResult(failed.code, `循环第 ${index + 1} 轮存在失败目标，有效目标已执行，请核对结果`));
+          if (index < times - 1) await sleep(Math.max(0, interval - (performance.now() - started)), runId);
+        }
+        return finish({ ok: true, msg: `已按 ${Math.round(interval)}ms 周期循环 ${times} 轮` });
+      } catch (error) {
+        return finish(isNavigationResult(error) ? navigationResult() : errorResult(error.code || 'REPEAT_FAILED', error.message || String(error)));
       }
-      return { ok: true, msg: `已按 ${Math.round(interval)}ms 周期循环 ${times} 轮。${summaries.slice(-2).join('；').slice(0, 240)}` };
     }
     if (action.action === 'navigate') {
       let url;
@@ -1151,9 +1548,10 @@
     }
 
     let resolved;
-    if (action.action === 'press' && action.ref == null && !action.selector) resolved = bindTarget(document.activeElement || document.body, runId);
+    if (action.action === 'press' && action.ref == null && !action.selector) resolved = bindTarget(focusedElement(), runId);
     else resolved = await resolveTarget(action, runId);
     if (resolved.error) return resolved.error;
+    if (resolved.recoverChoice && ['click', 'check', 'checkRadio'].includes(action.action)) resolved = resolved.recoverChoice();
     const { element, target, verify } = resolved;
     if (TARGET_ACTIONS.has(action.action) && !element) return errorResult('MISSING_TARGET', '操作缺少目标');
     verify();
@@ -1187,7 +1585,7 @@
       // 原生控件以 checked 为准（aria 可能与实际状态脱节）；仅非原生 ARIA 控件才信 aria-checked
       if (checkbox?.checked || (!checkbox && target.getAttribute('aria-checked') === 'true')) return { ok: true, code: 'NO_CHANGE', msg: '目标已选中', state: '已选中' };
       // label 引用时 target 是其内部 input，直接点 input 保证原生翻转与 change 事件
-      await clickOnce(checkbox || element, runId, verify, 1, element);
+      await clickOnce(checkbox || element, runId, verify, 1, element, resolved.recoverChoice);
       const record = action.ref != null && optionRecords.get(Number(action.ref));
       const observedElement = element.isConnected ? element : record && optionAt(record.path);
       if (record && !optionMatches(observedElement, record)) return errorResult('STALE_TARGET', '点击后题目或选项身份已变化，请重新读取页面核对实际状态');
@@ -1206,7 +1604,7 @@
         const href = anchor?.getAttribute('href');
         if (href) activeOperation.navigationUrl = new URL(href, document.baseURI).href;
       } catch {}
-      try { await clickOnce(toggle ? target : element, runId, verify, 1, element); }
+      try { await clickOnce(toggle ? target : element, runId, verify, 1, element, resolved.recoverChoice); }
       catch (error) {
         if (typeof error.code === 'string') throw error;
         return errorResult('CLICK_BLOCKED', error.message);
@@ -1234,21 +1632,21 @@
       target.focus();
       verify();
       if (target.readOnly) return errorResult('READ_ONLY', '目标为只读');
-      const next = String(action.value ?? '');
-      let changed = false;
-      if (target.isContentEditable) {
-        changed = target.textContent !== next;
-        if (changed) {
-          target.textContent = next;
-          target.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, inputType: 'insertText', data: next }));
-          verify();
-          target.dispatchEvent(new Event('change', { bubbles: true }));
-        }
-      } else changed = setNativeValue(target, next, true, verify);
-      assertActive(runId);
-      target.blur();
-      await sleep(TIMING.event, runId);
-      return { ok: true, code: changed ? 'FILLED' : 'NO_CHANGE', msg: changed ? '已填写目标' : '目标已是指定内容', state: readState(target) };
+      const next = normalizedFieldValue(target, action.value);
+      if (exceedsFieldLimit(target, next)) return valueNotApplied();
+      const changed = fieldValueState(target)[0] !== next;
+      const expected = expectedFieldState(target, next, changed);
+      const observe = valueTargetObserver(target, verify, runId);
+      if (changed) {
+        if (target.isContentEditable) target.textContent = next;
+        else setNativeValue(target, next, verify);
+        target.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, inputType: 'insertText', data: next }));
+        if (canContinueValueEvents(target, verify, runId)) target.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+      if (canContinueValueEvents(target, verify, runId)) target.blur();
+      const confirmed = await confirmValueApplied(observe, fieldValueState, expected, runId);
+      if (confirmed.error) return confirmed.error;
+      return { ok: true, code: changed ? 'FILLED' : 'NO_CHANGE', msg: changed ? '已填写目标' : '目标已是指定内容', state: readState(confirmed.target) };
     }
     if (action.action === 'select') {
       if (!(target instanceof HTMLSelectElement)) return errorResult('NOT_SELECT', 'select 仅支持原生下拉框');
@@ -1264,21 +1662,26 @@
         if (!hit) return errorResult('OPTION_NOT_FOUND', prefix.length > 1 ? '选项前缀不唯一' : '选项不存在');
         if (!hits.includes(hit)) hits.push(hit);
       }
-      if (target.multiple) {
-        const signatureOf = () => [...target.selectedOptions].map((option) => option.value).join('\u0000');
-        const before = signatureOf();
+      const options = [...target.options];
+      const selected = options.map((option) => hits.includes(option));
+      const optionIdentity = (option) => JSON.stringify([option.value, option.textContent, option.label, option.disabled,
+        option.parentElement?.tagName === 'OPTGROUP' ? [option.parentElement.label, option.parentElement.disabled] : null]);
+      const readSelection = (element) => [...element.options].flatMap((option) => [optionIdentity(option), option.selected]);
+      const expected = options.flatMap((option, index) => [optionIdentity(option), selected[index]]);
+      const changed = options.some((option, index) => option.selected !== selected[index]);
+      const observe = valueTargetObserver(target, verify, runId);
+      if (changed) {
         verify();
-        for (const option of target.options) option.selected = hits.includes(option);
-        const changed = before !== signatureOf();
-        if (changed) {
-          target.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true }));
-          target.dispatchEvent(new Event('change', { bubbles: true }));
-        }
-        return { ok: true, code: changed ? 'SELECTED' : 'NO_CHANGE', msg: changed ? (isSensitive(target) ? '已选择敏感选项（已隐藏）' : `已选择 ${hits.length} 项`) : '已是指定选项', state: readState(target) };
+        if (target.multiple) options.forEach((option, index) => { option.selected = selected[index]; });
+        // A value may belong to multiple options. Use the matched option's index
+        // so choosing by visible text does not silently select a different row.
+        else Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'selectedIndex').set.call(target, options.indexOf(hits[0]));
+        target.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true }));
+        if (canContinueValueEvents(target, verify, runId)) target.dispatchEvent(new Event('change', { bubbles: true }));
       }
-      const hit = hits[0];
-      const changed = setNativeValue(target, hit.value, true, verify);
-      return { ok: true, code: changed ? 'SELECTED' : 'NO_CHANGE', msg: changed ? (isSensitive(target) ? '已选择敏感选项（已隐藏）' : `已选择「${cleanText(hit.textContent, 60)}」`) : '已是指定选项', state: readState(target) };
+      const confirmed = await confirmValueApplied(observe, readSelection, expected, runId);
+      if (confirmed.error) return confirmed.error;
+      return { ok: true, code: changed ? 'SELECTED' : 'NO_CHANGE', msg: changed ? (isSensitive(confirmed.target) ? '已选择敏感选项（已隐藏）' : `已选择 ${hits.length} 项`) : '已是指定选项', state: readState(confirmed.target) };
     }
     if (action.action === 'submitForm') {
       const form = target instanceof HTMLFormElement ? target : target.form || target.closest('form');
@@ -1295,12 +1698,12 @@
         activeOperation.navigationUrl = new URL(formAction || location.href, document.baseURI).href;
       } catch {}
       // novalidate 表单本就不做约束校验，requestSubmit 会跳过；不能替它拦下
-      const skipValidation = form.novalidate === true || target.getAttribute?.('formnovalidate') != null;
+      const submitter = (target instanceof HTMLButtonElement && target.type === 'submit')
+        || (target instanceof HTMLInputElement && ['submit', 'image'].includes(target.type)) ? target : undefined;
+      const skipValidation = form.noValidate === true || submitter?.formNoValidate === true;
       const valid = skipValidation || form.reportValidity();
       verify();
       if (!valid) return errorResult('FORM_INVALID', '表单校验未通过，未提交');
-      const submitter = (target instanceof HTMLButtonElement && target.type === 'submit')
-        || (target instanceof HTMLInputElement && ['submit', 'image'].includes(target.type)) ? target : undefined;
       if (form.requestSubmit) {
         if (submitter) form.requestSubmit(submitter);
         else form.requestSubmit();

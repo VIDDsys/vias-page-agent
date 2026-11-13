@@ -9,6 +9,7 @@ const path = require('node:path');
 const { chromium } = require('playwright-core');
 
 const root = path.resolve(__dirname, '..');
+const artifacts = path.resolve(process.env.UI_ARTIFACT_DIR || path.join(os.homedir(), '.agents', 'temp', 'vias-page-agent', `agent-${Date.now()}`));
 const edgePath = process.env.EDGE_PATH || 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
 let context;
 let profile;
@@ -33,6 +34,20 @@ function listen(server) {
 }
 
 const fixture = '<!doctype html><meta charset="utf-8"><title>Agent Integration</title><button id="work">Do work</button><form id="form"><button id="submit">Submit</button></form><p id="result">INITIAL_PAGE_MARKER</p><script>window.clicks=0;window.submits=0;work.onclick=()=>{clicks++;result.textContent="PAGE_"+clicks};form.onsubmit=e=>{e.preventDefault();submits++;result.textContent="SUBMITTED"};</script>';
+
+function bindingFixture(marker, long = false) {
+  return `<!doctype html><meta charset="utf-8"><title>${marker}</title><p>${marker}</p>
+<label for="note">任务备注</label><input id="note"><button id="work" type="button">Record task</button><p id="result">UNTOUCHED</p>
+<a id="next" href="/binding-child" target="_blank">Open task child</a><button id="popup" type="button">Open task popup</button>
+${marker.startsWith('B_') ? '<p>B_PRIVATE_DOCUMENT_MARKER</p><input type="password" value="B_PASSWORD_SENTINEL">' : ''}
+${long ? `<p>${'binding-page-copy-'.repeat(2500)}</p><p>A_TAIL_ONLY_MARKER</p>` : ''}
+<script>
+window.clicks=0;window.inputEvents=0;window.popupAttempts=0;window.popupOpened=false;
+popup.onclick=()=>{window.popupAttempts++;window.popupOpened=!!window.open(${JSON.stringify(marker.startsWith('B_') ? '/binding-b?popup=unrelated' : '/binding-child')},'_blank');};
+note.oninput=()=>{window.inputEvents++;};
+work.onclick=()=>{window.clicks++;result.textContent=${JSON.stringify(marker)}+':'+note.value+':'+window.clicks;};
+</script>`;
+}
 
 const batchOptionsFixture = `<!doctype html><meta charset="utf-8"><title>Batch options</title>
 <style>input{opacity:0;position:absolute;width:0;height:0}label{display:block;min-height:24px}</style>
@@ -80,6 +95,10 @@ test.before(async () => {
     if (route === '/navigate-link') { response.end('<!doctype html><a href="/slow">Start navigation</a><button id="old" onclick="fetch(\'/old-click\')">Old action</button>'); return; }
     if (route === '/navigate-form') { response.end('<!doctype html><form action="/slow"><input name="note"><button type="submit">Submit</button></form><button id="old" onclick="fetch(\'/old-click\')">Old action</button>'); return; }
     if (route === '/batch-options') { response.end(batchOptionsFixture); return; }
+    if (route.startsWith('/binding-')) {
+      const marker = route === '/binding-b' ? 'B_UNRELATED_PAGE' : route === '/binding-child' ? 'FOLLOWED_CHILD_MARKER' : route === '/binding-next' ? 'FOLLOWED_NAVIGATION_MARKER' : 'A_TASK_MARKER';
+      response.end(bindingFixture(marker, route === '/binding-long')); return;
+    }
     response.end(fixture);
   });
   modelServer = http.createServer((request, response) => {
@@ -92,7 +111,7 @@ test.before(async () => {
         const instruction = await reply(requests.length, body);
         if (response.destroyed) return;
         response.writeHead(200, { 'content-type': 'application/json' });
-        response.end(JSON.stringify({ choices: [{ finish_reason: 'stop', message: { content: typeof instruction === 'string' ? instruction : JSON.stringify(instruction) } }] }));
+        response.end(JSON.stringify({ choices: [{ finish_reason: instruction?.__finishReason || 'stop', message: instruction?.__message || { content: typeof instruction === 'string' ? instruction : JSON.stringify(instruction) } }] }));
       } catch (error) {
         response.writeHead(500, { 'content-type': 'text/plain' });
         response.end(error.message);
@@ -185,6 +204,59 @@ test('真实扩展完成模型→操作→新快照→done全链路，无审批�
     assert.match(JSON.stringify(requests[1].messages), /操作结果/);
   });
 });
+
+for (const ask of [false, true]) {
+  for (const embedded of [false, true]) {
+    test(`真实MV3${ask ? '问答' : '执行'}拒绝${embedded ? 'say内嵌' : '裸'}DSML，纠正后继续且不污染聊天和历史`, async () => {
+      const dsml = '<｜DSML｜ calls><｜DSML｜ invoke name="vias_read"><｜DSML｜ parameter name="kind" string="false">"images"</｜DSML｜ parameter><｜DSML｜ parameter name="ids" string="false">[4]</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>';
+      reply = (n) => {
+        if (n === 1) return embedded ? { say: dsml, actions: [{ action: 'click', selector: '#work' }] } : dsml;
+        if (n === 2) return ask ? '正文回答：无需图片也可解释当前页面。' : { say: '现在点击目标', actions: [{ action: 'click', selector: '#work' }] };
+        return complete;
+      };
+      await withPanel(async (panel, target) => {
+        if (ask) await panel.locator('#modeAsk').click();
+        await send(panel, ask ? '解释页面正文' : '点击 Do work 并汇报');
+        await finished(panel);
+        assert.equal(requests.length, ask ? 2 : 3);
+        assert.equal(await target.evaluate(() => window.clicks), ask ? 0 : 1, '含内部协议的整条回复不得执行其中的动作');
+        const displayed = await panel.locator('#chat').innerText();
+        assert.ok(!displayed.includes('DSML'));
+        assert.match(displayed, ask ? /正文回答/ : /任务完成/);
+        assert.equal(await panel.locator('.tool-name').filter({ hasText: 'image analyze' }).count(), 0);
+        for (const body of requests) {
+          assert.ok(!JSON.stringify(body.messages).includes('<｜DSML｜'));
+          assert.equal(body.messages.flatMap((m) => Array.isArray(m.content) ? m.content : []).some((part) => part.type === 'image_url'), false);
+        }
+        const stored = JSON.stringify(await panel.evaluate(() => chrome.storage.session.get(null)));
+        assert.ok(!stored.includes('<｜DSML｜'));
+      });
+    });
+  }
+}
+
+for (const ask of [false, true]) {
+  test(`真实MV3${ask ? '问答' : '执行'}原生工具协议错误跨侧栏回传后有界纠正`, async () => {
+    const hidden = 'NATIVE_TOOL_CONTENT_MUST_NOT_APPEAR';
+    reply = (n) => {
+      if (n === 1) return { __finishReason: 'tool_calls', __message: { content: hidden, tool_calls: [{ id: 'synthetic-call', type: 'function', function: { name: 'click', arguments: '{"selector":"#work"}' } }] } };
+      if (n === 2) return ask ? '已恢复普通正文回答' : { say: '使用已支持的操作继续', actions: [{ action: 'click', selector: '#work' }] };
+      return complete;
+    };
+    await withPanel(async (panel, target) => {
+      if (ask) await panel.locator('#modeAsk').click();
+      await send(panel, ask ? '解释页面' : '点击 Do work 并汇报');
+      await finished(panel);
+      assert.equal(requests.length, ask ? 2 : 3);
+      assert.equal(await target.evaluate(() => window.clicks), ask ? 0 : 1);
+      const displayed = await panel.locator('#chat').innerText();
+      assert.ok(!displayed.includes(hidden));
+      assert.match(displayed, ask ? /已恢复普通正文回答/ : /任务完成/);
+      assert.ok(!JSON.stringify(requests).includes(hidden));
+      assert.ok(!JSON.stringify(await panel.evaluate(() => chrome.storage.session.get(null))).includes(hidden));
+    });
+  });
+}
 
 test('真实MV3模型按当前快照分两批选择12题原生label/input，逐次全量重绘后核对反馈才done且不保存提交', { timeout: 90000 }, async () => {
   const expected = Array.from({ length: 12 }, (_, question) => question % 2
@@ -358,7 +430,7 @@ for (const ask of [false, true]) {
         const candidate = candidates.find((item) => item.alt === '需要识别的题目图');
         assert.ok(candidate);
         assert.equal(imageHits.length, 3, '仅页面自身初始两图及所选图的302跳转');
-        return { vias_read: { kind: 'images', snapshotId: text.match(/快照ID: ([^\n]+)/)[1], ids: [candidate.id] } };
+        return { vias_read: { kind: 'images', snapshotId: text.match(/快照ID: ([^\n]+)/)[1], ids: [candidate.id], reason: '题目图中有正文未提供的图形信息，需要据此作答' } };
       }
       if (n === 2) {
         assert.equal(images.length, 1, JSON.stringify(body.messages.at(-1)).slice(0, 600));
@@ -395,6 +467,20 @@ for (const ask of [false, true]) {
         await send(panel, '识别题目图，忽略其它图'); await finished(panel);
         assert.equal(requests.length, ask ? 2 : 3);
         assert.match(await panel.locator('body').innerText(), ask ? /所选图片已识别/ : /任务完成/);
+        const timeline = await panel.locator('#chat > .msg.ai, #chat > .tools').allTextContents();
+        assert.match(timeline[0], /image analyze/);
+        assert.match(timeline[0], /已读取/);
+        if (ask) assert.match(timeline[1], /所选图片已识别/);
+        else {
+          assert.match(timeline[1], /click/);
+          assert.match(timeline[2], /任务完成/);
+        }
+        assert.equal(await panel.locator('.tool.pending').count(), 0);
+        fs.mkdirSync(artifacts, { recursive: true });
+        await panel.setViewportSize({ width: 390, height: 850 });
+        const screenshot = path.join(artifacts, `image-${ask ? 'ask' : 'agent'}-390.png`);
+        await panel.screenshot({ path: screenshot });
+        console.log(`Image timeline screenshot: ${screenshot}`);
         const stored = JSON.stringify(await panel.evaluate(() => chrome.storage.session.get(null)));
         assert.ok(!stored.includes('data:image/'), '会话持久化不得保存图片');
       } finally {
@@ -455,14 +541,14 @@ test('有进展的连续同目标点击使用最新ref且不误停，旧首屏�
   });
 });
 
-test('页面无进展的同目标操作在ref刷新后仍会熔断', async () => {
+test('页面无进展的同目标操作在ref刷新后连续三次才熔断', async () => {
   reply = (_n, body) => ({ actions: [{ action: 'click', ref: buttonRef(body, 'Do work') }] });
   await withPanel(async (panel, target) => {
     await target.evaluate(() => { document.querySelector('#work').onclick = () => { window.clicks++; }; });
     await send(panel);
     await finished(panel);
-    assert.equal(await target.evaluate(() => window.clicks), 2);
-    assert.equal(requests.length, 3);
+    assert.equal(await target.evaluate(() => window.clicks), 3);
+    assert.equal(requests.length, 4);
     assert.match(await panel.locator('body').innerText(), /无进展/);
   });
 });
@@ -479,7 +565,7 @@ test('无效操作参数三轮熔断，不把超长坏回复反复带入请求',
   });
 });
 
-test('失败后的提交只拦一次，读取最新页面后能继续完成', async () => {
+test('失败后的提交只拦一次，继续提交后仍保留未确认失败提示', async () => {
   reply = (n, body) => n === 1 ? { actions: [{ action: 'click', ref: 999 }] }
     : n < 4 ? { actions: [{ action: 'submitForm', ref: buttonRef(body, 'Submit') }] } : complete;
   await withPanel(async (panel, target) => {
@@ -488,6 +574,7 @@ test('失败后的提交只拦一次，读取最新页面后能继续完成', as
     assert.equal(await target.evaluate(() => window.submits), 1);
     assert.equal(requests.length, 4);
     assert.match(JSON.stringify(requests[2].messages), /已拦下这一次提交并重新读取页面/);
+    assert.match(await panel.locator('body').innerText(), /任务已结束，但仍有操作未获成功确认/);
   });
 });
 
@@ -551,7 +638,7 @@ test('重定向回原URL但已生成新文档时允许继续', async () => {
 });
 
 test('合法长回答仅把规范化操作写入后续模型历史', async () => {
-  reply = (n, body) => n === 1 ? { say: 'PAD'.repeat(100000), actions: [{ action: 'click', ref: buttonRef(body, 'Do work') }] } : complete;
+  reply = (n, body) => n === 1 ? { say: 'PAD'.repeat(60000), actions: [{ action: 'click', ref: buttonRef(body, 'Do work') }] } : complete;
   await withPanel(async (panel, target) => {
     await send(panel);
     await finished(panel);
@@ -561,6 +648,439 @@ test('合法长回答仅把规范化操作写入后续模型历史', async () =>
     assert.ok(history.length < 10000, `后续请求长度 ${history.length}`);
     assert.ok((history.match(/PAD/g) || []).length <= 683, '超长说明未按2048字符历史上限裁剪');
   });
+});
+
+function heldModelReply() {
+  let arrived;
+  let release;
+  const started = new Promise((resolve) => { arrived = resolve; });
+  const response = new Promise((resolve) => { release = resolve; });
+  return {
+    receive: (body) => { arrived(body); return response; },
+    release,
+    wait: async () => {
+      let timer;
+      try {
+        return await Promise.race([started, new Promise((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error('本地模型请求未在15秒内到达')), 15000);
+        })]);
+      } finally { clearTimeout(timer); }
+    },
+  };
+}
+
+async function extensionTab(panel, page) {
+  if (page.url().startsWith(`chrome-extension://${extensionId}/`)) {
+    const tab = await page.evaluate(() => chrome.tabs.getCurrent());
+    assert.ok(tab?.id, '扩展测试页必须有自己的tabId');
+    return tab;
+  }
+  const tabs = await panel.evaluate(async (url) => (await chrome.tabs.query({})).filter((item) => item.url === url), page.url());
+  assert.equal(tabs.length, 1, `测试URL必须唯一标识标签页 ${page.url()}`);
+  return tabs[0];
+}
+
+async function activateTab(panel, tab) {
+  await panel.evaluate(async ({ id, windowId }) => {
+    await chrome.tabs.update(id, { active: true });
+    await chrome.windows.update(windowId, { focused: true });
+  }, tab);
+}
+
+async function newWindowPage(panel, url) {
+  const opened = context.waitForEvent('page', { timeout: 10000 });
+  await panel.evaluate((url) => chrome.windows.create({ url, type: 'normal', width: 900, height: 850 }), url);
+  const page = await opened;
+  await page.waitForLoadState('domcontentloaded');
+  await page.waitForURL(url);
+  return page;
+}
+
+async function assertRunning(panel) {
+  assert.equal(await panel.locator('#clear').isDisabled(), true, '正常切页不能结束侧栏任务');
+  assert.equal((await panel.evaluate(() => chrome.runtime.sendMessage({ type: 'PING' }))).running, true, '正常切页不能取消后台任务');
+}
+
+async function bindingState(page) {
+  return page.evaluate(() => ({ value: document.querySelector('#note').value, clicks: window.clicks, inputs: window.inputEvents, result: document.querySelector('#result').textContent }));
+}
+
+function assertNoBContent(body) {
+  const serialized = JSON.stringify(body.messages);
+  for (const marker of ['B_UNRELATED_PAGE', 'B_PRIVATE_DOCUMENT_MARKER', 'B_PASSWORD_SENTINEL']) {
+    assert.ok(!serialized.includes(marker), `非任务页内容不能进入模型请求: ${marker}`);
+  }
+}
+
+for (const otherWindow of [false, true]) {
+  test(`真实MV3任务绑定：模型挂起时多次切换${otherWindow ? '标签及不同窗口' : '标签'}，后台A继续读取填写点击且B零副作用`, { timeout: 90000 }, async () => {
+    const gates = Array.from({ length: 4 }, heldModelReply);
+    reply = (n, body) => { assert.ok(n <= gates.length); return gates[n - 1].receive(body); };
+    await withPanel(async (panel, target) => {
+      const decoys = [];
+      try {
+        const decoy = await context.newPage(); decoys.push(decoy);
+        await decoy.goto(webUrl + '/binding-b');
+        if (otherWindow) decoys.push(await newWindowPage(panel, webUrl + '/binding-b?window=other'));
+        const taskTab = await extensionTab(panel, target);
+        const decoyTabs = await Promise.all(decoys.map((page) => extensionTab(panel, page)));
+        assert.equal(decoyTabs[0].windowId, taskTab.windowId);
+        if (otherWindow) assert.notEqual(decoyTabs[1].windowId, taskTab.windowId, '必须实际创建第二个Edge窗口');
+        await activateTab(panel, taskTab);
+        await send(panel, '只在任务页面读取第二段并填写任务备注，然后分两轮点击 Record task');
+        for (let index = 0; index < gates.length; index++) {
+          const body = await gates[index].wait();
+          assertNoBContent(body);
+          const latest = body.messages.at(-1).content;
+          assert.equal(typeof latest, 'string');
+          if (index === 0) assert.match(latest, /A_TASK_MARKER/);
+          if (index === 1) assert.match(latest, /A_TAIL_ONLY_MARKER/, '后台分段读取仍必须来自A');
+          if (index >= 2) {
+            assert.match(latest, /A_TASK_MARKER:A_FILLED_VALUE:/, '操作后的新观察仍必须来自A');
+            assert.equal((await panel.evaluate((id) => chrome.tabs.get(id), taskTab.id)).active, false, '填写点击后A仍必须是非活动标签');
+          }
+          for (const tab of [decoyTabs[0], taskTab, ...decoyTabs, taskTab, ...decoyTabs]) await activateTab(panel, tab);
+          const state = await panel.evaluate(async ({ taskId, decoyIds }) => ({
+            task: await chrome.tabs.get(taskId), decoys: await Promise.all(decoyIds.map((id) => chrome.tabs.get(id))),
+            focusedWindow: (await chrome.windows.getLastFocused()).id,
+          }), { taskId: taskTab.id, decoyIds: decoyTabs.map((tab) => tab.id) });
+          assert.equal(state.task.active, false, '发回模型回复时A必须不是活动标签');
+          assert.equal(state.decoys[0].active, true);
+          assert.equal(state.focusedWindow, decoyTabs.at(-1).windowId);
+          await assertRunning(panel);
+          if (index === 0) gates[index].release({ vias_read: { kind: 'segment', snapshotId: latest.match(/快照ID: ([^\n]+)/)?.[1], index: 1 } });
+          else if (index === 1) gates[index].release({ actions: [{ action: 'fill', selector: '#note', value: 'A_FILLED_VALUE' }, { action: 'click', selector: '#work' }] });
+          else if (index === 2) gates[index].release({ actions: [{ action: 'click', ref: buttonRef(body, 'Record task') }] });
+          else gates[index].release(complete);
+        }
+        await finished(panel);
+        assert.equal(requests.length, 4);
+        for (const body of requests) assertNoBContent(body);
+        assert.deepEqual(await bindingState(target), { value: 'A_FILLED_VALUE', clicks: 2, inputs: 1, result: 'A_TASK_MARKER:A_FILLED_VALUE:2' });
+        for (const decoy of decoys) assert.deepEqual(await bindingState(decoy), { value: '', clicks: 0, inputs: 0, result: 'UNTOUCHED' });
+        await panel.getByText('任务完成', { exact: true }).waitFor();
+        assert.doesNotMatch(await panel.locator('#chat').innerText(), /任务已(?:停止|取消)/);
+      } finally {
+        for (const gate of gates) gate.release(complete);
+        for (const decoy of decoys) await decoy.close();
+      }
+    }, '/binding-long');
+  });
+}
+
+async function watchNavigationSource(worker, url) {
+  await worker.evaluate((url) => {
+    globalThis.__integrationNavigationTarget = null;
+    globalThis.__integrationNavigationObserver = (details) => {
+      if (details.url !== url) return;
+      globalThis.__integrationNavigationTarget = {
+        sourceTabId: details.sourceTabId, sourceFrameId: details.sourceFrameId, tabId: details.tabId,
+        capturing: !!activeRun?.capturingNewTabs, executionTabId: activeRun?.executionTabId,
+      };
+      chrome.webNavigation.onCreatedNavigationTarget.removeListener(globalThis.__integrationNavigationObserver);
+      delete globalThis.__integrationNavigationObserver;
+    };
+    chrome.webNavigation.onCreatedNavigationTarget.addListener(globalThis.__integrationNavigationObserver);
+  }, url);
+}
+
+async function clearNavigationObserver(worker) {
+  await worker.evaluate(() => {
+    if (globalThis.__integrationNavigationObserver) chrome.webNavigation.onCreatedNavigationTarget.removeListener(globalThis.__integrationNavigationObserver);
+    delete globalThis.__integrationNavigationObserver;
+    delete globalThis.__integrationNavigationTarget;
+  });
+}
+
+for (const { newTab, background } of [
+  { newTab: false, background: true },
+  { newTab: true, background: false },
+  { newTab: true, background: true },
+]) {
+  test(`真实MV3任务跟随：${background ? '切到B后' : 'A活动时'}仍跟随任务自身${newTab ? '点击打开的新标签' : '导航的新文档'}，后续后台操作不误落B`, { timeout: 60000 }, async () => {
+    const gates = Array.from({ length: 3 }, heldModelReply);
+    reply = (n, body) => { assert.ok(n <= gates.length); return gates[n - 1].receive(body); };
+    await withPanel(async (panel, target) => {
+      let decoy;
+      let followed;
+      const worker = context.serviceWorkers().find((item) => item.url().startsWith(`chrome-extension://${extensionId}/`));
+      try {
+        if (newTab) await watchNavigationSource(worker, webUrl + '/binding-child');
+        decoy = await context.newPage();
+        await decoy.goto(webUrl + '/binding-b');
+        const taskTab = await extensionTab(panel, target);
+        const decoyTab = await extensionTab(panel, decoy);
+        await activateTab(panel, taskTab);
+        await send(panel, newTab ? '点击 Open task popup，在新标签填写并点击 Record task' : '导航到下一文档，在该页填写并点击 Record task');
+        assert.match((await gates[0].wait()).messages.at(-1).content, /A_TASK_MARKER/);
+        if (background) await activateTab(panel, decoyTab);
+        await assertRunning(panel);
+        gates[0].release({ actions: [newTab ? { action: 'click', selector: '#popup' } : { action: 'navigate', value: webUrl + '/binding-next' }] });
+        const second = await gates[1].wait();
+        const marker = newTab ? 'FOLLOWED_CHILD_MARKER' : 'FOLLOWED_NAVIGATION_MARKER';
+        followed = newTab ? context.pages().find((page) => page.url() === webUrl + '/binding-child') : target;
+        assert.match(second.messages.at(-1).content, new RegExp(marker));
+        assertNoBContent(second);
+        assert.ok(followed, '必须存在已被模型观察到的任务后续页');
+        const followedTab = await extensionTab(panel, followed);
+        assert.equal(followedTab.id === taskTab.id, !newTab, '导航保留tabId，操作开页必须换tabId');
+        if (newTab) {
+          const navigationTarget = await worker.evaluate(() => globalThis.__integrationNavigationTarget);
+          assert.equal(navigationTarget?.tabId, followedTab.id);
+          assert.equal(navigationTarget.sourceTabId, taskTab.id, '使用浏览器来源事件核实真实任务页，不能信任Edge活动页归属');
+          assert.equal(navigationTarget.sourceFrameId, 0);
+          assert.equal(await followed.evaluate(() => window.opener?.location.href || null), webUrl + '/binding-opener');
+          assert.deepEqual(await target.evaluate(() => ({ attempts: window.popupAttempts, opened: window.popupOpened })), { attempts: 1, opened: true });
+        }
+        await activateTab(panel, decoyTab);
+        await assertRunning(panel);
+        gates[1].release({ actions: [{ action: 'fill', selector: '#note', value: 'FOLLOWED_VALUE' }, { action: 'click', ref: buttonRef(second, 'Record task') }] });
+        const third = await gates[2].wait();
+        assert.match(third.messages.at(-1).content, new RegExp(`${marker}:FOLLOWED_VALUE:1`));
+        gates[2].release(complete);
+        await finished(panel);
+        assert.equal(requests.length, 3);
+        for (const body of requests) assertNoBContent(body);
+        assert.deepEqual(await bindingState(followed), { value: 'FOLLOWED_VALUE', clicks: 1, inputs: 1, result: `${marker}:FOLLOWED_VALUE:1` });
+        assert.equal((await panel.evaluate((id) => chrome.tabs.get(id), followedTab.id)).active, false, '跟随后切回B，填写点击不能激活任务页');
+        assert.deepEqual(await bindingState(decoy), { value: '', clicks: 0, inputs: 0, result: 'UNTOUCHED' });
+        if (newTab) assert.deepEqual(await bindingState(target), { value: '', clicks: 0, inputs: 0, result: 'UNTOUCHED' });
+        await panel.getByText('任务完成', { exact: true }).waitFor();
+      } finally {
+        for (const gate of gates) gate.release(complete);
+        if (newTab && worker) await clearNavigationObserver(worker);
+        if (followed && followed !== target) await followed.close();
+        await decoy?.close();
+      }
+    }, '/binding-opener');
+  });
+}
+
+test('真实MV3反向隔离：A操作捕获窗口内后台B自行开页，来源B即使被Edge标为A的opener也不能接管任务', { timeout: 90000 }, async () => {
+  const gates = Array.from({ length: 2 }, heldModelReply);
+  reply = (n, body) => { assert.ok(n <= gates.length); return gates[n - 1].receive(body); };
+  await withPanel(async (panel, target) => {
+    const worker = context.serviceWorkers().find((item) => item.url().startsWith(`chrome-extension://${extensionId}/`));
+    let decoy;
+    let unrelated;
+    try {
+      await watchNavigationSource(worker, webUrl + '/binding-b?popup=unrelated');
+      decoy = await context.newPage();
+      await decoy.goto(webUrl + '/binding-b');
+      const taskTab = await extensionTab(panel, target);
+      const decoyTab = await extensionTab(panel, decoy);
+      await activateTab(panel, taskTab);
+      await send(panel, '等待本地门闩出现后，只点击当前任务页面的 Record task');
+      assert.match((await gates[0].wait()).messages.at(-1).content, /A_TASK_MARKER/);
+      gates[0].release({ actions: [{ action: 'wait', selector: '#releaseTask', timeout: 15000 }, { action: 'click', selector: '#work' }] });
+      const deadline = Date.now() + 5000;
+      let capturing = false;
+      while (Date.now() < deadline && !capturing) {
+        capturing = await worker.evaluate(() => !!activeRun?.capturingNewTabs && !!activeRun?.newTabOperationId);
+        if (!capturing) await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      assert.equal(capturing, true, 'B必须在真实操作的新标签捕获窗口内开页');
+      assert.equal((await panel.evaluate((id) => chrome.tabs.get(id), taskTab.id)).active, true);
+      const opened = context.waitForEvent('page', { timeout: 10000 });
+      await decoy.evaluate(() => document.querySelector('#popup').click());
+      unrelated = await opened;
+      await unrelated.waitForLoadState('domcontentloaded');
+      await unrelated.waitForURL(webUrl + '/binding-b?popup=unrelated');
+      const unrelatedTab = await extensionTab(panel, unrelated);
+      const event = await worker.evaluate(() => globalThis.__integrationNavigationTarget);
+      assert.equal(event?.tabId, unrelatedTab.id);
+      assert.equal(event.sourceTabId, decoyTab.id);
+      assert.equal(event.capturing, true);
+      assert.equal(event.executionTabId, taskTab.id);
+      await target.evaluate(() => {
+        const latch = document.createElement('span'); latch.id = 'releaseTask'; latch.textContent = '门闩已打开'; document.body.append(latch);
+      });
+      const second = await gates[1].wait();
+      assertNoBContent(second);
+      assert.match(second.messages.at(-1).content, /A_TASK_MARKER::1/);
+      gates[1].release(complete);
+      await finished(panel);
+      assert.equal(requests.length, 2);
+      for (const body of requests) assertNoBContent(body);
+      assert.deepEqual(await bindingState(target), { value: '', clicks: 1, inputs: 0, result: 'A_TASK_MARKER::1' });
+      for (const page of [decoy, unrelated]) assert.deepEqual(await bindingState(page), { value: '', clicks: 0, inputs: 0, result: 'UNTOUCHED' });
+      await panel.getByText('任务完成', { exact: true }).waitFor();
+    } finally {
+      for (const gate of gates) gate.release(complete);
+      await clearNavigationObserver(worker);
+      await unrelated?.close();
+      await decoy?.close();
+    }
+  }, '/binding-opener');
+});
+
+async function openPromptOptions(panel, otherWindow = false) {
+  const url = `chrome-extension://${extensionId}/options.html`;
+  const options = otherWindow ? await newWindowPage(panel, url) : await context.newPage();
+  if (!otherWindow) await options.goto(url);
+  await options.waitForFunction(() => latestPromptState !== null);
+  return options;
+}
+
+async function saveSystemPrompt(options, text) {
+  await options.locator('#systemPrompt').fill(text);
+  await options.locator('#btnSavePrompt').click();
+  await options.waitForFunction(() => !promptDirty && !promptSaving && !document.querySelector('#btnSavePrompt').disabled);
+  assert.equal((await options.evaluate(() => chrome.runtime.sendMessage({ type: 'GET_SETTINGS' }))).systemPrompt, text);
+}
+
+function assertSystemPrompt(body, expected, absent = []) {
+  assert.equal(body.messages[0].role, 'system');
+  assert.ok(body.messages[0].content.startsWith(expected + '\n'), 'system消息必须使用实际保存的全局提示词');
+  const outputRules = body.messages[0].content.split('\n').at(-1);
+  assert.match(outputRules, /遵循用户指定的语言、格式和长度/);
+  assert.match(outputRules, /value只放字段需要的内容/);
+  assert.match(outputRules, /say用于简短进度/);
+  for (const text of absent) assert.ok(!body.messages[0].content.includes(text), `system消息混入了非本任务提示词: ${text}`);
+}
+
+test('真实MV3设置页UI保存提示词后，同一侧栏的下一任务立即使用新system消息并移除旧文本', { timeout: 60000 }, async () => {
+  reply = () => complete;
+  await withPanel(async (panel, target) => {
+    const options = await openPromptOptions(panel);
+    const original = await options.locator('#systemPrompt').inputValue();
+    try {
+      const taskTab = await extensionTab(panel, target);
+      const oldPrompt = 'UI_SAVED_OLD_PROMPT：本地回归旧提示词。';
+      const nextPrompt = 'UI_SAVED_NEXT_PROMPT：本地回归更新提示词。';
+      await saveSystemPrompt(options, oldPrompt);
+      await activateTab(panel, taskTab);
+      await send(panel, '检查首次保存的提示词'); await finished(panel);
+      assert.equal(requests.length, 1);
+      assertSystemPrompt(requests[0], oldPrompt, [nextPrompt]);
+      await saveSystemPrompt(options, nextPrompt);
+      await activateTab(panel, taskTab);
+      await send(panel, '检查修改提示词后的下一任务'); await finished(panel);
+      assert.equal(requests.length, 2);
+      assertSystemPrompt(requests[1], nextPrompt, [oldPrompt]);
+      await panel.getByText('任务完成', { exact: true }).last().waitFor();
+    } finally {
+      await saveSystemPrompt(options, original);
+      await options.close();
+    }
+  });
+});
+
+test('真实MV3提示词生命周期：跨窗口更新与未保存草稿不串用，运行中保持启动快照而下一任务采用新版本', { timeout: 90000 }, async () => {
+  const gates = Array.from({ length: 2 }, heldModelReply);
+  reply = (n, body) => n <= gates.length ? gates[n - 1].receive(body) : complete;
+  await withPanel(async (panel, target) => {
+    const optionsA = await openPromptOptions(panel);
+    const original = await optionsA.locator('#systemPrompt').inputValue();
+    let optionsB;
+    try {
+      const oldPrompt = 'PROMPT_BASE_SAVED：外部更新前的版本。';
+      const draft = 'PROMPT_DRAFT_UNSAVED：只能显式核对并保存后才生效。';
+      const external = 'PROMPT_EXTERNAL_START：本任务启动时的已保存版本。';
+      const updated = 'PROMPT_EXTERNAL_LATER：运行中保存，仅供下一任务使用。';
+      await saveSystemPrompt(optionsA, oldPrompt);
+      optionsB = await openPromptOptions(panel, true);
+      assert.notEqual((await extensionTab(panel, optionsA)).windowId, (await extensionTab(panel, optionsB)).windowId);
+      await optionsA.locator('#systemPrompt').fill(draft);
+      await saveSystemPrompt(optionsB, external);
+      await optionsA.locator('#promptConflict').waitFor({ state: 'visible' });
+      assert.equal(await optionsA.locator('#systemPrompt').inputValue(), draft);
+      assert.equal(await optionsA.locator('#latestPrompt').inputValue(), external);
+      await optionsA.locator('#btnSavePrompt').click();
+      await optionsA.waitForFunction(() => !promptSaving);
+      assert.equal(await optionsA.locator('#promptConflict').isVisible(), true);
+      assert.match(await optionsA.locator('#promptStatus').textContent(), /草稿已保留/);
+      assert.equal((await optionsA.evaluate(() => chrome.runtime.sendMessage({ type: 'GET_SETTINGS' }))).systemPrompt, external, '旧revision草稿不能静默覆盖外部保存');
+      const taskTab = await extensionTab(panel, target);
+      await activateTab(panel, taskTab);
+      await send(panel, '点击 Do work 并汇报');
+      assertSystemPrompt(await gates[0].wait(), external, [oldPrompt, draft, updated]);
+      await saveSystemPrompt(optionsB, updated);
+      await optionsA.waitForFunction((text) => document.querySelector('#latestPrompt').value === text, updated);
+      assert.equal(await optionsA.locator('#systemPrompt').inputValue(), draft, '外部更新不得覆盖未保存的本地草稿');
+      await assertRunning(panel);
+      gates[0].release({ actions: [{ action: 'click', selector: '#work' }] });
+      assertSystemPrompt(await gates[1].wait(), external, [oldPrompt, draft, updated]);
+      gates[1].release(complete);
+      await finished(panel);
+      assert.equal(requests.length, 2);
+      assert.equal(await target.evaluate(() => window.clicks), 1);
+      await activateTab(panel, taskTab);
+      await send(panel, '新任务采用外部最新已保存提示词'); await finished(panel);
+      assert.equal(requests.length, 3);
+      assertSystemPrompt(requests[2], updated, [oldPrompt, external, draft]);
+      await optionsA.locator('#btnRebasePrompt').click();
+      await optionsA.locator('#btnSavePrompt').click();
+      await optionsA.waitForFunction(() => !promptDirty && !promptSaving);
+      await activateTab(panel, taskTab);
+      await send(panel, '草稿明确核对保存后才生效'); await finished(panel);
+      assert.equal(requests.length, 4);
+      assertSystemPrompt(requests[3], draft, [oldPrompt, external, updated]);
+      await panel.getByText('任务完成', { exact: true }).last().waitFor();
+    } finally {
+      for (const gate of gates) gate.release(complete);
+      await optionsA.reload();
+      await optionsA.waitForFunction(() => latestPromptState !== null);
+      await saveSystemPrompt(optionsA, original);
+      await optionsB?.close();
+      await optionsA.close();
+    }
+  });
+});
+
+test('真实MV3长文本：超过20k的Unicode问题完整发送，超过50k的问答显示保存并在同窗口重开后完整回传历史', { timeout: 90000 }, async () => {
+  const question = 'Q'.repeat(24000) + '问题尾标记_中文_🙂_QUESTION_END';
+  const answer = '答'.repeat(55000) + '答案尾标记_中文_🙂_ANSWER_END';
+  reply = (n) => n === 1 ? answer : '重开侧栏后的问答已完成';
+  await withPanel(async (panel, target) => {
+    let reopened;
+    const windowId = (await extensionTab(panel, panel)).windowId;
+    const originalSessionKey = await panel.evaluate(() => sessionKey);
+    assert.equal(originalSessionKey, `chat:${windowId}`);
+    try {
+      await panel.locator('#modeAsk').click();
+      await send(panel, question); await finished(panel);
+      assert.equal(requests.length, 1);
+      assert.ok(requests[0].messages.at(-1).content.includes(question), 'RUN与模型请求必须包含完整长问题及Unicode尾标记');
+      assert.equal(await panel.locator('#chat > .msg.user').textContent(), question);
+      assert.ok((await panel.locator('#chat > .msg.ai .md-content').innerText()).trim() === answer, '问答正文在UI中必须完整显示到Unicode尾标记');
+      await panel.evaluate(() => persistQueue);
+      const saved = await panel.evaluate(async () => (await chrome.storage.session.get(sessionKey))[sessionKey]);
+      assert.ok(saved.some((item) => item.role === 'user' && item.content === question), '完整问题必须持久化');
+      assert.ok(saved.some((item) => item.role === 'assistant' && item.content === answer), '完整长答案必须持久化');
+      await panel.close();
+      reopened = await context.newPage();
+      await reopened.goto(`chrome-extension://${extensionId}/sidepanel.html`);
+      await reopened.waitForFunction(() => initialized && !document.querySelector('#clear').disabled);
+      assert.equal((await extensionTab(reopened, reopened)).windowId, windowId, '必须在原Edge窗口重新打开侧栏');
+      assert.equal(await reopened.evaluate(() => sessionKey), originalSessionKey, '重开前后必须使用同一窗口sessionKey');
+      assert.ok((await reopened.locator('#chat > .msg.ai .md-content').innerText()).trim() === answer, '重开后完整恢复长答案');
+      await reopened.locator('#modeAsk').click();
+      await activateTab(reopened, await extensionTab(reopened, target));
+      await send(reopened, '根据刚才长答案的尾部继续回答'); await finished(reopened);
+      assert.equal(requests.length, 2);
+      assert.ok(requests[1].messages.some((item) => item.role === 'assistant' && item.content === answer),
+        `下一次真实请求必须保留完整长答案: ${JSON.stringify({ historyLimit: await reopened.evaluate(() => globalThis.ViasCore.TEXT_LIMITS.history), messages: requests[1].messages.map((item) => ({ role: item.role, length: typeof item.content === 'string' ? item.content.length : 0, questionTail: JSON.stringify(item.content).includes('QUESTION_END'), answerTail: JSON.stringify(item.content).includes('ANSWER_END') })) })}`);
+      await reopened.getByText('重开侧栏后的问答已完成', { exact: true }).waitFor();
+    } finally { await reopened?.close(); }
+  });
+});
+
+test('真实MV3大JSON：完整Unicode转义的200000字合法fill跨越旧1M协议上限，实际填写全量后done', { timeout: 90000 }, async () => {
+  const raw = '{"actions":[{"action":"fill","selector":"#note","value":"' + '\\u4e2d'.repeat(200000) + '"}]}';
+  assert.ok(raw.length > 1000000 && raw.length < 3000000);
+  reply = (n) => n === 1 ? raw : complete;
+  await withPanel(async (panel, target) => {
+    await send(panel, '填写本地备注字段中的20万个中文字并核对完成'); await finished(panel);
+    assert.equal(requests.length, 2, '大JSON必须作为合法指令一次执行并完成核对');
+    assert.deepEqual(await target.evaluate(() => {
+      const value = document.querySelector('#note').value;
+      return { length: value.length, allChinese: /^中+$/.test(value), inputs: window.inputEvents };
+    }), { length: 200000, allChinese: true, inputs: 1 });
+    const feedback = JSON.parse(requests[1].messages.at(-1).content.match(/^操作结果: (\[[^\n]*\])/m)?.[1] || 'null');
+    assert.equal(feedback?.[0]?.ok, true);
+    await panel.getByText('任务完成', { exact: true }).waitFor();
+  }, '/binding-opener');
 });
 
 test('模型请求等待中停止，旧响应不能污染下一任务', async () => {

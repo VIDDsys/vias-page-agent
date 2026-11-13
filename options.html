@@ -1,111 +1,300 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-zcode-design>
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Vias 页面助手 - 设置</title>
 <style>
-  :root { color-scheme: light dark; --ink: #111; --page: #fff; --bg: #fafafa; --line: #e5e7eb; --line-soft: #f1f2f4; --muted: #646a73; --ok: #107c10; --fail: #c42b1c; }
-  @media (prefers-color-scheme: dark) {
-    :root { --ink: #f4f4f5; --page: #1c1c1f; --bg: #161618; --line: #2e2e33; --line-soft: #26262b; --muted: #a9abb2; --ok: #81cf91; --fail: #ff8c82; }
+  :root {
+    color-scheme: light dark;
+    --color-page: #ffffff;
+    --color-surface: #fafafa;
+    --color-surface-strong: #f4f4f5;
+    --color-ink: #111111;
+    --color-body: #3f3f46;
+    --color-muted: #71717a;
+    --color-faint: #a1a1aa;
+    --color-line: #e4e4e7;
+    --color-line-strong: #d4d4d8;
+    --color-fail: #b42318;
+    --radius: 10px;
+    --radius-sm: 6px;
+    --control: 44px;
+    --content-width: 960px;
+    --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
   }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --color-page: #111113;
+      --color-surface: #17171a;
+      --color-surface-strong: #1f1f23;
+      --color-ink: #f4f4f5;
+      --color-body: #d4d4d8;
+      --color-muted: #a1a1aa;
+      --color-faint: #71717a;
+      --color-line: #2a2a2e;
+      --color-line-strong: #3f3f46;
+      --color-fail: #f97066;
+    }
+  }
+
   * { box-sizing: border-box; }
-  body { font: 14px/1.7 "Segoe UI", "Microsoft YaHei", sans-serif; max-width: 660px; margin: 40px auto; padding: 0 16px; color: var(--ink); background: var(--bg); }
-  h1 { font-size: 18px; }
-  h2 { font-size: 15px; margin: 26px 0 8px; }
-  .card { background: var(--page); border: 1px solid var(--line); border-radius: 14px; padding: 12px 16px; margin: 10px 0; }
-  .card.active { border-color: var(--ink); box-shadow: 0 6px 20px rgba(0,0,0,.06); }
-  .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-  .row strong { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .row .tag, .row button { flex: none; }
-  .meta { color: var(--muted); font-size: 12px; word-break: break-all; margin-top: 4px; }
-  label { display: block; margin-top: 12px; font-weight: 600; font-size: 13px; }
-  input, textarea { width: 100%; padding: 8px 10px; margin-top: 4px; border-radius: 8px; border: 1px solid var(--line); font: inherit; background: var(--page); color: inherit; }
-  input[type="checkbox"] { width: auto; margin-right: 8px; }
-  textarea { height: 96px; resize: vertical; }
-  button { padding: 7px 16px; border: 1px solid var(--line); border-radius: 999px; background: var(--page); color: var(--ink); cursor: pointer; font: inherit; font-size: 13px; }
-  button.primary { background: var(--ink); color: var(--page); border-color: var(--ink); }
-  button.danger { color: var(--fail); }
-  button:disabled { opacity: .5; cursor: default; }
-  .hint { color: var(--muted); font-size: 12px; margin-top: 4px; }
-  .form-title-row { display: flex; align-items: baseline; gap: 10px; }
-  .form-title-row h2 { margin-right: auto; }
-  .promote-link { font-size: 13px; color: var(--ink); text-decoration: underline; text-underline-offset: 3px; white-space: nowrap; }
-  .key-row { display: flex; gap: 8px; margin-top: 4px; }
-  .key-row input { flex: 1; min-width: 0; margin-top: 0; }
-  .eye-btn { flex: none; width: 42px; padding: 0; display: inline-flex; align-items: center; justify-content: center; border-radius: 8px; color: var(--muted); }
-  .eye-btn:hover { color: var(--ink); }
-  .status { font-size: 12px; }
-  .model-status { margin-top: 6px; overflow-wrap: anywhere; }
-  .model-status[hidden] { display: none; }
-  .ok { color: var(--ok); }
-  .fail { color: var(--fail); }
+  html { background: var(--color-page); color: var(--color-ink); font-family: var(--font-sans); text-rendering: optimizeLegibility; }
+  body { margin: 0; min-width: 320px; min-height: 100dvh; background: var(--color-page); color: var(--color-ink); font-size: 15px; line-height: 1.65; -webkit-font-smoothing: antialiased; }
+  button, input, textarea { font: inherit; color: inherit; }
+  button { cursor: pointer; }
+  a { color: inherit; }
+  a:focus-visible, button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px solid var(--color-ink); outline-offset: 2px; }
+  button:disabled { cursor: default; opacity: .45; }
+  .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+  @media (prefers-reduced-motion: reduce) {
+    .topbar, .drawer, .drawer-row { transition: none !important; }
+  }
+
+  .topbar {
+    position: sticky; top: 0; z-index: 20;
+    height: 52px; background: var(--color-page);
+    border-bottom: 1px solid var(--color-line);
+  }
+  .topbar-inner {
+    width: min(100%, var(--content-width)); height: 100%; margin: 0 auto;
+    padding: 0 24px; display: flex; align-items: center; gap: 12px;
+  }
+  .brand { display: inline-flex; align-items: baseline; gap: 8px; color: var(--color-ink); font-size: 20px; font-weight: 800; letter-spacing: .6px; line-height: 1; }
+  .brand small { color: var(--color-muted); font-size: 14px; font-weight: 400; letter-spacing: 0; }
+
+  .workspace { width: min(100%, var(--content-width)); margin: 0 auto; padding: 40px 24px 96px; }
+  .intro { padding-bottom: 32px; }
+  h1 { margin: 0; color: var(--color-ink); font-size: 26px; line-height: 1.3; font-weight: 700; letter-spacing: -.2px; }
+  .intro p { margin: 12px 0 0; color: var(--color-muted); font-size: 15px; }
+
+  .section { padding-top: 32px; border-top: 1px solid var(--color-line); }
+  .section + .section { margin-top: 48px; }
+  h2 { margin: 0 0 20px; color: var(--color-ink); font-size: 18px; line-height: 1.4; font-weight: 650; }
+  .section-body { min-width: 0; }
+
+  /* options.js renders #modelList .card > .row strong/.tag/buttons + .meta + .model-status */
+  #modelList {
+    border: 1px solid var(--color-line-strong);
+    border-radius: var(--radius);
+    background: var(--color-page);
+    overflow: clip;
+  }
+  #modelList > .hint { margin: 0; padding: 20px 16px; }
+  #modelList > .card { margin: 0; padding: 16px; border-bottom: 1px solid var(--color-line); background: transparent; }
+  #modelList > .card:last-child { border-bottom: 0; }
+  #modelList .row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; min-width: 0; }
+  #modelList .row strong {
+    flex: 1 1 100%; min-width: 0; max-width: 100%;
+    overflow: hidden; color: var(--color-ink); font-size: 16px; font-weight: 600;
+    line-height: 1.45; text-overflow: ellipsis; white-space: nowrap;
+  }
+  #modelList .row .tag, #modelList .row button { flex: 0 0 auto; width: max-content; max-width: 100%; }
+  #modelList .row .tag { padding: 0 4px; color: var(--color-muted); font-size: 14px; font-weight: 400; }
+  #modelList .row button:not(.primary) {
+    min-width: 0; padding: 8px; border-color: transparent; background: transparent;
+    color: var(--color-muted); font-weight: 400;
+  }
+  #modelList .row button:not(.primary):hover:not(:disabled) { border-color: transparent; background: var(--color-surface); color: var(--color-ink); }
+  #modelList .row button.danger { color: var(--color-fail); }
+  #modelList .meta { margin: 4px 0 0; color: var(--color-muted); font: 14px/1.6 var(--font-mono); overflow-wrap: break-word; }
+  #modelList .model-status { margin-top: 10px; }
+  @media (max-width: 380px) {
+    #modelList .row { flex-direction: column; align-items: flex-start; }
+    #modelList .row strong { width: 100%; }
+    #modelList .row .tag, #modelList .row button { flex: none; width: auto; }
+  }
+  @media (min-width: 640px) {
+    #modelList .row strong { flex: 1 1 14rem; width: auto; }
+    #modelList .row .tag, #modelList .row button { flex: none; width: auto; }
+  }
+  #modelListStatus:not([hidden]) { margin-top: 12px; }
+
+  button {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: var(--control); min-height: var(--control); padding: 8px 16px;
+    border: 1px solid var(--color-line-strong); border-radius: var(--radius);
+    background: var(--color-page); color: var(--color-ink);
+    font-size: 14px; line-height: 1.2; white-space: nowrap;
+    transition: background-color 150ms var(--ease-out), border-color 150ms var(--ease-out);
+  }
+  button:hover:not(:disabled) { background: var(--color-surface); border-color: var(--color-muted); }
+  button.primary { border-color: var(--color-ink); background: var(--color-ink); color: var(--color-page); font-weight: 600; }
+  button.primary:hover:not(:disabled) { border-color: var(--color-ink); background: var(--color-body); color: var(--color-page); }
+  button.danger { color: var(--color-fail); }
+  button.danger:hover:not(:disabled) { border-color: var(--color-fail); background: var(--color-page); color: var(--color-fail); }
+  .tag {
+    display: inline-flex; align-items: center;
+    border: 0; color: var(--color-muted);
+    font-size: 14px; font-weight: 400; line-height: 1.2; white-space: nowrap;
+  }
+
+  .toolbar, .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; min-width: 0; }
+  .toolbar { margin-top: 24px; }
+  .actions { margin-top: 20px; }
+  .actions .status { flex: 1 1 16rem; }
+
+  .panel {
+    min-width: 0; margin-top: 24px; padding: 24px;
+    border: 1px solid var(--color-line); border-radius: var(--radius);
+    background: var(--color-page);
+  }
   #formWrap { display: none; }
   #formWrap.show { display: block; }
-  .tag { font: inherit; font-size: 13px; color: var(--ink); border: 1px solid var(--line); border-radius: 999px; padding: 7px 16px; background: var(--page); }
-  .sponsors { margin-top: 32px; }
-  .sponsor-list { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 10px; }
-  .sponsor { display: flex; align-items: center; gap: 10px; padding: 7px 14px 7px 7px; background: var(--page); border: 1px solid var(--line); border-radius: 999px; }
-  .sponsor-avatar { width: 42px; height: 42px; border-radius: 50%; object-fit: cover; background: var(--line-soft); flex: none; }
-  .sponsor-name { font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }
-  .sponsor-fallback { display: grid; place-items: center; font-size: 16px; font-weight: 700; color: var(--muted); }
-  .sponsor-empty { margin-top: 8px; }
+  .form-title-row { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px 24px; }
+  .form-title-row h3 { margin: 0; color: var(--color-ink); font-size: 18px; line-height: 1.4; font-weight: 650; }
+  .promote-link { color: var(--color-muted); font-size: 14px; text-decoration: underline; text-underline-offset: 3px; overflow-wrap: anywhere; }
+  .promote-link:hover { color: var(--color-ink); }
+
+  .fields { display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; margin-top: 24px; }
+  @media (min-width: 720px) {
+    .fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .field-span { grid-column: 1 / -1; }
+  }
+  .field { min-width: 0; }
+  label { display: block; color: var(--color-ink); font-size: 14px; font-weight: 600; line-height: 1.5; }
+  .check-label { display: flex; align-items: center; gap: 10px; min-height: var(--control); font-weight: 500; }
+  input, textarea {
+    display: block; width: 100%; margin-top: 8px; padding: 10px 12px;
+    border: 1px solid var(--color-line-strong); border-radius: var(--radius);
+    background: var(--color-page); color: var(--color-ink); font-size: 15px;
+  }
+  input { min-height: var(--control); }
+  input::placeholder, textarea::placeholder { color: var(--color-faint); opacity: 1; }
+  input:hover, textarea:hover { border-color: var(--color-muted); }
+  textarea { min-height: 140px; resize: vertical; line-height: 1.7; }
+  input[type="checkbox"] { width: 18px; height: 18px; min-height: 18px; margin: 0; accent-color: var(--color-ink); flex: none; }
+  .key-row { display: flex; align-items: stretch; gap: 8px; margin-top: 8px; }
+  .key-row input { flex: 1; min-width: 0; margin-top: 0; }
+  .eye-btn { flex: none; width: var(--control); padding: 0; color: var(--color-muted); }
+  .eye-btn:hover:not(:disabled), .eye-btn.on { color: var(--color-ink); border-color: var(--color-muted); }
+  .eye-btn svg { display: block; }
+
+  .hint, .status { color: var(--color-muted); font-size: 14px; line-height: 1.65; overflow-wrap: anywhere; }
+  .hint { margin: 8px 0 0; }
+  .status:empty { display: none; }
+  .model-status { overflow-wrap: anywhere; }
+  [hidden] { display: none !important; }
+  .ok { color: var(--color-ink); }
+  .fail { color: var(--color-fail); }
+
+  #promptConflict { margin-top: 20px; background: var(--color-surface); }
+  #promptConflict > p:first-child { margin: 0; color: var(--color-body); font-size: 15px; }
+  #latestPrompt { min-height: 96px; color: var(--color-muted); background: var(--color-surface-strong); }
+
+  .sponsor-list { display: flex; flex-wrap: wrap; gap: 12px; min-width: 0; }
+  .sponsor {
+    display: flex; align-items: center; gap: 12px; min-width: 0; max-width: 100%;
+    min-height: var(--control); padding: 6px 16px 6px 6px;
+    border: 1px solid var(--color-line); border-radius: var(--radius); background: var(--color-page);
+  }
+  .sponsor-avatar { width: 40px; height: 40px; border-radius: var(--radius-sm); object-fit: cover; background: var(--color-surface-strong); flex: none; }
+  .sponsor-name { min-width: 0; color: var(--color-ink); font-size: 15px; font-weight: 500; overflow-wrap: anywhere; }
+  .sponsor-fallback { display: grid; place-items: center; color: var(--color-muted); font-size: 15px; font-weight: 650; }
+  .sponsor-empty { margin: 0; }
+
+  @media (max-width: 640px) {
+    .workspace { padding: 32px 16px 72px; }
+    .topbar-inner { padding: 0 16px; }
+    .intro { padding-bottom: 24px; }
+    .section + .section { margin-top: 40px; }
+    .panel { padding: 20px 16px; }
+  }
 </style>
 </head>
 <body>
-<h1>Vias 页面助手 · 设置</h1>
-<p class="hint">配置一个或多个模型（任意 OpenAI 兼容接口：官方 API、中转站、本地模型均可），配置后在侧边栏可随时切换。所有配置仅保存在本机浏览器内（不上云同步），卸载扩展即自动清除。</p>
-
-<h2>模型列表</h2>
-<div id="modelList"></div>
-<div id="modelListStatus" class="status fail" role="status" aria-live="polite" hidden></div>
-<div class="row" style="margin-top:12px">
-  <button id="btnAdd" class="primary">＋ 添加模型</button>
-</div>
-
-<div id="formWrap" class="card">
-  <div class="form-title-row">
-    <h2 id="formTitle" style="margin-top:0">添加模型</h2>
-    <a class="promote-link" href="https://api.viddsys.xyz/" target="_blank" rel="noopener noreferrer">打开VIDDsys API</a>
+<header class="topbar">
+  <div class="topbar-inner">
+    <span class="brand">Vias<small>页面助手</small></span>
   </div>
-  <label for="fName">显示名称（侧边栏切换菜单里显示的名字）</label>
-  <input id="fName" autocomplete="off" placeholder="VIDDsys API">
-  <label for="fBase">API 地址（Base URL）</label>
-  <input id="fBase" type="url" autocomplete="url" aria-describedby="baseHint" placeholder="https://api.viddsys.xyz/v1">
-  <p id="baseHint" class="hint">远程接口建议使用 HTTPS；HTTP 会明文传输密钥和页面内容。本机模型可使用 HTTP。</p>
-  <label for="fKey">API Key</label>
-  <div class="key-row">
-    <input id="fKey" type="password" autocomplete="new-password" placeholder="sk-******key">
-    <button id="toggleKey" type="button" class="eye-btn" title="显示密钥" aria-label="显示密钥" aria-pressed="false"></button>
-  </div>
-  <label for="fModel">模型名</label>
-  <input id="fModel" autocomplete="off" placeholder="deepseek-v4.1-flash">
-  <label><input id="fVision" type="checkbox" style="width:auto;margin-right:8px" aria-describedby="visionHint">模型支持图片输入（按需识别）</label>
-  <p id="visionHint" class="hint">请自行确认模型及接口支持图片输入，无法根据模型名或连接测试判断。默认不自动附图；开启后先提供图片候选描述，由模型按任务选择指定图片识别，问答与执行模式均支持。不截图，不自动附带其它图片。</p>
-  <div class="row" style="margin-top:16px">
-    <button id="btnSave" class="primary">保存</button>
-    <button id="btnCancel">取消</button>
-    <span id="formStatus" class="status" role="status" aria-live="polite"></span>
-  </div>
-</div>
+</header>
+<main class="workspace">
+  <header class="intro">
+    <h1>设置</h1>
+    <p>配置 OpenAI 兼容模型与全局提示词。所有配置只保存在本机，卸载扩展即清除。</p>
+  </header>
 
-<h2><label for="systemPrompt">系统提示词（全局，对所有模型生效）</label></h2>
-<textarea id="systemPrompt" placeholder="留空使用默认提示词"></textarea>
-<div class="row" style="margin-top:10px">
-  <button id="btnSavePrompt" class="primary">保存提示词</button>
-  <span id="promptStatus" class="status" role="status" aria-live="polite"></span>
-</div>
-<section id="promptConflict" class="card" hidden aria-label="提示词冲突恢复">
-  <p>设置已更新，未保存的草稿仍保留在上方。请对照下方最新提示词，按需合并到草稿，再点击「保留草稿并继续」后重新保存；不会自动覆盖其他窗口。</p>
-  <label for="latestPrompt">最新已保存的提示词（只读）</label>
-  <textarea id="latestPrompt" readonly></textarea>
-  <button id="btnRebasePrompt" type="button">保留草稿并继续</button>
-</section>
+  <section class="section" aria-labelledby="modelsTitle">
+    <h2 id="modelsTitle">模型</h2>
+    <div class="section-body">
+      <div id="modelList"></div>
+      <div id="modelListStatus" class="status fail" role="status" aria-live="polite" hidden></div>
+      <div class="toolbar">
+        <button id="btnAdd" class="primary" type="button">＋ 添加模型</button>
+      </div>
 
-<section class="sponsors" aria-labelledby="sponsorTitle">
-  <h2 id="sponsorTitle">赞助者名单</h2>
-  <div id="sponsorList" class="sponsor-list"></div>
-</section>
+      <div id="formWrap" class="panel">
+        <div class="form-title-row">
+          <h3 id="formTitle">添加模型</h3>
+          <a class="promote-link" href="https://api.viddsys.xyz/" target="_blank" rel="noopener noreferrer">打开 VIDDsys API</a>
+        </div>
+        <div class="fields">
+          <div class="field">
+            <label for="fName">显示名称</label>
+            <input id="fName" autocomplete="off" placeholder="VIDDsys API">
+          </div>
+          <div class="field">
+            <label for="fBase">API 地址</label>
+            <input id="fBase" type="url" autocomplete="url" aria-describedby="baseHint" placeholder="https://api.viddsys.xyz/v1">
+            <p id="baseHint" class="hint">远程接口请使用 HTTPS；HTTP 会明文传输密钥和页面内容。</p>
+          </div>
+          <div class="field">
+            <label for="fKey">API Key</label>
+            <div class="key-row">
+              <input id="fKey" type="password" autocomplete="new-password" placeholder="sk-******key">
+              <button id="toggleKey" type="button" class="eye-btn" title="显示密钥" aria-label="显示密钥" aria-pressed="false"></button>
+            </div>
+          </div>
+          <div class="field">
+            <label for="fModel">模型名</label>
+            <input id="fModel" autocomplete="off" placeholder="deepseek-v4.1-flash">
+          </div>
+          <div class="field field-span">
+            <label class="check-label"><input id="fVision" type="checkbox" aria-describedby="visionHint">支持图片输入</label>
+            <p id="visionHint" class="hint">仅当模型与服务商确实支持图片输入时开启。开启后由模型按任务选择图片，不自动截图。</p>
+          </div>
+        </div>
+        <div class="actions">
+          <button id="btnSave" class="primary" type="button">保存</button>
+          <button id="btnCancel" type="button">取消</button>
+          <span id="formStatus" class="status" role="status" aria-live="polite"></span>
+        </div>
+      </div>
+    </div>
+  </section>
 
+  <section class="section" aria-labelledby="promptLabel">
+    <h2 id="promptLabel">提示词</h2>
+    <div class="section-body">
+      <label for="systemPrompt" class="sr-only">系统提示词（全局，对所有模型生效）</label>
+      <textarea id="systemPrompt" aria-describedby="promptHint" placeholder="留空使用默认提示词"></textarea>
+      <p id="promptHint" class="hint">保存后从下一次任务生效，进行中的任务保留原提示词；留空保存恢复默认。</p>
+      <div class="actions">
+        <button id="btnSavePrompt" class="primary" type="button">保存提示词</button>
+        <span id="promptStatus" class="status" role="status" aria-live="polite"></span>
+      </div>
+      <section id="promptConflict" class="panel" hidden aria-label="提示词冲突恢复">
+        <p>设置已更新，未保存的草稿仍保留在上方。请对照下方最新提示词合并后重新保存；不会自动覆盖其他窗口。</p>
+        <div class="field">
+          <label for="latestPrompt">最新已保存的提示词（只读）</label>
+          <textarea id="latestPrompt" readonly></textarea>
+        </div>
+        <div class="actions">
+          <button id="btnRebasePrompt" type="button">保留草稿并继续</button>
+        </div>
+      </section>
+    </div>
+  </section>
+
+  <section class="section sponsors" aria-labelledby="sponsorTitle">
+    <h2 id="sponsorTitle">赞助者</h2>
+    <div class="section-body">
+      <div id="sponsorList" class="sponsor-list"></div>
+    </div>
+  </section>
+</main>
 <script src="core.js"></script>
 <script src="options.js"></script>
 </body>

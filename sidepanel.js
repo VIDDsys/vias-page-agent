@@ -1,5 +1,6 @@
 'use strict';
 
+const TEXT_LIMITS = globalThis.ViasCore.TEXT_LIMITS;
 const $ = (selector) => document.querySelector(selector);
 const chatEl = $('#chat');
 const inputEl = $('#input');
@@ -22,8 +23,10 @@ let currentModelId = '';
 let menuModels = [];
 let modelRefreshId = 0;
 let persistQueue = Promise.resolve();
+let historyOmissionShown = false;
 let autoStick = true;
 let toastTimer;
+let lastRunJournal = '';
 
 marked.use({
   gfm: true,
@@ -90,7 +93,18 @@ function scrollBottom(force = false) {
   if (autoStick) chatEl.scrollTop = chatEl.scrollHeight;
 }
 
+function displayTaskText(text) {
+  return String(text ?? '')
+    .replace(/^第\s*\d+\s*轮[：:]\s*/u, '')
+    .replace(/^已达到最大轮数\s*\d+$/u, '任务已达到执行上限')
+    .replace(/^(模型|页面)连续三轮/u, '$1多次')
+    .replace(/^连续多轮操作后/u, '多次操作后');
+}
+
 function addMessage(role, text) {
+  if (role === 'ai' && globalThis.ViasCore.isInternalToolText(text)) return null;
+  if (role === 'sys' && globalThis.ViasCore.isInternalToolText(text)) text = '任务出现异常，请稍后重试。';
+  if (role !== 'user') text = displayTaskText(text);
   const element = document.createElement('div');
   element.className = `msg ${role}`;
   if (role === 'ai') {
@@ -122,18 +136,41 @@ const ACTION_FAILURES = {
   OPTION_NOT_FOUND: '找不到匹配选项，请检查页面选项。',
   CLICK_BLOCKED: '点击未能完成，请检查页面后重试。',
   CHECK_NOT_APPLIED: '点击后目标仍未选中，请重读页面核对，必要时手动选择。',
+  VALUE_NOT_APPLIED: '网站未保留填写/选择结果，已停止后续操作，请检查字段要求。',
   SKIPPED_AFTER_NAVIGATION: '页面正在跳转，此操作已跳过，请检查新页面。',
   SKIPPED_AFTER_FAILURE: '前序操作失败，此操作已跳过，请检查前面的结果。',
   BUSY: '页面正在处理其他操作，请稍后重试。',
   CANCELLED: '操作已取消，请检查页面状态。',
+  INTERRUPTED: '操作已中断，请检查页面状态后重试。',
+  VISION_DISABLED: '当前模型未启用图片能力，请在模型设置中启用后重试。',
+  INVALID_IMAGE: '图片编号无效，请重新读取页面后选择图片。',
+  IMAGE_UNREADABLE: '无法读取这张图片，请检查页面或换一张图片。',
+  STALE_IMAGE: '图片已变化，请重新读取页面后重试。',
+  ENCODED_LIMIT: '图片编码后的大小超出限制，请选择更小的图片。',
+  DOWNLOAD_LIMIT: '图片下载大小超出限制，请选择更小的图片。',
+  PIXEL_LIMIT: '图片分辨率超出限制，请选择尺寸更小的图片。',
+  UNSUPPORTED_IMAGE: '暂不支持这种图片格式，请换一张图片。',
+  TIMEOUT: '图片读取超时，请检查网络后重试。',
+  IMAGE_REASON_REQUIRED: '图片读取缺少原因，请补充读取原因后重试。',
+  IMAGE_ALREADY_READ: '这张图片已读取，无需重复读取。',
+  READ_FAILED: '读取未完成，请重新读取页面后重试。',
+  ACTION_COMMUNICATION_FAILED: '页面通信失败，请检查页面状态后重试。',
+  UNSUPPORTED_KEY: '当前页面无法可靠模拟该按键，请改用点击或填写。',
+  NO_EFFECT: '按键未生效，请重新读取页面后核对状态。',
 };
 
-function addTools(round, actions) {
+function toolText(value, limit) {
+  const text = String(value ?? '');
+  return globalThis.ViasCore.isInternalToolText(text) ? '' : text.slice(0, limit);
+}
+
+function addTools(round, actions, title) {
   const block = document.createElement('div');
   block.className = 'tools';
   const heading = document.createElement('div');
   heading.className = 'tools-head';
-  heading.textContent = `第 ${round} 轮 · ${actions.length} 个操作`;
+  const label = ['图片分析', '页面读取'].includes(title) ? title : `${actions.length} 个操作`;
+  heading.textContent = label;
   block.appendChild(heading);
   const slots = [];
   for (const action of actions) {
@@ -141,12 +178,13 @@ function addTools(round, actions) {
     row.className = 'tool pending';
     const name = document.createElement('span');
     name.className = 'tool-name';
-    name.textContent = action.action;
+    name.textContent = toolText(action.action, 48);
     const detail = document.createElement('span');
     detail.className = 'tool-detail';
     const sensitive = /password|密码|验证码|token|secret|银行卡|cvv|身份证/i.test(String(action.selector || ''));
     const value = sensitive ? '[已隐藏]' : action.value;
-    detail.textContent = `${action.ref != null ? `@${action.ref}` : action.selector || ''}${value != null && value !== '' ? ` ← "${String(value).slice(0, 160)}"` : ''}`;
+    const fallbackDetail = `${action.ref != null ? `@${action.ref}` : action.selector || ''}${value != null && value !== '' ? ` ← "${String(value).slice(0, 160)}"` : ''}`;
+    detail.textContent = toolText(typeof action.detail === 'string' ? action.detail : fallbackDetail, 320);
     const state = document.createElement('span');
     state.className = 'tool-state';
     state.textContent = '…';
@@ -155,16 +193,33 @@ function addTools(round, actions) {
     reason.hidden = true;
     row.append(name, detail, state, reason);
     block.appendChild(row);
-    slots.push({ row, state, reason });
+    slots.push({ row, state, reason, image: action.action === 'image analyze' });
   }
   chatEl.appendChild(block);
   scrollBottom();
   return slots;
 }
 
+function updateTool(context, slot, result) {
+  if (!slot || !context.pendingTools.has(slot)) return;
+  const ok = result.ok === true;
+  slot.row.classList.remove('pending');
+  slot.row.classList.add(ok ? 'ok' : 'fail');
+  slot.state.textContent = ok ? (slot.image ? '已读取' : toolText(result.state, 160).replace('当前值=', '') || '完成')
+    : result.code === 'CANCELLED' ? '已取消' : result.code === 'INTERRUPTED' ? '已中断' : '失败';
+  slot.reason.hidden = ok;
+  slot.reason.textContent = ok ? '' : (Object.hasOwn(ACTION_FAILURES, result.code) ? ACTION_FAILURES[result.code] : '操作未完成，请检查页面状态后重试。');
+  context.pendingTools.delete(slot);
+}
+
+function settlePendingTools(context, code) {
+  for (const slot of context.pendingTools) updateTool(context, slot, { ok: false, code });
+}
+
 function setStatus(text) {
-  statusEl.classList.toggle('show', !!text);
-  statusEl.textContent = text || '';
+  const visible = displayTaskText(text);
+  statusEl.classList.toggle('show', !!visible);
+  statusEl.textContent = visible;
 }
 
 function showToast(message) {
@@ -195,7 +250,7 @@ document.addEventListener('click', (event) => {
 });
 
 function setControlsRunning(running) {
-  sendEl.textContent = running ? '■' : '➤';
+  sendEl.textContent = running ? '停止' : '发送';
   sendEl.title = running ? '停止' : '发送';
   sendEl.setAttribute('aria-label', running ? '停止' : '发送');
   modeAsk.disabled = running;
@@ -216,8 +271,48 @@ function setMode(value) {
 modeAsk.addEventListener('click', () => setMode(false));
 modeAgent.addEventListener('click', () => setMode(true));
 
-function boundedHistory(items) {
-  return items.slice(-100).map((item) => ({ role: item.role, content: String(item.content || '').slice(0, 20000) }));
+function showHistoryOmission() {
+  if (historyOmissionShown) return;
+  historyOmissionShown = true;
+  addMessage('sys', '较早对话因保存预算已省略，最近消息保持完整。');
+}
+
+function boundedHistory(items, onOmitted) {
+  const valid = items.filter((item) => item && ['user', 'assistant'].includes(item.role) && typeof item.content === 'string'
+    && (item.role === 'user' || !globalThis.ViasCore.isInternalToolText(item.content)));
+  const selected = [];
+  let bytes = 2; // JSON array brackets; never slice an individual message.
+  for (let index = valid.length - 1; index >= 0; index--) {
+    const item = { role: valid[index].role, content: valid[index].content };
+    const size = globalThis.ViasCore.utf8ByteLength(JSON.stringify(item)) + Number(selected.length > 0);
+    if (bytes + size > TEXT_LIMITS.sessionBytes || selected.length >= 100) {
+      if (!selected.length) throw new Error('最新消息超过本窗口 8 MiB 保存预算，原文未截短；请复制保存并拆分任务');
+      break;
+    }
+    bytes += size;
+    selected.unshift(item);
+  }
+  if (selected.length < valid.length) onOmitted?.();
+  return selected;
+}
+
+async function writeSessionSnapshot(key, snapshot) {
+  const session = chrome.storage.session;
+  const bytes = globalThis.ViasCore.utf8ByteLength(JSON.stringify({ [key]: snapshot }));
+  if (bytes > TEXT_LIMITS.sessionBytes) throw new Error('本窗口对话超过 8 MiB 保存预算，原文未截短；请复制保存并新建对话');
+  const quota = Number(session.QUOTA_BYTES) || 10 * 1024 * 1024;
+  const reserve = Math.min(256 * 1024, Math.floor(quota * 0.05));
+  let otherBytes = 0;
+  if (typeof session.getBytesInUse === 'function') {
+    const [total, own] = await Promise.all([session.getBytesInUse(null), session.getBytesInUse(key)]);
+    otherBytes = Math.max(0, total - own);
+  }
+  // Chrome session storage estimates allocated memory. Include a conservative UTF-16 floor as well as JSON bytes.
+  const estimatedBytes = Math.max(bytes, snapshot.reduce((sum, item) => sum + item.content.length * 2 + 256, key.length * 2));
+  if (otherBytes + estimatedBytes > quota - reserve) {
+    throw new Error('会话存储空间不足，本次内容尚未保存；请复制保存或关闭不需要的对话。其它窗口的历史未删除');
+  }
+  await session.set({ [key]: snapshot });
 }
 
 function queueSessionWrite(operation) {
@@ -230,8 +325,10 @@ function queueSessionWrite(operation) {
 function persist() {
   const key = sessionKey;
   if (!key) return Promise.resolve();
-  const snapshot = boundedHistory(history);
-  return queueSessionWrite(() => chrome.storage.session.set({ [key]: snapshot })).catch((error) => {
+  let snapshot;
+  try { snapshot = boundedHistory(history, showHistoryOmission); }
+  catch (error) { addMessage('sys', `对话保存失败：${error.message}`); return Promise.resolve(); }
+  return queueSessionWrite(() => writeSessionSnapshot(key, snapshot)).catch((error) => {
     addMessage('sys', `对话保存失败：${error.message}`);
   });
 }
@@ -240,14 +337,18 @@ async function initializeHistory(windowId) {
   sessionKey = `chat:${windowId}`;
   const stored = await chrome.storage.session.get([sessionKey, 'chat']);
   const saved = Array.isArray(stored[sessionKey]) ? stored[sessionKey] : Array.isArray(stored.chat) ? stored.chat : [];
-  history = boundedHistory(saved.filter((item) => item && ['user', 'assistant'].includes(item.role) && typeof item.content === 'string'));
+  history = boundedHistory(saved, showHistoryOmission);
   if (!stored[sessionKey] && Array.isArray(stored.chat)) {
     const key = sessionKey;
     const snapshot = boundedHistory(history);
     await queueSessionWrite(async () => {
-      await chrome.storage.session.set({ [key]: snapshot });
+      await writeSessionSnapshot(key, snapshot);
       await chrome.storage.session.remove('chat');
     });
+  } else if (saved.length !== history.length) {
+    const key = sessionKey;
+    const snapshot = boundedHistory(history);
+    await queueSessionWrite(() => writeSessionSnapshot(key, snapshot));
   }
   for (const item of history) addMessage(item.role === 'user' ? 'user' : 'ai', item.content);
 }
@@ -405,6 +506,8 @@ clearButton.addEventListener('click', async () => {
   if (activeRun || !sessionKey) return;
   const key = sessionKey;
   history = [];
+  lastRunJournal = '';
+  historyOmissionShown = false;
   chatEl.innerHTML = '';
   try { await queueSessionWrite(() => chrome.storage.session.remove(key)); addMessage('sys', '已新建对话'); }
   catch (error) { addMessage('sys', `新建失败：${error.message}（旧对话可能仍保存在本机，请重试新建）`); }
@@ -431,22 +534,57 @@ for (const chip of CHIPS) {
   chipsEl.appendChild(button);
 }
 
+function describeJournalResult(action, result, prefix = '') {
+  const name = toolText(action.action, 32) || '操作';
+  const detail = toolText(typeof action.detail === 'string' ? action.detail : '', 80);
+  const state = !result ? '结果未知'
+    : result.ok === true ? '成功'
+      : `失败（${Object.hasOwn(ACTION_FAILURES, result.code) ? ACTION_FAILURES[result.code] : '未完成，请检查页面状态'}）`;
+  return `${prefix}${name}${detail ? ` ${detail}` : ''}：${state}`;
+}
+
+function buildRunJournal(context, outcome, error = '') {
+  const operations = [...context.operations.values()];
+  if (!operations.length) return error ? `上一任务已停止。停止原因：${toolText(error, 300)}`.slice(0, 1500) : '';
+  const total = operations.reduce((count, entry) => count + entry.actions.length, 0);
+  const failed = [];
+  operations.forEach((entry, batch) => entry.actions.forEach((action, index) => {
+    const result = entry.results.get(index);
+    if (result && result.ok !== true) failed.push(describeJournalResult(action, result, `第 ${batch + 1} 批 ${index + 1}. `));
+  }));
+  const last = operations.at(-1);
+  const lines = failed.length
+    ? failed.slice(-8)
+    : last.actions.slice(0, 10).map((action, index, _all) => describeJournalResult(action, last.results.get(index), `${index + 1}. `));
+  const heading = failed.length ? '本任务失败或未确认的操作' : '最后一批操作';
+  const outcomeText = outcome === 'unverified' ? '已结束，但仍有未确认的操作'
+    : outcome === 'stalled' ? '因连续无进展或重复而停止'
+      : outcome === 'limit' ? '达到执行上限后停止'
+        : outcome === 'cancelled' ? '已停止' : '已结束';
+  const errorText = error ? `\n停止原因：${toolText(error, 300)}` : '';
+  return `上一任务${outcomeText}，共执行 ${total} 个页面操作。${heading}：\n${lines.join('\n')}${errorText}`.slice(0, 1500);
+}
+
 function finishRun(context, outcome, error = '') {
   if (!context || context.finished) return;
   context.finished = true;
+  settlePendingTools(context, context.stopRequested || outcome === 'cancelled' ? 'CANCELLED' : 'INTERRUPTED');
   clearInterval(context.heartbeat);
   clearTimeout(context.stopFallback);
   for (const controller of context.modelControllers.values()) controller.abort();
   context.modelControllers.clear();
   try { context.port?.disconnect(); } catch {}
   if (activeRun !== context) return;
+  const journal = buildRunJournal(context, outcome, error);
+  if (journal) lastRunJournal = journal;
   activeRun = null;
   setControlsRunning(false);
   setStatus('');
   if (error) addMessage('sys', error);
   else if (outcome === 'cancelled') addMessage('sys', '任务已停止');
-  else if (outcome === 'limit') addMessage('sys', '任务达到最大轮数后停止');
+  else if (outcome === 'limit') addMessage('sys', '任务已达到执行上限并停止');
   else if (outcome === 'stalled') addMessage('sys', '任务因连续重复或无进展而安全停止');
+  else if (outcome === 'unverified') addMessage('sys', '任务已结束，但仍有操作未获成功确认，请核对页面状态');
   void refreshModels().catch(() => {});
 }
 
@@ -471,10 +609,14 @@ async function handleModelRequest(context, message) {
     } : undefined;
     const text = await globalThis.ViasCore.callModel(message.cfg, message.messages, {
       signal: controller.signal, timeoutMs: policy.timeoutMs, totalTimeoutMs: policy.totalTimeoutMs, retries: policy.retries, beforeAttempt,
+      maxReplyLength: message.replyLimit,
     });
     if (!context.finished && !context.stopRequested && activeRun === context) context.port.postMessage({ t: 'model_response', runId: context.runId, requestId: message.requestId, text });
   } catch (error) {
-    if (!context.finished && !context.stopRequested && activeRun === context) context.port.postMessage({ t: 'model_response', runId: context.runId, requestId: message.requestId, error: error.name === 'AbortError' ? '模型请求已取消' : error.message });
+    if (!context.finished && !context.stopRequested && activeRun === context) {
+      const code = error.code === 'UNSUPPORTED_TOOL_PROTOCOL' ? { code: 'UNSUPPORTED_TOOL_PROTOCOL' } : {};
+      context.port.postMessage({ t: 'model_response', runId: context.runId, requestId: message.requestId, error: error.name === 'AbortError' ? '模型请求已取消' : error.message, ...code });
+    }
   } finally {
     context.modelControllers.delete(message.requestId);
   }
@@ -484,6 +626,7 @@ function stopRun() {
   const context = activeRun;
   if (!context || context.stopRequested) return;
   context.stopRequested = true;
+  settlePendingTools(context, 'CANCELLED');
   setStatus('正在安全停止…');
   for (const controller of context.modelControllers.values()) controller.abort();
   if (context.port) {
@@ -495,15 +638,22 @@ function stopRun() {
 }
 
 async function send() {
-  const question = inputEl.value.trim();
-  if (!question || activeRun) return;
+  const question = inputEl.value;
+  if (!question.trim() || activeRun) return;
+  if (question.length > TEXT_LIMITS.question) {
+    addMessage('sys', `任务不能超过 ${TEXT_LIMITS.question} 个 UTF-16 代码单元，未发送且输入已保留；请拆分任务`);
+    return;
+  }
   if (!initialized) { addMessage('sys', '侧边栏尚未初始化成功，请关闭后重新打开侧边栏'); return; }
   const context = {
     runId: crypto.randomUUID(),
     port: null,
     heartbeat: null,
     modelControllers: new Map(),
+    toolsByOperation: new Map(),
     toolsByRound: new Map(),
+    operations: new Map(),
+    pendingTools: new Set(),
     finished: false,
     stopRequested: false,
   };
@@ -529,21 +679,31 @@ async function send() {
       if (message.runId && message.runId !== context.runId) return;
       if (activeRun !== context || context.finished) return;
       if (message.t === 'status') setStatus(message.text);
-      else if (message.t === 'say') {
+      else if (message.t === 'notice') {
+        if (!context.stopRequested) addMessage('sys', toolText(message.text, 300));
+      } else if (message.t === 'say') {
+        if (context.stopRequested || globalThis.ViasCore.isInternalToolText(message.text)) return;
         addMessage('ai', message.text);
         history.push({ role: 'assistant', content: message.text });
         void persist();
       } else if (message.t === 'actions') {
-        context.toolsByRound.set(message.round, addTools(message.round, message.actions || []));
+        if (context.stopRequested) return;
+        const operationId = typeof message.operationId === 'string' && message.operationId ? message.operationId : null;
+        if (operationId && context.toolsByOperation.has(operationId)) return;
+        const slots = addTools(message.round, Array.isArray(message.actions) ? message.actions : [], message.title);
+        if (operationId) context.toolsByOperation.set(operationId, slots);
+        else context.toolsByRound.set(message.round, slots);
+        context.operations.set(operationId || `round-${context.operations.size + 1}`, {
+          actions: Array.isArray(message.actions) ? message.actions : [],
+          results: new Map(),
+        });
+        for (const slot of slots) context.pendingTools.add(slot);
       } else if (message.t === 'result') {
-        const slot = context.toolsByRound.get(message.round)?.[message.index];
-        if (slot) {
-          slot.row.classList.remove('pending');
-          slot.row.classList.add(message.ok ? 'ok' : 'fail');
-          slot.state.textContent = message.ok ? (message.state?.replace('当前值=', '') || '完成') : '失败';
-          slot.reason.hidden = message.ok;
-          slot.reason.textContent = message.ok ? '' : (Object.hasOwn(ACTION_FAILURES, message.code) ? ACTION_FAILURES[message.code] : '操作未完成，请检查页面状态后重试。');
-        }
+        // A known operation is authoritative; an unknown ID must never fall back to a different legacy block.
+        const slots = message.operationId ? context.toolsByOperation.get(message.operationId) : context.toolsByRound.get(message.round);
+        if (Number.isSafeInteger(message.index) && message.index >= 0) updateTool(context, slots?.[message.index], message);
+        const entry = message.operationId ? context.operations.get(message.operationId) : [...context.operations.values()].at(-1);
+        if (entry && Number.isSafeInteger(message.index) && message.index >= 0) entry.results.set(message.index, message);
       } else if (message.t === 'model_request') {
         void handleModelRequest(context, message);
       } else if (message.t === 'model_cancel') {
@@ -561,10 +721,10 @@ async function send() {
     context.heartbeat = setInterval(() => {
       try { port.postMessage({ t: 'ping', runId: context.runId }); } catch {}
     }, 15000);
-    const conversation = boundedHistory(history.slice(0, -1));
-    // 会话窗口取「提问前最近 100 条」，快照取「含当前提问最近 100 条」；裁剪须在两者都构造完之后
-    if (history.length > 100) history.splice(0, history.length - 100);
-    port.postMessage({ t: 'RUN', runId: context.runId, tabId: tab.id, question, allowActions, maxSteps: allowActions ? 50 : 1, history: conversation });
+    const conversation = boundedHistory(history.slice(0, -1), showHistoryOmission);
+    // 会话窗口取「提问前最近 100 条」，快照取「含当前提问最近 100 条」；构造完后仅按完整条目裁剪内存。
+    history = boundedHistory(history, showHistoryOmission);
+    port.postMessage({ t: 'RUN', runId: context.runId, tabId: tab.id, question, allowActions, maxSteps: allowActions ? 100 : 1, history: conversation, priorRun: lastRunJournal });
   } catch (error) {
     finishRun(context, 'interrupted', error.message);
   }
@@ -576,15 +736,15 @@ formEl.addEventListener('submit', (event) => {
   else void send();
 });
 inputEl.addEventListener('keydown', (event) => {
-  if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); if (activeRun) stopRun(); else void send(); }
+  if (event.key === 'Enter' && !event.isComposing) { event.preventDefault(); if (activeRun) stopRun(); else void send(); }
 });
 
 function autosize() {
   inputEl.style.height = '0px';
   const height = inputEl.scrollHeight;
   if (height > 48) {
-    inputEl.style.height = `${Math.min(height, 132) - 16}px`;
-    inputEl.style.overflowY = height > 132 ? 'auto' : 'hidden';
+    inputEl.style.height = `${Math.min(height, 154) - 22}px`;
+    inputEl.style.overflowY = height > 154 ? 'auto' : 'hidden';
   } else {
     inputEl.style.height = '22px';
     inputEl.style.overflowY = 'hidden';
@@ -611,7 +771,6 @@ chrome.storage.onChanged.addListener((_changes, area) => {
     let current = await refreshModels();
     if (current === null) current = await refreshModels();
     if (!current) addMessage('sys', '尚未配置模型：点击上方「＋ 配置模型」添加 API 地址、Key 和模型名。');
-    if (!chatEl.children.length) addMessage('sys', 'Vias 已就绪\n「执行」可操作当前页面，「问答」只读取页面。复杂任务会持续观察并自动执行页面操作（已开启完全访问权限，全部自动允许）。');
     initialized = true;
   } catch (error) {
     addMessage('sys', `初始化失败：${error.message}`);

@@ -1490,3 +1490,577 @@ test('选择器语法错误仍返回 INVALID_SELECTOR，不与导航/取消的�
     assert.equal(await page.evaluate(() => window.fixtureCounts.button), 0);
   });
 });
+
+for (const shadow of [false, true]) {
+  test(`可靠性 signature 反映 ARIA 状态和连续点击进展${shadow ? '（open Shadow DOM）' : ''}`, { timeout: 30000 }, async () => {
+    await withFixture(async (page) => {
+      await page.evaluate((useShadow) => {
+        document.body.innerHTML = '<div id="semantic-host"></div>';
+        const host = document.querySelector('#semantic-host');
+        const root = useShadow ? host.attachShadow({ mode: 'open' }) : host;
+        root.innerHTML = '<div id="aria-choice" role="checkbox" tabindex="0" aria-checked="false">ARIA choice</div>'
+          + ['selected', 'expanded', 'pressed', 'valuenow', 'valuetext'].map((name) => `<button id="state-${name}" aria-${name}="${name.startsWith('value') ? '1' : 'false'}">${name}</button>`).join('');
+        root.querySelector('#aria-choice').addEventListener('click', (event) => {
+          event.currentTarget.setAttribute('aria-checked', String(event.currentTarget.getAttribute('aria-checked') !== 'true'));
+        });
+        for (const name of ['selected', 'expanded', 'pressed', 'valuenow', 'valuetext']) root.querySelector(`#state-${name}`).addEventListener('click', (event) => {
+          event.currentTarget.setAttribute(`aria-${name}`, name.startsWith('value') ? '2' : 'true');
+        });
+      }, shadow);
+      let snap = await extract(page);
+      for (let index = 0; index < 4; index++) {
+        const response = await execute(page, snap, `op-aria-${shadow}-${index}`, [{ action: 'click', selector: '#aria-choice' }]);
+        assert.equal(response.results[0].ok, true, JSON.stringify(response));
+        assert.equal(await page.evaluate(() => {
+          const host = document.querySelector('#semantic-host');
+          return (host.shadowRoot || host).querySelector('#aria-choice').getAttribute('aria-checked');
+        }), String(index % 2 === 0));
+        assert.notEqual(response.page.signature, snap.signature, '每次真实翻转都必须算进展');
+        snap = response.page;
+      }
+      for (const name of ['selected', 'expanded', 'pressed', 'valuenow', 'valuetext']) {
+        const response = await execute(page, snap, `op-aria-${shadow}-${name}`, [{ action: 'click', selector: `#state-${name}` }]);
+        assert.equal(response.results[0].ok, true);
+        assert.notEqual(response.page.signature, snap.signature, `aria-${name} 状态改变必须改变签名`);
+        assert.equal(await page.evaluate((attribute) => {
+          const host = document.querySelector('#semantic-host');
+          return (host.shadowRoot || host).querySelector(`#state-${attribute}`).getAttribute(`aria-${attribute}`);
+        }, name), name.startsWith('value') ? '2' : 'true');
+        snap = response.page;
+      }
+    });
+  });
+}
+
+test('可靠性 signature 忽略动画属性和计时器，保留正文及原生多选变化', { timeout: 30000 }, async () => {
+  await withFixture(async (page) => {
+    await page.evaluate(() => {
+      document.body.innerHTML = '<div id="animation">Stable</div><span role="timer">剩余 30 秒</span><span id="clock">12:30:01</span><p id="message">Pending</p>'
+        + '<label><input id="hidden-choice" style="display:none" type="checkbox">Hidden native choice</label>'
+        + '<select id="multiple" multiple><option selected>A</option><option>B</option><option>C</option></select>';
+    });
+    const before = await extract(page);
+    await page.evaluate(() => {
+      document.querySelector('[role="timer"]').textContent = '剩余 29 秒';
+      document.querySelector('#clock').textContent = '12:30:02';
+      document.querySelector('#animation').setAttribute('style', 'transform:translateX(1px)');
+      document.querySelector('#animation').dataset.timestamp = String(Date.now());
+    });
+    const jitter = await extract(page);
+    assert.equal(jitter.signature, before.signature, '无关时间/动画抖动不算任务进展');
+    await page.evaluate(() => { document.querySelector('#message').textContent = 'Completed'; });
+    const changed = await extract(page);
+    assert.notEqual(changed.signature, jitter.signature, '普通正文变化仍算进展');
+    await page.evaluate(() => { document.querySelector('#multiple').options[2].selected = true; });
+    const selected = await extract(page);
+    assert.notEqual(selected.signature, changed.signature, '首个value/index不变时其他多选项也应进入签名');
+    assert.deepEqual(await page.locator('#multiple').evaluate((el) => [...el.selectedOptions].map((option) => option.text)), ['A', 'C']);
+    await page.evaluate(() => { document.querySelector('#hidden-choice').checked = true; });
+    assert.notEqual((await extract(page)).signature, selected.signature, '可见label关联的隐藏原生控件状态也应纳入');
+  });
+});
+
+async function pressAndRead(page, snap, operationId, key, selector = '#name') {
+  const response = await execute(page, snap, operationId, [{ action: 'press', ...(selector ? { selector } : {}), value: key }]);
+  const state = await page.evaluate((targetSelector) => {
+    let el = targetSelector ? document.querySelector(targetSelector) : document.activeElement;
+    while (el?.shadowRoot?.activeElement) el = el.shadowRoot.activeElement;
+    return { value: el.value, start: el.selectionStart, end: el.selectionEnd, direction: el.selectionDirection };
+  }, selector);
+  return { response, state };
+}
+
+test('可靠性 press Backspace/Delete 真正删除当前选区和完整 Unicode 字符', { timeout: 30000 }, async () => {
+  await withFixture(async (page) => {
+    let snap = await extract(page);
+    const cases = [
+      ['abc', 3, 3, 'Backspace', 'ab', 2],
+      ['abc', 1, 1, 'Delete', 'ac', 1],
+      ['abcdef', 1, 4, 'Backspace', 'aef', 1],
+      ['abcdef', 1, 4, 'Delete', 'aef', 1],
+      ['a👨‍👩‍👧‍👦e\u0301', 14, 14, 'Backspace', 'a👨‍👩‍👧‍👦', 12],
+      ['a👨‍👩‍👧‍👦', 12, 12, 'Backspace', 'a', 1],
+    ];
+    for (const [index, [value, start, end, key, expected, caret]] of cases.entries()) {
+      await page.locator('#name').evaluate((el, state) => { el.value = state.value; el.setSelectionRange(state.start, state.end); }, { value, start, end });
+      const { response, state } = await pressAndRead(page, snap, `op-delete-${index}`, key);
+      assert.equal(response.results[0].ok, true, JSON.stringify(response));
+      assert.deepEqual({ value: state.value, start: state.start, end: state.end }, { value: expected, start: caret, end: caret });
+      snap = response.page;
+    }
+    assert.equal(await page.evaluate(() => window.fixtureCounts.nameInput), cases.length, '每次删除都应产生真实input通知');
+  });
+});
+
+test('可靠性 press 全选、左右方向、Shift 选区和输入均核对实际选区', { timeout: 30000 }, async () => {
+  await withFixture(async (page) => {
+    await page.locator('#name').evaluate((el) => { el.value = 'abcd'; el.setSelectionRange(2, 2); });
+    let snap = await extract(page);
+    const cases = [
+      ['ArrowLeft', 'abcd', 1, 1], ['Shift+ArrowRight', 'abcd', 1, 2],
+      ['Shift+ArrowRight', 'abcd', 1, 3], ['x', 'axd', 2, 2],
+      ['Home', 'axd', 0, 0], ['Shift+End', 'axd', 0, 3],
+      ['ArrowLeft', 'axd', 0, 0], ['Control+A', 'axd', 0, 3],
+      ['ArrowRight', 'axd', 3, 3], ['Shift+ArrowLeft', 'axd', 2, 3],
+      ['Backspace', 'ax', 2, 2], ['Meta+A', 'ax', 0, 2],
+    ];
+    for (const [index, [key, value, start, end]] of cases.entries()) {
+      const { response, state } = await pressAndRead(page, snap, `op-selection-${index}`, key);
+      assert.equal(response.results[0].ok, true, `${key}: ${JSON.stringify(response)}`);
+      assert.deepEqual({ value: state.value, start: state.start, end: state.end }, { value, start, end }, key);
+      if (key === 'Shift+ArrowLeft') assert.equal(state.direction, 'backward');
+      snap = response.page;
+    }
+  });
+});
+
+test('可靠性 press textarea Enter 替换选区并换行，普通 Enter 保留提交事件', { timeout: 30000 }, async () => {
+  await withFixture(async (page) => {
+    await page.locator('#notes').evaluate((el) => { el.value = 'abcDEF'; el.setSelectionRange(3, 6); });
+    let snap = await extract(page);
+    const newline = await pressAndRead(page, snap, 'op-selection-newline', 'Enter', '#notes');
+    assert.equal(newline.response.results[0].ok, true);
+    assert.deepEqual({ value: newline.state.value, start: newline.state.start, end: newline.state.end }, { value: 'abc\n', start: 4, end: 4 });
+    assert.equal(await page.evaluate(() => window.fixtureCounts.formSubmit), 0);
+    await page.evaluate(() => {
+      document.querySelector('#note-form').insertAdjacentHTML('beforeend', '<input id="enter-field" aria-label="Enter field">');
+      window.pressTrust = [];
+      document.querySelector('#enter-field').addEventListener('keydown', (event) => window.pressTrust.push(event.isTrusted));
+    });
+    snap = await extract(page);
+    const submit = await execute(page, snap, 'op-real-enter-submit', [{ action: 'press', selector: '#enter-field', value: 'Enter' }]);
+    assert.equal(submit.results[0].ok, true);
+    assert.equal(await page.evaluate(() => window.fixtureCounts.formSubmit), 1);
+    assert.deepEqual(await page.evaluate(() => window.pressTrust), [false], '不得伪造isTrusted');
+  });
+});
+
+test('可靠性 press custom ArrowDown/Escape 仅在真实语义变化后成功', { timeout: 30000 }, async () => {
+  await withFixture(async (page) => {
+    await page.evaluate(() => {
+      document.body.innerHTML = '<div role="listbox"><div id="first-option" role="option" tabindex="0" aria-selected="true">First</div><div id="next-option" role="option" aria-selected="false">Next</div></div><button id="menu-toggle" aria-expanded="true">Menu</button><div id="menu">Menu content</div>';
+      document.querySelector('#first-option').addEventListener('keydown', (event) => {
+        if (event.key !== 'ArrowDown') return;
+        event.preventDefault();
+        event.currentTarget.setAttribute('aria-selected', 'false');
+        document.querySelector('#next-option').setAttribute('aria-selected', 'true');
+      });
+      document.querySelector('#menu-toggle').addEventListener('keydown', (event) => {
+        if (event.key !== 'Escape') return;
+        event.currentTarget.setAttribute('aria-expanded', 'false');
+        document.querySelector('#menu').hidden = true;
+      });
+    });
+    let snap = await extract(page);
+    const down = await execute(page, snap, 'op-custom-down', [{ action: 'press', selector: '#first-option', value: 'ArrowDown' }]);
+    assert.equal(down.results[0].ok, true, JSON.stringify(down));
+    assert.deepEqual(await page.locator('[role="option"]').evaluateAll((options) => options.map((option) => option.getAttribute('aria-selected'))), ['false', 'true']);
+    assert.notEqual(down.page.signature, snap.signature);
+    snap = down.page;
+    const escape = await execute(page, snap, 'op-custom-escape', [{ action: 'press', selector: '#menu-toggle', value: 'Escape' }]);
+    assert.equal(escape.results[0].ok, true);
+    assert.equal(await page.locator('#menu-toggle').getAttribute('aria-expanded'), 'false');
+    assert.equal(await page.locator('#menu').isVisible(), false);
+    assert.notEqual(escape.page.signature, snap.signature);
+    const again = await execute(page, escape.page, 'op-custom-escape-no-effect', [{ action: 'press', selector: '#menu-toggle', value: 'Escape' }]);
+    assert.equal(again.results[0].ok, false);
+    assert.equal(again.results[0].code, 'UNSUPPORTED_KEY');
+  });
+});
+
+for (const mode of ['keydown', 'beforeinput', 'input-revert', 'keyup-revert', 'readonly', 'boundary', 'unknown', 'custom', 'richtext']) {
+  test(`可靠性 press 不假成功：${mode}`, { timeout: 30000 }, async () => {
+    await withFixture(async (page) => {
+      await page.evaluate((failureMode) => {
+        document.body.innerHTML = '<input id="name" value="abc"><div id="custom" role="textbox" tabindex="0">abc</div><div id="rich" contenteditable="true">abc</div>';
+        const el = document.querySelector('#name');
+        el.setSelectionRange(failureMode === 'boundary' ? 0 : 3, failureMode === 'boundary' ? 0 : 3);
+        if (failureMode === 'readonly') el.readOnly = true;
+        if (['keydown', 'beforeinput'].includes(failureMode)) el.addEventListener(failureMode, (event) => event.preventDefault());
+        if (failureMode.endsWith('-revert')) el.addEventListener(failureMode.split('-')[0], () => { el.value = 'abc'; el.setSelectionRange(3, 3); });
+      }, mode);
+      const snap = await extract(page);
+      const selector = mode === 'custom' ? '#custom' : mode === 'richtext' ? '#rich' : '#name';
+      const key = mode === 'unknown' ? 'F4' : 'Backspace';
+      const response = await execute(page, snap, `op-no-effect-${mode}`, [{ action: 'press', selector, value: key }]);
+      assert.equal(response.results[0].ok, false, JSON.stringify(response));
+      assert.equal(response.results[0].code, mode === 'readonly' ? 'READ_ONLY' : ['unknown', 'custom', 'richtext'].includes(mode) ? 'UNSUPPORTED_KEY' : 'NO_EFFECT');
+      assert.equal(await page.locator(selector).evaluate((el) => el.value ?? el.textContent), 'abc');
+    });
+  });
+}
+
+for (const phase of ['keydown', 'beforeinput']) {
+  test(`可靠性 press ${phase} 复用目标返回 STALE_TARGET 且不写入`, { timeout: 30000 }, async () => {
+    await withFixture(async (page) => {
+      await page.locator('#name').evaluate((el, eventName) => {
+        el.value = 'abc'; el.setSelectionRange(3, 3);
+        el.addEventListener(eventName, () => el.setAttribute('aria-label', 'Reused field'), { once: true });
+      }, phase);
+      const snap = await extract(page);
+      const response = await execute(page, snap, `op-key-race-${phase}`, [{ action: 'press', selector: '#name', value: 'Backspace' }]);
+      assert.equal(response.results[0].code, 'STALE_TARGET');
+      assert.equal(await page.locator('#name').inputValue(), 'abc');
+    });
+  });
+}
+
+test('可靠性 press beforeinput 中取消任务不得继续写字段', { timeout: 30000 }, async () => {
+  await withFixture(async (page) => {
+    await page.locator('#name').evaluate((el) => {
+      el.value = 'abc'; el.setSelectionRange(3, 3);
+      el.addEventListener('beforeinput', () => globalThis.__viasContentListener({ type: 'ABORT', runId: 'run-e2e' }, {}, () => {}), { once: true });
+    });
+    const snap = await extract(page);
+    const response = await execute(page, snap, 'op-key-abort', [{ action: 'press', selector: '#name', value: 'Backspace' }]);
+    assert.equal(response.results[0].code, 'CANCELLED');
+    assert.equal(await page.locator('#name').inputValue(), 'abc');
+  });
+});
+
+test('可靠性 press 隐式焦点进入 open Shadow DOM，Tab 可验证双向切换', { timeout: 30000 }, async () => {
+  await withFixture(async (page) => {
+    await page.evaluate(() => {
+      document.body.innerHTML = '<div id="host"></div><input id="after" value="after">';
+      const shadow = document.querySelector('#host').attachShadow({ mode: 'open' });
+      shadow.innerHTML = '<input id="shadow-edit" value="abc">';
+      shadow.querySelector('input').focus();
+      shadow.querySelector('input').setSelectionRange(3, 3);
+    });
+    let snap = await extract(page);
+    const deletion = await pressAndRead(page, snap, 'op-shadow-key', 'Backspace', null);
+    assert.equal(deletion.response.results[0].ok, true);
+    assert.equal(deletion.state.value, 'ab');
+    assert.equal(deletion.state.start, 2);
+    snap = deletion.response.page;
+    const tab = await execute(page, snap, 'op-shadow-tab', [{ action: 'press', value: 'Tab' }]);
+    assert.equal(tab.results[0].ok, true);
+    assert.equal(await page.evaluate(() => document.activeElement.id), 'after');
+    const back = await execute(page, tab.page, 'op-shadow-shift-tab', [{ action: 'press', value: 'Shift+Tab' }]);
+    assert.equal(back.results[0].ok, true);
+    assert.equal(await page.evaluate(() => document.querySelector('#host').shadowRoot.activeElement.id), 'shadow-edit');
+  });
+});
+
+test('可靠性 submitForm novalidate/formnovalidate 跳过原生约束，正常 required 仍拦截', { timeout: 30000 }, async () => {
+  await withFixture(async (page) => {
+    await page.evaluate(() => {
+      document.body.innerHTML = '<form id="validation"><input id="required-field" required><button id="normal-submit">Normal submit</button><button id="skip-submit" formnovalidate>Skip validation</button><button id="not-submitter" type="button" formnovalidate>Plain button</button></form>';
+      window.validationEvents = { submits: [], invalid: 0 };
+      document.querySelector('form').addEventListener('submit', (event) => { event.preventDefault(); window.validationEvents.submits.push(event.submitter?.id || null); });
+      document.querySelector('input').addEventListener('invalid', () => window.validationEvents.invalid++);
+    });
+    let snap = await extract(page);
+    for (const [index, selector] of ['#normal-submit', '#not-submitter'].entries()) {
+      const response = await execute(page, snap, `op-validation-block-${index}`, [{ action: 'submitForm', selector }]);
+      assert.equal(response.results[0].code, 'FORM_INVALID');
+      assert.deepEqual(await page.evaluate(() => window.validationEvents.submits), []);
+      snap = response.page;
+    }
+    const bypass = await execute(page, snap, 'op-formnovalidate-submit', [{ action: 'submitForm', selector: '#skip-submit' }]);
+    assert.equal(bypass.results[0].ok, true);
+    assert.deepEqual(await page.evaluate(() => window.validationEvents), { submits: ['skip-submit'], invalid: 2 });
+    await page.evaluate(() => { document.querySelector('form').noValidate = true; });
+    snap = await extract(page);
+    const noValidate = await execute(page, snap, 'op-novalidate-submit', [{ action: 'submitForm', selector: '#normal-submit' }]);
+    assert.equal(noValidate.results[0].ok, true);
+    assert.deepEqual(await page.evaluate(() => window.validationEvents), { submits: ['skip-submit', 'normal-submit'], invalid: 2 });
+    await page.evaluate(() => { document.querySelector('form').noValidate = false; document.querySelector('input').value = 'valid'; });
+    snap = await extract(page);
+    const valid = await execute(page, snap, 'op-required-valid-submit', [{ action: 'submitForm', selector: '#normal-submit' }]);
+    assert.equal(valid.results[0].ok, true);
+    assert.deepEqual(await page.evaluate(() => window.validationEvents.submits), ['skip-submit', 'normal-submit', 'normal-submit']);
+  });
+});
+
+test('可靠性 repeat 末轮首项失败保留之前成功计数及有界历史', { timeout: 30000 }, async () => {
+  await withFixture(async (page) => {
+    await page.evaluate(() => {
+      document.body.innerHTML = '<button id="repeat-button">Repeat target</button>';
+      window.repeatClicks = 0;
+      document.querySelector('button').addEventListener('click', (event) => { if (++window.repeatClicks === 2) event.currentTarget.disabled = true; });
+    });
+    const snap = await extract(page);
+    const response = await execute(page, snap, 'op-repeat-partial-history', [{ action: 'repeat', times: 4, value: 0, actions: [{ action: 'click', selector: '#repeat-button' }, { action: 'wait', value: 0 }] }]);
+    const result = response.results[0];
+    assert.equal(result.ok, false);
+    assert.equal(result.code, 'TARGET_DISABLED');
+    assert.equal(await page.evaluate(() => window.repeatClicks), 2);
+    assert.deepEqual(result.repeatSummary, { plannedIterations: 4, completedIterations: 2, iteration: 3, subIndex: 1, successCount: 4, failureCount: 1, skippedCount: 3, omittedCount: 0 });
+    assert.equal(result.results.length, 6);
+    assert.equal(result.results[4].iteration, 3);
+    assert.equal(result.results[4].subIndex, 1);
+    assert.equal(result.results[5].code, 'SKIPPED_AFTER_FAILURE');
+  });
+});
+
+for (const kind of ['fill', 'type', 'single', 'multiple']) {
+  for (const timing of ['sync', 'next-tick']) {
+    for (const mode of ['truncate', 'revert']) {
+      test(`可靠性值确认 ${kind} ${timing} ${mode} 失败且阻止同批提交`, { timeout: 30000 }, async () => {
+        await withFixture(async (page) => {
+          await page.evaluate(({ kind, timing, mode }) => {
+            document.body.innerHTML = `<form><label>Verified field${['single', 'multiple'].includes(kind)
+              ? `<select id="verified" ${kind === 'multiple' ? 'multiple' : ''}><option value="a" selected>A</option><option value="b">B</option><option value="c">C</option></select>`
+              : '<input id="verified" value="safe">'}</label><button type="submit">Local submit</button></form>`;
+            window.valueSubmits = 0;
+            document.querySelector('form').addEventListener('submit', (event) => { event.preventDefault(); window.valueSubmits++; });
+            document.querySelector('#verified').addEventListener('input', (event) => {
+              const apply = () => {
+                const el = event.target;
+                if (el.tagName === 'SELECT') [...el.options].forEach((option) => { option.selected = option.value === (mode === 'truncate' && kind === 'multiple' ? 'b' : 'a'); });
+                else el.value = mode === 'truncate' ? el.value.slice(0, 3) : 'safe';
+              };
+              if (timing === 'sync') apply(); else setTimeout(apply, 0);
+            });
+          }, { kind, timing, mode });
+          const snap = await extract(page);
+          const response = await execute(page, snap, `op-confirm-${kind}-${timing}-${mode}`, [
+            { action: ['single', 'multiple'].includes(kind) ? 'select' : kind, selector: '#verified', value: kind === 'multiple' ? ['b', 'c'] : kind === 'single' ? 'b' : 'requested-complete' },
+            { action: 'submitForm', selector: '#verified' },
+          ]);
+          assert.equal(response.results[0].ok, false);
+          assert.equal(response.results[0].code, 'VALUE_NOT_APPLIED', JSON.stringify(response));
+          assert.equal(response.results[1].code, 'SKIPPED_AFTER_FAILURE');
+          assert.equal(await page.evaluate(() => window.valueSubmits), 0);
+          assert.equal(Object.hasOwn(response.results[0], 'state'), false);
+        });
+      });
+    }
+  }
+}
+
+for (const eventName of ['change', 'blur']) {
+  test(`可靠性值确认 fill ${eventName} 下一tick回退不误成功`, { timeout: 30000 }, async () => {
+    await withFixture(async (page) => {
+      await page.locator('#name').evaluate((el, eventName) => el.addEventListener(eventName, () => setTimeout(() => { el.value = 'safe'; }, 0)), eventName);
+      const response = await execute(page, await extract(page), `op-late-${eventName}`, [{ action: 'fill', selector: '#name', value: 'complete' }]);
+      assert.equal(response.results[0].code, 'VALUE_NOT_APPLIED');
+    });
+  });
+}
+
+for (const kind of ['fill', 'type', 'single', 'multiple']) {
+  test(`可靠性值确认 ${kind} 敏感失败不泄漏请求值和实际值`, { timeout: 30000 }, async () => {
+    await withFixture(async (page) => {
+      await page.evaluate((kind) => {
+        document.body.innerHTML = ['single', 'multiple'].includes(kind)
+          ? `<select id="secret-field" autocomplete="one-time-code" ${kind === 'multiple' ? 'multiple' : ''}><option value="actual-secret" selected>Actual secret text</option><option value="requested-secret">Requested secret text</option><option value="other-secret">Other secret text</option></select>`
+          : '<input id="secret-field" type="password" value="actual-secret">';
+        const el = document.querySelector('#secret-field');
+        el.addEventListener('change', () => setTimeout(() => {
+          if (el.tagName === 'SELECT') [...el.options].forEach((option) => { option.selected = option.value === 'actual-secret'; });
+          else el.value = 'actual-secret';
+        }, 0));
+      }, kind);
+      const response = await execute(page, await extract(page), `op-secret-confirm-${kind}`, [{ action: ['single', 'multiple'].includes(kind) ? 'select' : kind, selector: '#secret-field', value: kind === 'multiple' ? ['requested-secret', 'other-secret'] : 'requested-secret' }]);
+      assert.equal(response.results[0].code, 'VALUE_NOT_APPLIED');
+      assert.doesNotMatch(JSON.stringify(response), /requested-secret|actual-secret|other-secret|Requested secret text|Actual secret text|Other secret text/);
+    });
+  });
+}
+
+for (const kind of ['input', 'textarea', 'richtext']) {
+  test(`可靠性值确认 fill ${kind} 200000代码单元全量保留`, { timeout: 30000 }, async () => {
+    await withFixture(async (page) => {
+      await page.evaluate((kind) => { document.body.innerHTML = kind === 'input' ? '<input id="large" aria-label="Large field">' : kind === 'textarea' ? '<textarea id="large" aria-label="Large field"></textarea>' : '<div id="large" contenteditable="true" aria-label="Large field"></div>'; }, kind);
+      const value = 'BEGIN中文🙂'.repeat(19999).padEnd(199996, 'z').slice(0, 199996) + 'TAIL';
+      assert.equal(value.length, 200000);
+      const response = await execute(page, await extract(page), `op-large-confirm-${kind}`, [{ action: 'fill', selector: '#large', value }]);
+      assert.equal(response.results[0].code, 'FILLED', JSON.stringify(response.results));
+      assert.deepEqual(await page.locator('#large').evaluate((el, value) => ({ length: (el.value ?? el.textContent).length, full: (el.value ?? el.textContent) === value }), value), { length: 200000, full: true });
+    });
+  });
+}
+
+for (const action of ['fill', 'type']) {
+  test(`可靠性值确认 ${action} 正常化换行、整字段替换及末尾光标`, { timeout: 30000 }, async () => {
+    await withFixture(async (page) => {
+      await page.locator('#notes').evaluate((el) => { el.value = 'old content'; el.setSelectionRange(1, 4); });
+      const response = await execute(page, await extract(page), `op-normalized-${action}`, [{ action, selector: '#notes', value: 'a\r\nb\rc\n🙂' }]);
+      assert.equal(response.results[0].ok, true, JSON.stringify(response));
+      assert.deepEqual(await page.locator('#notes').evaluate((el) => ({ value: el.value, start: el.selectionStart, end: el.selectionEnd })), { value: 'a\nb\nc\n🙂', start: 8, end: 8 });
+      await page.locator('#notes').evaluate((el) => el.setSelectionRange(1, 3, 'backward'));
+      const noChange = await execute(page, response.page, `op-normalized-no-change-${action}`, [{ action, selector: '#notes', value: 'a\r\nb\rc\n🙂' }]);
+      assert.equal(noChange.results[0].code, 'NO_CHANGE');
+      assert.deepEqual(await page.locator('#notes').evaluate((el) => [el.selectionStart, el.selectionEnd, el.selectionDirection]), [1, 3, 'backward']);
+    });
+  });
+
+  test(`可靠性值确认 ${action} maxlength及number/date拒值明确失败`, { timeout: 30000 }, async () => {
+    await withFixture(async (page) => {
+      await page.evaluate(() => { document.body.innerHTML = '<input id="limited" maxlength="3" value="old"><input id="numeric" type="number"><input id="date" type="date">'; });
+      for (const [index, selector] of ['#limited', '#numeric', '#date'].entries()) {
+        const response = await execute(page, await extract(page), `op-native-rejection-${action}-${index}`, [{ action, selector, value: 'not-accepted' }]);
+        assert.equal(response.results[0].code, 'VALUE_NOT_APPLIED', JSON.stringify(response));
+        assert.equal(await page.locator(selector).inputValue(), selector === '#limited' ? 'old' : '');
+      }
+    });
+  });
+
+  test(`可靠性值确认 ${action} 下一tick选区回退明确失败`, { timeout: 30000 }, async () => {
+    await withFixture(async (page) => {
+      await page.locator('#name').evaluate((el) => el.addEventListener('change', () => setTimeout(() => el.setSelectionRange(0, 0), 0)));
+      const response = await execute(page, await extract(page), `op-caret-rejection-${action}`, [{ action, selector: '#name', value: 'new text' }]);
+      assert.equal(response.results[0].code, 'VALUE_NOT_APPLIED');
+      assert.equal(await page.locator('#name').inputValue(), 'new text');
+    });
+  });
+}
+
+test('可靠性值确认 fill 接受email和本地日期时间的正常DOM规范化', { timeout: 30000 }, async () => {
+  await withFixture(async (page) => {
+    await page.evaluate(() => { document.body.innerHTML = '<input id="addresses" type="email" multiple><input id="local-time" type="datetime-local">'; });
+    for (const [index, [selector, value, expected]] of [
+      ['#addresses', ' a@example.com , b@example.com ', 'a@example.com,b@example.com'],
+      ['#local-time', '2026-11-12 10:30:00', '2026-11-12T10:30'],
+    ].entries()) {
+      const response = await execute(page, await extract(page), `op-dom-canonical-${index}`, [{ action: 'fill', selector, value }]);
+      assert.equal(await page.locator(selector).inputValue(), expected);
+      assert.equal(response.results[0].ok, true, JSON.stringify(response.results));
+    }
+  });
+});
+
+for (const multiple of [false, true]) {
+  test(`可靠性值确认 select ${multiple ? '多选' : '单选'} 按选项身份处理重复value`, { timeout: 30000 }, async () => {
+    await withFixture(async (page) => {
+      await page.evaluate((multiple) => { document.body.innerHTML = `<select id="duplicate" aria-label="Duplicate values" ${multiple ? 'multiple' : ''}><option value="same" selected>First</option><option value="same">Second</option><option value="third">Third</option></select>`; }, multiple);
+      const value = multiple ? ['Second', 'Third'] : 'Second';
+      const response = await execute(page, await extract(page), `op-duplicate-values-${multiple}`, [{ action: 'select', selector: '#duplicate', value }]);
+      assert.equal(response.results[0].code, 'SELECTED');
+      assert.deepEqual(await page.locator('#duplicate').evaluate((el) => [...el.selectedOptions].map((option) => option.index)), multiple ? [1, 2] : [1]);
+      const noChange = await execute(page, response.page, `op-duplicate-idempotent-${multiple}`, [{ action: 'select', selector: '#duplicate', value }]);
+      assert.equal(noChange.results[0].code, 'NO_CHANGE');
+    });
+  });
+}
+
+for (const kind of ['fill', 'type', 'single', 'multiple']) {
+  for (const timing of ['sync', 'next-tick']) {
+    test(`可靠性值确认 ${kind} ${timing} 最终输入后同身份重绘只读恢复`, { timeout: 30000 }, async () => {
+      await withFixture(async (page) => {
+        await page.evaluate(({ kind, timing }) => {
+          document.body.innerHTML = ['single', 'multiple'].includes(kind) ? `<select id="redraw" aria-label="Redraw field" ${kind === 'multiple' ? 'multiple' : ''}><option value="old" selected>Old</option><option value="done">Done</option><option value="other">Other</option></select>` : '<input id="redraw" aria-label="Redraw field">';
+          window.replacementInputs = 0;
+          const el = document.querySelector('#redraw');
+          el.addEventListener('input', () => {
+            if (el.value !== 'done') return;
+            const redraw = () => {
+              const replacement = el.cloneNode(true);
+              if (el.tagName === 'SELECT') [...replacement.options].forEach((option, index) => { option.selected = el.options[index].selected; });
+              else { replacement.value = el.value; replacement.setSelectionRange(el.selectionStart, el.selectionEnd); }
+              replacement.addEventListener('input', () => window.replacementInputs++);
+              el.replaceWith(replacement);
+            };
+            if (timing === 'sync') redraw(); else setTimeout(redraw, 0);
+          });
+        }, { kind, timing });
+        const response = await execute(page, await extract(page), `op-value-redraw-${kind}-${timing}`, [{ action: ['single', 'multiple'].includes(kind) ? 'select' : kind, selector: '#redraw', value: kind === 'multiple' ? ['done', 'other'] : 'done' }]);
+        assert.equal(response.results[0].ok, true, JSON.stringify(response));
+        assert.equal(await page.evaluate(() => window.replacementInputs), 0);
+      });
+    });
+  }
+}
+
+for (const kind of ['fill', 'type', 'select']) {
+  test(`可靠性值确认 ${kind} 稳定等待可取消且不提交`, { timeout: 30000 }, async () => {
+    await withFixture(async (page) => {
+      await page.evaluate((kind) => {
+        document.body.innerHTML = `<form>${kind === 'select' ? '<select id="abort-value"><option>A</option><option>B</option></select>' : '<input id="abort-value">'}<button>Submit</button></form>`;
+        window.valueSubmits = 0;
+        document.querySelector('form').addEventListener('submit', (event) => { event.preventDefault(); window.valueSubmits++; });
+        document.querySelector('#abort-value').addEventListener('change', () => setTimeout(() => globalThis.__viasContentListener({ type: 'ABORT', runId: 'run-e2e' }, {}, () => {}), 0));
+      }, kind);
+      const response = await execute(page, await extract(page), `op-value-abort-${kind}`, [{ action: kind, selector: '#abort-value', value: kind === 'select' ? 'B' : 'complete' }, { action: 'submitForm', selector: '#abort-value' }]);
+      assert.equal(response.results[0].code, 'CANCELLED');
+      assert.equal(response.results[1].code, 'SKIPPED_AFTER_FAILURE');
+      assert.equal(await page.evaluate(() => window.valueSubmits), 0);
+    });
+  });
+
+  test(`可靠性值确认 ${kind} 输入引发导航不误报失败且跳过提交`, { timeout: 30000 }, async () => {
+    await withFixture(async (page) => {
+      await page.evaluate((kind) => {
+        document.body.innerHTML = `<form>${kind === 'select' ? '<select id="navigation-value"><option>A</option><option>B</option></select>' : '<input id="navigation-value">'}<button>Submit</button></form>`;
+        window.valueSubmits = 0;
+        document.querySelector('form').addEventListener('submit', (event) => { event.preventDefault(); window.valueSubmits++; });
+        document.querySelector('#navigation-value').addEventListener('change', () => { location.hash = 'value-applied'; });
+      }, kind);
+      const response = await execute(page, await extract(page), `op-value-navigation-${kind}`, [{ action: kind, selector: '#navigation-value', value: kind === 'select' ? 'B' : 'complete' }, { action: 'submitForm', selector: '#navigation-value' }]);
+      assert.equal(response.results[0].code, 'NAVIGATED');
+      assert.equal(response.results[0].ok, true);
+      assert.equal(response.results[1].code, 'SKIPPED_AFTER_NAVIGATION');
+      assert.equal(response.page, undefined);
+      assert.equal(await page.evaluate(() => window.valueSubmits), 0);
+    });
+  });
+}
+
+test('可靠性值确认 repeat 失败立即停止后续提交和剩余轮次', { timeout: 30000 }, async () => {
+  await withFixture(async (page) => {
+    await page.evaluate(() => {
+      document.body.innerHTML = '<form><input id="repeat-value"><button>Submit</button></form>';
+      window.valueSubmits = 0;
+      document.querySelector('input').addEventListener('input', (event) => { event.target.value = 'safe'; });
+      document.querySelector('form').addEventListener('submit', (event) => { event.preventDefault(); window.valueSubmits++; });
+    });
+    const response = await execute(page, await extract(page), 'op-value-repeat-stop', [{ action: 'repeat', times: 3, value: 0, actions: [{ action: 'fill', selector: '#repeat-value', value: 'complete' }, { action: 'submitForm', selector: '#repeat-value' }] }]);
+    assert.equal(response.results[0].code, 'VALUE_NOT_APPLIED');
+    assert.equal(response.results[0].repeatSummary.failureCount, 1);
+    assert.equal(response.results[0].repeatSummary.skippedCount, 5);
+    assert.equal(await page.evaluate(() => window.valueSubmits), 0);
+  });
+});
+
+for (const mode of ['default', 'external-default', 'disabled-default', 'fieldset-disabled-default', 'no-default-single', 'no-default-multiple', 'click-prevented', 'keydown-prevented', 'formnovalidate', 'formaction']) {
+  test(`可靠性隐式提交 Enter 对照原生 submitter/FormData：${mode}`, { timeout: 30000 }, async () => {
+    await withFixture(async (page) => {
+      const setup = async () => page.evaluate((mode) => {
+        const noDefault = mode.startsWith('no-default');
+        const external = mode === 'external-default';
+        const button = `<button id="default-submit" ${external ? 'form="implicit"' : ''} name="operation" value="search" ${mode === 'disabled-default' ? 'disabled' : ''} ${mode === 'formnovalidate' ? 'formnovalidate' : ''} ${mode === 'formaction' ? 'formaction="/local-search" formmethod="post"' : ''}>Search</button>`;
+        document.body.innerHTML = `${external ? button : ''}<form id="implicit" action="/normal-search"><input id="implicit-field" name="query" value="lookup">${mode === 'no-default-multiple' ? '<input name="second" value="other">' : ''}${['formnovalidate', 'formaction'].includes(mode) ? '<input name="required" required>' : ''}${noDefault || external ? '' : mode === 'fieldset-disabled-default' ? `<fieldset disabled>${button}</fieldset>` : button}${noDefault ? '' : '<button id="second-submit" name="operation" value="wrong-second">Second</button>'}</form>`;
+        window.implicitEvents = [];
+        document.querySelector('form').addEventListener('submit', (event) => {
+          event.preventDefault();
+          window.implicitEvents.push({ submitter: event.submitter?.id || null, data: [...new FormData(event.target, event.submitter).entries()], action: event.submitter?.formAction || event.target.action, method: event.submitter?.formMethod || event.target.method });
+        });
+        document.querySelector('#default-submit')?.addEventListener('click', (event) => { if (mode === 'click-prevented') event.preventDefault(); });
+        document.querySelector('#implicit-field').addEventListener('keydown', (event) => { if (mode === 'keydown-prevented') event.preventDefault(); });
+        if (mode === 'formaction') document.querySelector('[name="required"]').value = 'valid';
+      }, mode);
+      await setup();
+      await page.locator('#implicit-field').press('Enter');
+      const native = await page.evaluate(() => window.implicitEvents);
+      await setup();
+      const response = await execute(page, await extract(page), `op-implicit-${mode}`, [{ action: 'press', selector: '#implicit-field', value: 'Enter' }]);
+      const actual = await page.evaluate(() => window.implicitEvents);
+      assert.deepEqual(actual, native, `必须与浏览器原生隐式提交一致：${mode}`);
+      assert.equal(response.results[0].ok, native.length > 0, JSON.stringify(response));
+      if (native.length) {
+        assert.equal(native[0].submitter, noDefaultMode(mode) ? null : 'default-submit');
+        assert.equal(native[0].data.some(([name, value]) => name === 'operation' && value === 'search'), !noDefaultMode(mode));
+      } else assert.equal(response.results[0].code, 'NO_EFFECT');
+    });
+  });
+}
+
+function noDefaultMode(mode) { return mode.startsWith('no-default'); }
+
+test('可靠性 repeat 200 个成功叶节点仅保留100条历史且不带参数或快照', { timeout: 30000 }, async () => {
+  await withFixture(async (page) => {
+    const snap = await extract(page);
+    const response = await execute(page, snap, 'op-repeat-history-limit', [{ action: 'repeat', times: 100, value: 0, actions: [{ action: 'wait', value: 0 }, { action: 'wait', value: 0 }] }]);
+    const result = response.results[0];
+    assert.equal(result.ok, true);
+    assert.equal(result.repeatSummary.successCount, 200);
+    assert.equal(result.repeatSummary.completedIterations, 100);
+    assert.equal(result.repeatSummary.omittedCount, 100);
+    assert.equal(result.repeatSummary.skippedCount, 0);
+    assert.equal(result.results.length, 100);
+    assert.equal(result.results[0].iteration, 51);
+    for (const child of result.results) assert.deepEqual(Object.keys(child).sort(), ['action', 'iteration', 'msg', 'ok', 'subIndex']);
+  });
+});

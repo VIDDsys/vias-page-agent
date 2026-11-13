@@ -149,11 +149,12 @@ async function screenshot(page, name) {
     await panel.setViewportSize({ width: 360, height: 850 });
     await panel.goto(url('sidepanel.html'));
     await readyPanel(panel);
+    await screenshot(panel, 'panel-empty-360-light');
 
     await check('6 模型 / 850px 视口 / 点击选择与焦点还原', async () => {
       await panel.locator('#modelPill').click();
       const bounds = await menuBounds(panel);
-      assert.ok(bounds.menu.bottom <= bounds.pill.top - 5, '底部菜单必须向上');
+      assert.ok(bounds.menu.top >= bounds.pill.bottom + 5, '顶部模型选择器应向下展开菜单');
       assert.equal(await panel.locator('#modelMenu button').count(), 7);
       assert.equal(await panel.evaluate(() => [...document.querySelectorAll('#modelMenu button')].every((button) => {
         const item = button.getBoundingClientRect();
@@ -561,9 +562,9 @@ async function screenshot(page, name) {
       await race.evaluate(() => { chrome.storage.session.set = window.__sessionSet; chrome.storage.session.remove = window.__sessionRemove; });
     });
 
-    await check('IPC/持久化统一最近 100 条、单条 20000 字；排队快照捕获 sessionKey', async () => {
+    await check('IPC/持久化保留最近 100 条完整长消息与Unicode尾部；排队快照捕获sessionKey', async () => {
       await race.evaluate(() => {
-        history = Array.from({ length: 125 }, (_, index) => ({ role: index % 2 ? 'assistant' : 'user', content: `${index}:` + 'x'.repeat(21000) }));
+        history = Array.from({ length: 125 }, (_, index) => ({ role: index % 2 ? 'assistant' : 'user', content: `${index}:` + 'x'.repeat(21000) + '😀完整尾标记' }));
         window.__oldKey = sessionKey;
         window.__releaseQueue = null;
         persistQueue = new Promise((resolve) => { window.__releaseQueue = resolve; });
@@ -571,7 +572,7 @@ async function screenshot(page, name) {
       await raceSend('最新问题');
       const ipc = await race.evaluate(() => window.__ports.at(-1).sent.find((message) => message.t === 'RUN').history);
       assert.equal(ipc.length, 100);
-      assert.ok(ipc.every((item) => item.content.length === 20000));
+      assert.ok(ipc.every((item) => item.content.length > 21000 && item.content.endsWith('😀完整尾标记')));
       assert.ok(ipc[0].content.startsWith('25:'));
       await race.evaluate(async () => {
         sessionKey = 'chat:ui-test-other-window';
@@ -584,7 +585,8 @@ async function screenshot(page, name) {
       assert.equal(stored[oldKey].length, 100);
       assert.ok(stored[oldKey][0].content.startsWith('26:'));
       assert.equal(stored[oldKey].at(-1).content, '最新问题');
-      assert.ok(stored[oldKey].every((item) => item.content.length <= 20000));
+      assert.ok(stored[oldKey].slice(0, -1).every((item) => item.content.endsWith('😀完整尾标记')));
+      assert.deepEqual(stored[oldKey].slice(0, -1), ipc.slice(1));
       await race.evaluate(() => { sessionKey = window.__oldKey; window.__ports.at(-1).deliver({ t: 'done' }); });
     });
 

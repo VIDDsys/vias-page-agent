@@ -171,7 +171,7 @@ test('Element UI 风格：opacity:0 隐藏 input 的 label 选项必须拿到编
   await page.close();
 });
 
-test('嵌套交互容器/label 不吞控件或重复映射，checked/value 变化不破坏同批多选', async () => {
+test('嵌套交互容器/label 不吞控件或重复映射，checked/无关渲染状态不破坏同批多选', async () => {
   const page = await openQuizPage();
   try {
     await page.evaluate(() => {
@@ -191,7 +191,8 @@ test('嵌套交互容器/label 不吞控件或重复映射，checked/value 变�
       extra.addEventListener('click', () => window.extraClicks++);
       container.insertAdjacentHTML('beforeend', '<label for="cA">Duplicate A label</label><input id="cE" type="checkbox"><label for="cE">External E label</label>');
       document.querySelector('#cA').addEventListener('change', () => {
-        document.querySelectorAll('input').forEach((input) => { input.value = `changed-${input.id}`; });
+        // checked/渲染提示是状态；checkbox.value 是提交值，变更后旧 ref 必须拒绝。
+        document.querySelectorAll('input').forEach((input) => { input.dataset.render = `changed-${input.id}`; });
       });
     });
     const snap = await send(page, { type: 'EXTRACT', runId: 'nested-run', maxLen: 16000 });

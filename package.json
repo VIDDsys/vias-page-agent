@@ -1,13 +1,13 @@
 {
   "name": "vias-page-agent",
-  "version": "0.14.0",
+  "version": "0.15.0",
   "private": true,
   "description": "Vias Edge MV3 page agent",
   "engines": { "node": ">=21" },
   "scripts": {
     "check": "node --check core.js && node --check background.js && node --check content.js && node --check sidepanel.js && node --check options.js && node --check main-world.js",
     "test": "node --test tests/*.test.js",
-    "test:e2e": "node tests/content.e2e.js",
+    "test:e2e": "node tests/content.e2e.js && node tests/content-targets.e2e.js",
     "test:extension": "node tests/extension.smoke.js",
     "test:agent": "node tests/agent.integration.js",
     "test:ui": "node tests/ui.e2e.js && node tests/ui-feedback.e2e.js",
