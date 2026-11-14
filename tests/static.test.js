@@ -605,12 +605,15 @@ test('core parseReply 修复字符串内裸换行/制表等控制字符而不改
 test('core parseReply 正确处理字符串内括号、转义引号和嵌套值', () => {
   const core = loadCore();
   const instruction = {
-    say: '文本 { } [ ] "引号" 和 \\，示例 {"done":true}',
-    actions: [{ action: 'fill', ref: 8, value: '字符串 } { \\"', data: { say: '嵌套不是指令', done: true } }],
+    say: '文本 { } [ ] "引号" 和 \\，普通括号不是指令',
+    actions: [{ action: 'fill', ref: 8, value: '字符串 } { \\" {"done":true}', data: { say: '嵌套不是指令', done: true } }],
   };
   for (const text of [JSON.stringify(instruction), `\`\`\`json\n${JSON.stringify(instruction)}\n\`\`\``]) {
-    assert.deepEqual(plain(core.parseReply(text)), { ...instruction, say: '文本 { } [ ] "引号" 和 \\，示例', done: false });
+    assert.deepEqual(plain(core.parseReply(text)), { ...instruction, done: false });
   }
+  // say 中夹带指令对象时整条不可信，不能删掉片段后继续执行同条动作。
+  const embedded = JSON.stringify({ ...instruction, say: '示例 {"done":true}' });
+  assert.deepEqual(plain(core.parseReply(embedded)), { say: '', actions: [], done: false, malformed: true });
 });
 
 test('core parseReply done 仅接受布尔 true，其他字段按契约规范化', () => {
@@ -642,7 +645,7 @@ test('core parseReply 不把数据容器中的嵌套示例或畸形 JSON 当指�
   }
 });
 
-test('core 将损坏协议与普通文字区分，过滤 say 内嵌指令', () => {
+test('core 将损坏协议与普通文字区分，say 内嵌指令整条拒绝', () => {
   const core = loadCore();
   for (const text of [
     '{"actions":[{"action":"click","ref":3}]',
@@ -660,7 +663,7 @@ test('core 将损坏协议与普通文字区分，过滤 say 内嵌指令', () =
   const example = '例如：\n```json\n{"actions":[{"action":"click","ref":1}]}\n```';
   assert.deepEqual(plain(core.parseReply(example)), { say: '', actions: [], done: false, malformed: true });
   const reply = JSON.stringify({ say: '先说明\n```json\n{"actions":[{"action":"click","ref":2}]}\n```\n继续说明', done: true, actions: [] });
-  assert.equal(core.parseReply(reply).say, '先说明\n\n继续说明');
+  assert.deepEqual(plain(core.parseReply(reply)), { say: '', actions: [], done: false, malformed: true });
   assert.equal(core.parseReply(JSON.stringify({ say: ' 普通说明 \n', done: true })).say, ' 普通说明 \n');
 });
 

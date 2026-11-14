@@ -342,21 +342,22 @@ test('真实MV3模型按当前快照分两批选择12题原生label/input，逐�
   }, '/batch-options');
 });
 
-test('真实侧栏隐藏损坏协议及 say 内嵌指令，修复后正常执行并保存', async () => {
+test('真实侧栏整条拒绝损坏及 say 内嵌指令，纠正后才执行并保存', async () => {
   reply = (n) => n === 1 ? '{"say":"BROKEN_UI_MARKER","actions":[{"action":"click","selector":"#work"}],}'
-    : n === 2 ? { say: '开始执行 {"actions":[{"action":"click","value":"EMBEDDED_UI_MARKER"}]}', actions: [{ action: 'click', selector: '#work' }] } : complete;
+    : n === 2 ? { say: '开始执行 {"actions":[{"action":"click","value":"EMBEDDED_UI_MARKER"}]}', actions: [{ action: 'click', selector: '#work' }] }
+      : n === 3 ? { say: '纠正后开始执行', actions: [{ action: 'click', selector: '#work' }] } : complete;
   await withPanel(async (panel, target) => {
     await send(panel, '点击 Do work 并汇报');
     await finished(panel);
-    assert.equal(await target.evaluate(() => window.clicks), 1);
-    assert.equal(requests.length, 3);
+    assert.equal(await target.evaluate(() => window.clicks), 1, '前两条损坏回复均不得执行同条动作，仅纠正后的第三条执行一次');
+    assert.equal(requests.length, 4);
     const displayed = await panel.locator('body').innerText();
     const stored = JSON.stringify(await panel.evaluate(() => chrome.storage.session.get(null)));
     for (const text of [displayed, stored, JSON.stringify(requests.slice(1))]) {
       assert.ok(!text.includes('BROKEN_UI_MARKER'));
       assert.ok(!text.includes('EMBEDDED_UI_MARKER'));
     }
-    assert.match(displayed, /开始执行/);
+    assert.match(displayed, /纠正后开始执行/);
     assert.match(displayed, /任务完成/);
   });
 });
@@ -589,6 +590,8 @@ test('慢导航截断旧页后续动作，等待新文档再交给模型', async
     assert.equal(await target.locator('body').innerText(), 'ARRIVED_NEW_PAGE');
     assert.match(JSON.stringify(requests[1].messages), /ARRIVED_NEW_PAGE/);
     assert.ok(!JSON.stringify(requests[1].messages).includes('OLD_DOCUMENT'));
+    assert.equal(await panel.locator('.tool-state').last().textContent(), '已跳过');
+    assert.equal(await panel.locator('.tool').last().evaluate((row) => row.classList.contains('fail')), false);
   }, '/navigate');
 });
 

@@ -1898,12 +1898,14 @@ for (const action of ['fill', 'type']) {
     });
   });
 
-  test(`可靠性值确认 ${action} 下一tick选区回退明确失败`, { timeout: 30000 }, async () => {
+  test(`可靠性值确认 ${action} 下一tick选区被页面重置仍以值保真为成功`, { timeout: 30000 }, async () => {
     await withFixture(async (page) => {
       await page.locator('#name').evaluate((el) => el.addEventListener('change', () => setTimeout(() => el.setSelectionRange(0, 0), 0)));
-      const response = await execute(page, await extract(page), `op-caret-rejection-${action}`, [{ action, selector: '#name', value: 'new text' }]);
-      assert.equal(response.results[0].code, 'VALUE_NOT_APPLIED');
-      assert.equal(await page.locator('#name').inputValue(), 'new text');
+      const response = await execute(page, await extract(page), `op-caret-reset-${action}`, [{ action, selector: '#name', value: 'new text' }]);
+      // 纯填写以值为成功依据：页面合法重置光标不是填写失败；press 的光标语义另有断言。
+      assert.equal(response.results[0].ok, true, JSON.stringify(response));
+      assert.notEqual(response.results[0].code, 'VALUE_NOT_APPLIED');
+      assert.deepEqual(await page.locator('#name').evaluate((el) => ({ value: el.value, start: el.selectionStart, end: el.selectionEnd })), { value: 'new text', start: 0, end: 0 });
     });
   });
 }
@@ -2062,5 +2064,320 @@ test('可靠性 repeat 200 个成功叶节点仅保留100条历史且不带参�
     assert.equal(result.results.length, 100);
     assert.equal(result.results[0].iteration, 51);
     for (const child of result.results) assert.deepEqual(Object.keys(child).sort(), ['action', 'iteration', 'msg', 'ok', 'subIndex']);
+  });
+});
+
+test('最终审查 select精确提交值优先于另一选项的显示文字', { timeout: 30000 }, async () => {
+  await withFixture(async (page) => {
+    await page.evaluate(() => { document.body.innerHTML = '<select aria-label="Country"><option value="original">Original</option><option value="wrong">CA</option><option value="CA">Canada</option></select>'; });
+    const snap = await extract(page);
+    const response = await execute(page, snap, 'op-value-before-label', [{ action: 'select', ref: refMatching(snap, /下拉框/), value: 'CA' }]);
+    assert.equal(response.results[0].code, 'SELECTED');
+    assert.equal(await page.locator('select').inputValue(), 'CA');
+    assert.equal(await page.locator('option:checked').textContent(), 'Canada');
+  });
+});
+
+for (const ambiguity of ['value', 'text', 'prefix']) {
+  test(`最终审查 select ${ambiguity}歧义拒绝且不改变当前选择`, { timeout: 30000 }, async () => {
+    await withFixture(async (page) => {
+      await page.evaluate((kind) => {
+        const options = kind === 'value' ? '<option value="same">First</option><option value="same">Second</option>'
+          : kind === 'text' ? '<option value="a">Duplicate</option><option value="b">Duplicate</option>'
+          : '<option value="a">Prefix one</option><option value="b">Prefix two</option>';
+        document.body.innerHTML = `<select aria-label="Ambiguous choice"><option value="original">Original</option>${options}</select>`;
+        window.selectionEvents = 0;
+        document.querySelector('select').addEventListener('input', () => window.selectionEvents++);
+      }, ambiguity);
+      const snap = await extract(page);
+      const response = await execute(page, snap, `op-ambiguous-${ambiguity}`, [{ action: 'select', ref: refMatching(snap, /下拉框/), value: { value: 'same', text: 'Duplicate', prefix: 'Prefix' }[ambiguity] }]);
+      assert.equal(response.results[0].ok, false);
+      assert.equal(response.results[0].code, 'OPTION_NOT_FOUND');
+      assert.equal(await page.locator('select').inputValue(), 'original');
+      assert.equal(await page.evaluate(() => window.selectionEvents), 0);
+    });
+  });
+}
+
+test('最终审查 select无同值时保留唯一文字和唯一前缀匹配', { timeout: 30000 }, async () => {
+  await withFixture(async (page) => {
+    await page.evaluate(() => { document.body.innerHTML = '<select aria-label="Choice"><option value="original">Original</option><option value="a">Alpha option</option><option value="b">Beta option</option></select>'; });
+    let snap = await extract(page);
+    for (const [index, value] of ['Alpha option', 'Beta'].entries()) {
+      const response = await execute(page, snap, `op-unique-text-${index}`, [{ action: 'select', ref: refMatching(snap, /下拉框/), value }]);
+      assert.equal(response.results[0].code, 'SELECTED');
+      assert.equal(await page.locator('select').inputValue(), index === 0 ? 'a' : 'b');
+      snap = response.page;
+    }
+  });
+});
+
+test('最终审查 type数字保留合法小数/负数/指数且重复值不发事件', { timeout: 30000 }, async () => {
+  await withFixture(async (page) => {
+    await page.evaluate(() => {
+      document.body.innerHTML = '<input type="number" aria-label="Amount" value="10">';
+      window.numberEvents = { input: 0, change: 0 };
+      for (const type of ['input', 'change']) document.querySelector('input').addEventListener(type, () => window.numberEvents[type]++);
+    });
+    let snap = await extract(page);
+    for (const [index, value] of ['12.3', '-12.3', '1e-3'].entries()) {
+      const response = await execute(page, snap, `op-numeric-complete-${index}`, [{ action: 'type', ref: refMatching(snap, /输入框\(number\)/), value }]);
+      assert.equal(response.results[0].ok, true, JSON.stringify(response));
+      assert.equal(await page.locator('input').inputValue(), value);
+      snap = response.page;
+    }
+    const repeated = await execute(page, snap, 'op-numeric-no-change', [{ action: 'type', ref: refMatching(snap, /输入框\(number\)/), value: '1e-3' }]);
+    assert.equal(repeated.results[0].code, 'NO_CHANGE');
+    assert.deepEqual(await page.evaluate(() => window.numberEvents), { input: 3, change: 3 });
+  });
+});
+
+test('最终审查 type数字仍核验异步回退并阻止后续提交', { timeout: 30000 }, async () => {
+  await withFixture(async (page) => {
+    await page.evaluate(() => {
+      document.body.innerHTML = '<form><input type="number" aria-label="Amount" value="10"><button>Submit</button></form>';
+      window.numberSubmits = 0;
+      document.querySelector('input').addEventListener('input', (event) => setTimeout(() => { event.target.value = '10'; }, 0));
+      document.querySelector('form').onsubmit = (event) => { event.preventDefault(); window.numberSubmits++; };
+    });
+    const snap = await extract(page);
+    const response = await execute(page, snap, 'op-numeric-reverted', [{ action: 'type', ref: refMatching(snap, /输入框\(number\)/), value: '12.3' }, { action: 'submitForm', selector: 'form' }]);
+    assert.equal(response.results[0].code, 'VALUE_NOT_APPLIED');
+    assert.equal(response.results[1].code, 'SKIPPED_AFTER_FAILURE');
+    assert.equal(await page.locator('input').inputValue(), '10');
+    assert.equal(await page.evaluate(() => window.numberSubmits), 0);
+  });
+});
+
+test('最终审查 多选快照与结果显示全部已选项和多选语义', { timeout: 30000 }, async () => {
+  await withFixture(async (page) => {
+    await page.evaluate(() => { document.body.innerHTML = '<select multiple aria-label="Fruits"><option value="a" selected>Apple</option><option value="b">Banana</option><option value="c" selected>Cherry</option></select>'; });
+    const snap = await extract(page);
+    const description = Object.values(snap.targets)[0];
+    assert.match(description.split('\n')[0], /Apple\(value=a\).*Cherry\(value=c\).*多选.*已选2项/);
+    const response = await execute(page, snap, 'op-multiple-observed', [{ action: 'select', ref: refMatching(snap, /下拉框/), value: ['a', 'b', 'c'] }]);
+    assert.match(response.results[0].state, /Apple\(value=a\).*Banana\(value=b\).*Cherry\(value=c\).*已选3项/);
+    assert.deepEqual(await page.locator('select').evaluate((el) => [...el.selectedOptions].map((option) => option.value)), ['a', 'b', 'c']);
+  });
+});
+
+test('最终审查 多选状态有界且省略明示，1000代码单元分段仍可登记完整目标', { timeout: 30000 }, async () => {
+  await withFixture(async (page) => {
+    await page.evaluate(() => { document.body.innerHTML = '<select multiple aria-label="Many choices">' + Array.from({ length: 60 }, (_, index) => `<option value="v${index}" selected>Option ${index}</option>`).join('') + '</select>'; });
+    const snap = await extract(page, { maxLen: 1000 });
+    assert.equal(Object.keys(snap.targets).length, 1);
+    assert.ok(snap.text.length <= 1000);
+    const title = Object.values(snap.targets)[0].split('\n')[0];
+    assert.ok(title.length < 600);
+    assert.match(title, /多选，已选60项，其余\d+项已省略/);
+    const response = await execute(page, snap, 'op-multiple-bounded', [{ action: 'select', ref: refMatching(snap, /下拉框/), value: ['v0'] }]);
+    assert.equal(response.results[0].code, 'SELECTED');
+    assert.match(response.results[0].state, /已选1项/);
+  });
+});
+
+for (const hidden of ['aria-hidden="true"', 'role="tooltip"', 'hidden']) {
+  test(`最终审查 display:contents仍过滤${hidden}且保留普通contents子控件`, { timeout: 30000 }, async () => {
+    await withFixture(async (page) => {
+      await page.evaluate((attribute) => {
+        document.body.innerHTML = `<div style="display:contents" ${attribute}><span>HIDDEN_CONTENTS_COPY</span><button>Hidden contents action</button></div><div style="display:contents"><span>Visible contents copy</span><button>Visible contents action</button></div>`;
+        window.contentsClicks = 0;
+        document.querySelectorAll('button')[1].onclick = () => window.contentsClicks++;
+      }, hidden);
+      const snap = await extract(page);
+      assert.doesNotMatch(JSON.stringify(snap), /HIDDEN_CONTENTS_COPY|Hidden contents action/);
+      assert.match(snap.text, /Visible contents copy/);
+      const response = await execute(page, snap, `op-contents-${hidden}`, [{ action: 'click', ref: refMatching(snap, /按钮「Visible contents action」/) }]);
+      assert.equal(response.results[0].ok, true);
+      assert.equal(await page.evaluate(() => window.contentsClicks), 1);
+    });
+  });
+}
+
+for (const skippedSubmit of [false, true]) {
+  test(`最终审查 批末导航保留真实失败${skippedSubmit ? '和跳过提交' : ''}并另报navigation`, { timeout: 30000 }, async () => {
+    await withFixture(async (page) => {
+      await page.evaluate(() => {
+        document.body.innerHTML = '<form><input aria-label="Reverted field"><button>Submit</button></form>';
+        window.finalObservationSubmits = 0;
+        window.finalObservationWrites = 0;
+        document.querySelector('form').onsubmit = (event) => { event.preventDefault(); window.finalObservationSubmits++; };
+        document.querySelector('input').oninput = (event) => {
+          window.finalObservationWrites++;
+          event.target.value = 'rollback';
+          setTimeout(() => { location.hash = 'final-observation-navigation'; }, 350);
+        };
+      });
+      const snap = await extract(page);
+      await page.clock.install();
+      const actions = [{ action: 'fill', ref: refMatching(snap, /输入框/), value: 'requested' }, ...(skippedSubmit ? [{ action: 'submitForm', ref: refMatching(snap, /按钮「Submit」/) }] : [])];
+      const operationId = `op-final-observation-${skippedSubmit}`;
+      await startClockBatch(page, snap, operationId, actions);
+      await page.clock.runFor(1000);
+      const response = await page.evaluate(() => window.clockResponse);
+      assert.equal(response.results[0].ok, false, JSON.stringify(response));
+      assert.equal(response.results[0].code, 'VALUE_NOT_APPLIED');
+      if (skippedSubmit) assert.equal(response.results[1].code, 'SKIPPED_AFTER_FAILURE');
+      assert.equal(response.results.length, actions.length);
+      assert.equal(response.results.filter((result) => result.ok).length, 0);
+      assert.equal(response.navigation.ok, true);
+      assert.equal(response.navigation.code, 'NAVIGATED');
+      assert.match(response.navigation.navigationUrl, /#final-observation-navigation$/);
+      assert.equal(Object.hasOwn(response, 'page'), false);
+      assert.equal(await page.evaluate(() => window.finalObservationSubmits), 0);
+      assert.deepEqual(await execute(page, snap, operationId, actions), response, '相同operationId必须保留批级导航且不重放');
+      assert.equal(await page.evaluate(() => window.finalObservationWrites), 1);
+    });
+  });
+}
+
+// —— 搜索/聊天框：联想词与选区抖动不再误判填写失败，真实回退/身份变化仍失败 ——
+test('填写触发同步联想并重置光标时 fill 仍成功且值完整', { timeout: 30000 }, async () => {
+  await withFixture(async (page) => {
+    await page.evaluate(() => {
+      document.body.innerHTML = '<form id="search-form"><textarea id="search-box" aria-label="搜索"></textarea><button id="go" type="submit">搜索</button><div id="sug"></div></form>';
+      window.searchEvents = { input: 0, submit: 0 };
+      document.querySelector('#search-form').addEventListener('submit', (event) => { event.preventDefault(); window.searchEvents.submit++; });
+      const box = document.querySelector('#search-box');
+      box.addEventListener('input', () => {
+        window.searchEvents.input++;
+        document.querySelector('#sug').textContent = '建议：' + box.value;
+        box.setSelectionRange(0, 0);
+      });
+      box.addEventListener('blur', () => { document.querySelector('#sug').textContent = ''; });
+    });
+    const snap = await extract(page);
+    const response = await execute(page, snap, 'op-search-fill-autocomplete', [{ action: 'fill', ref: refMatching(snap, /文本域/), value: '浏览器 自动化 测试' }]);
+    assert.equal(response.results[0].ok, true, JSON.stringify(response));
+    assert.equal(response.results[0].code, 'FILLED');
+    assert.equal(await page.locator('#search-box').inputValue(), '浏览器 自动化 测试');
+  });
+});
+
+test('type 联想逐字同步变化时输入完整文本，不只首字', { timeout: 30000 }, async () => {
+  await withFixture(async (page) => {
+    await page.evaluate(() => {
+      document.body.innerHTML = '<form><input id="type-box" aria-label="搜索"><button type="submit">搜索</button></form><div id="sug"></div>';
+      window.typeInputs = 0;
+      const box = document.querySelector('#type-box');
+      box.addEventListener('input', () => {
+        window.typeInputs++;
+        document.querySelector('#sug').textContent = '建议：' + box.value;
+      });
+    });
+    const snap = await extract(page);
+    const value = '测试查询';
+    const response = await execute(page, snap, 'op-search-type-autocomplete', [{ action: 'type', ref: refMatching(snap, /输入框/), value }]);
+    assert.equal(response.results[0].ok, true, JSON.stringify(response));
+    assert.equal(await page.locator('#type-box').inputValue(), value);
+    assert.equal(await page.evaluate(() => window.typeInputs), [...value].length, '每个字符都应真实输入并通知页面');
+  });
+});
+
+test('同批 fill 后联想出现仍能点击提交按钮且只提交一次', { timeout: 30000 }, async () => {
+  await withFixture(async (page) => {
+    await page.evaluate(() => {
+      document.body.innerHTML = '<form id="search-form"><input id="search-field" aria-label="搜索"><button id="search-go" type="submit">百度一下</button><div id="sug"></div></form>';
+      window.searchBatch = { click: 0, submit: 0 };
+      document.querySelector('#search-form').addEventListener('submit', (event) => { event.preventDefault(); window.searchBatch.submit++; });
+      document.querySelector('#search-go').addEventListener('click', () => window.searchBatch.click++);
+      document.querySelector('#search-field').addEventListener('input', (event) => {
+        document.querySelector('#sug').innerHTML = '<ul><li>' + event.target.value + ' 百科</li></ul>';
+      });
+    });
+    const snap = await extract(page);
+    const response = await execute(page, snap, 'op-search-batch-fill-click', [
+      { action: 'fill', ref: refMatching(snap, /输入框/), value: '测试查询' },
+      { action: 'click', ref: refMatching(snap, /按钮「百度一下」/) },
+    ]);
+    assert.ok(response.results.every((result) => result.ok), JSON.stringify(response));
+    assert.deepEqual(await page.evaluate(() => window.searchBatch), { click: 1, submit: 1 });
+    assert.equal(await page.locator('#search-field').inputValue(), '测试查询');
+  });
+});
+
+test('Enter 提交后页面改写内容仍报告成功，且不向已替换节点补发 keyup', { timeout: 30000 }, async () => {
+  await withFixture(async (page) => {
+    await page.evaluate(() => {
+      document.body.innerHTML = '<form id="enter-form"><input id="enter-box" aria-label="搜索" value="测试查询"><input id="enter-submit" type="submit" value="百度一下"></form><div id="results">旧结果</div>';
+      window.enterSubmit = { submit: 0, oldKeyups: 0, newKeyups: 0 };
+      const box = document.querySelector('#enter-box');
+      box.addEventListener('keyup', () => window.enterSubmit.oldKeyups++);
+      document.querySelector('#enter-form').addEventListener('submit', (event) => {
+        event.preventDefault();
+        window.enterSubmit.submit++;
+        document.querySelector('#results').textContent = '新结果';
+        const replacement = box.cloneNode(true);
+        replacement.addEventListener('keyup', () => window.enterSubmit.newKeyups++);
+        box.replaceWith(replacement);
+      });
+    });
+    const snap = await extract(page);
+    const response = await execute(page, snap, 'op-search-enter-replaced', [{ action: 'press', ref: refMatching(snap, /输入框\(text\)/), value: 'Enter' }]);
+    assert.equal(response.results[0].ok, true, JSON.stringify(response));
+    assert.equal(await page.evaluate(() => window.enterSubmit.submit), 1);
+    assert.equal(await page.evaluate(() => window.enterSubmit.oldKeyups), 0, '已提交后不得继续向旧节点派发 keyup');
+  });
+});
+
+test('Enter 提交后同容器文字更新（联想结果）仍报告已按键成功', { timeout: 30000 }, async () => {
+  await withFixture(async (page) => {
+    await page.evaluate(() => {
+      document.body.innerHTML = '<form id="sug-form"><input id="sug-box" aria-label="搜索" value="测试查询"><div id="sug-list"></div></form>';
+      window.sugSubmit = 0;
+      document.querySelector('#sug-form').addEventListener('submit', (event) => {
+        event.preventDefault();
+        window.sugSubmit++;
+        document.querySelector('#sug-list').innerHTML = '<ul><li>结果已更新</li></ul>';
+      });
+    });
+    const snap = await extract(page);
+    const response = await execute(page, snap, 'op-search-enter-suggestion', [{ action: 'press', ref: refMatching(snap, /输入框/), value: 'Enter' }]);
+    assert.equal(response.results[0].ok, true, JSON.stringify(response));
+    assert.equal(await page.evaluate(() => window.sugSubmit), 1);
+  });
+});
+
+test('提交按钮 value 快照后变化必须拒绝旧ref，不能点成另一个操作', { timeout: 30000 }, async () => {
+  await withFixture(async (page) => {
+    await page.evaluate(() => {
+      document.body.innerHTML = '<form id="label-form"><input id="label-box" aria-label="搜索"><input id="label-submit" type="submit" value="百度一下"></form>';
+      window.labelClicks = 0;
+      document.querySelector('#label-submit').addEventListener('click', () => window.labelClicks++);
+    });
+    const snap = await extract(page);
+    await page.evaluate(() => { document.querySelector('#label-submit').value = '删除全部'; });
+    const response = await execute(page, snap, 'op-search-button-label', [{ action: 'click', ref: refMatching(snap, /输入框\(submit\)/) }]);
+    assert.equal(response.results[0].code, 'STALE_TARGET', JSON.stringify(response));
+    assert.equal(await page.evaluate(() => window.labelClicks), 0);
+  });
+});
+
+test('type 值被页面同步回退仍报 VALUE_NOT_APPLIED，不吞真实失败', { timeout: 30000 }, async () => {
+  await withFixture(async (page) => {
+    await page.evaluate(() => {
+      document.body.innerHTML = '<input id="rollback-box" aria-label="搜索" value="old">';
+      const box = document.querySelector('#rollback-box');
+      box.addEventListener('input', () => { box.value = 'old'; });
+    });
+    const response = await execute(page, await extract(page), 'op-search-type-rollback', [{ action: 'type', selector: '#rollback-box', value: '测试查询' }]);
+    assert.equal(response.results[0].code, 'VALUE_NOT_APPLIED', JSON.stringify(response));
+    assert.equal(await page.locator('#rollback-box').inputValue(), 'old');
+  });
+});
+
+test('填写期间字段被替换为不同身份报 STALE_TARGET，不冒充值未写入', { timeout: 30000 }, async () => {
+  await withFixture(async (page) => {
+    await page.evaluate(() => {
+      document.body.innerHTML = '<input id="swap-box" aria-label="Original field">';
+      const box = document.querySelector('#swap-box');
+      box.addEventListener('input', () => {
+        const other = document.createElement('input');
+        other.setAttribute('aria-label', 'Different field');
+        box.replaceWith(other);
+      });
+    });
+    const response = await execute(page, await extract(page), 'op-search-fill-swap', [{ action: 'fill', selector: '#swap-box', value: 'requested' }]);
+    assert.equal(response.results[0].code, 'STALE_TARGET', JSON.stringify(response));
   });
 });

@@ -7,7 +7,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { chromium } = require('playwright-core');
 
-const project = 'C:/Users/VIDDsys/.zcode/projects/vias-page-agent';
+const project = path.resolve(__dirname, '../..');
 const edge = 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
 const contentScript = fs.readFileSync(path.join(project, 'content.js'), 'utf8');
 

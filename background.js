@@ -47,6 +47,10 @@ const ACTION_PROTOCOL = `
 - 未做完就持续"观察→下发操作→再观察"推进，直到目标达成；每一步都用最新页面的 ref 实际执行，别把计划写在 say 里而不做。`;
 
 chrome.sidePanel?.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
+chrome.windows?.onRemoved?.addListener((windowId) => {
+  if (!Number.isInteger(windowId) || windowId < 0) return;
+  void chrome.storage.session?.remove(`chat:${windowId}`).catch(() => {});
+});
 
 function randomId(prefix) {
   return `${prefix}-${crypto.randomUUID()}`;
@@ -149,11 +153,30 @@ function updateSettings(message) {
   return next;
 }
 
-async function csSend(tabId, message) {
+// 只有无副作用的消息可以在接收端缺失时“注入后重发”。
+const RESUMABLE_MESSAGE_TYPES = new Set(['EXTRACT', 'READ_SEGMENT', 'READ_IMAGES', 'VERIFY_IMAGES', 'CANCEL_IMAGES']);
+// 这些批次级 code 由 content.js 在执行任何动作之前返回，整批都没有被派发。
+const PRE_DISPATCH_REJECTIONS = new Set(['STALE_SNAPSHOT', 'INVALID_REQUEST', 'INVALID_ACTIONS', 'BUSY', 'CANCELLED']);
+
+function deliveryUnconfirmed(error) {
+  const detail = error ? `（${String(error.message || error).slice(0, 200)}）` : '';
+  return Object.assign(new Error(`未收到页面执行回执${detail}`), { code: 'DELIVERY_UNCONFIRMED', deliveryUnconfirmed: true });
+}
+
+async function csSend(tabId, message, run) {
+  const assertRunning = () => {
+    if (run.cancelled || run.finished) throw Object.assign(new Error('任务已取消或结束'), { code: 'CANCELLED' });
+  };
+  assertRunning();
   try {
     return await chrome.tabs.sendMessage(tabId, message);
-  } catch {
+  } catch (error) {
+    assertRunning();
+    // EXECUTE 一旦可能已送达，页面卸载会同时关掉消息端口，此时无法区分“已执行”和“未执行”。
+    // 绝不注入后重发：新文档里重发旧 snapshotId 必然误判，重新执行又可能重复副作用。
+    if (!RESUMABLE_MESSAGE_TYPES.has(message.type)) throw deliveryUnconfirmed(error);
     await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
+    assertRunning();
     return chrome.tabs.sendMessage(tabId, message);
   }
 }
@@ -262,7 +285,7 @@ async function selectedImages(run, read) {
   const message = { runId: run.runId, snapshotId: read.snapshotId, ids: read.ids, allowImages: true };
   const budget = { bytes: 0, encoded: 0 };
   try {
-    const result = await imageWait(csSend(run.activeTabId, { type: 'READ_IMAGES', ...message }), controller.signal);
+    const result = await imageWait(csSend(run.activeTabId, { type: 'READ_IMAGES', ...message }, run), controller.signal);
     if (!Array.isArray(result?.results)) return { images: [], results: [{ code: result?.code || 'IMAGE_UNREADABLE', msg: result?.error || '图片读取失败' }] };
     const results = [];
     const images = [];
@@ -273,7 +296,7 @@ async function selectedImages(run, read) {
         if (item?.code === 'FETCH_REQUIRED') dataUrl = await fetchSelectedImage(item.source, controller.signal, budget);
         if (!dataUrl) { results.push({ id, ok: false, code: item?.code || 'IMAGE_UNREADABLE', msg: item?.msg || '' }); continue; }
         if (!/^data:image\/jpeg;base64,[a-z\d+/=]+$/i.test(dataUrl) || dataUrl.length > IMAGE_POLICY.encoded || budget.encoded + dataUrl.length > IMAGE_POLICY.totalEncoded) throw imageFailure('ENCODED_LIMIT');
-        const verified = await imageWait(csSend(run.activeTabId, { type: 'VERIFY_IMAGES', ...message }), controller.signal);
+        const verified = await imageWait(csSend(run.activeTabId, { type: 'VERIFY_IMAGES', ...message }, run), controller.signal);
         const check = verified?.results?.find((candidate) => candidate.id === id);
         if (!check?.ok) throw imageFailure(check?.code || verified?.code || 'STALE_IMAGE');
         images.push({ id, dataUrl }); budget.encoded += dataUrl.length;
@@ -283,7 +306,7 @@ async function selectedImages(run, read) {
         results.push({ id, ok: false, code: error.code || 'IMAGE_UNREADABLE', msg: '所选图片读取失败，未发送其它图片' });
       }
     }
-    const final = await imageWait(csSend(run.activeTabId, { type: 'VERIFY_IMAGES', ...message }), controller.signal);
+    const final = await imageWait(csSend(run.activeTabId, { type: 'VERIFY_IMAGES', ...message }, run), controller.signal);
     for (let index = images.length - 1; index >= 0; index--) {
       const check = final?.results?.find((item) => item.id === images[index].id);
       if (!check?.ok) {
@@ -500,6 +523,7 @@ function summarizeResults(results) {
   const compact = (result) => {
     const item = { ok: result?.ok === true };
     if (result?.code) item.code = String(result.code).slice(0, 80);
+    if (result?.notDispatched === true) item.notDispatched = true;
     if (result?.navigationUrl) item.navigationUrl = text(result.navigationUrl, 1000);
     if (!item.ok) item.msg = text(result?.msg || result?.error, 240);
     else if (result?.state) item.state = text(result.state, 240);
@@ -537,6 +561,20 @@ function summarizeResults(results) {
 }
 
 const MAX_UNRESOLVED_EVIDENCE = 128;
+
+// content.js 的批次级拒绝（快照失配/参数非法/忙/已取消）在执行任何动作之前返回，只带 1 个结果。
+// 归一化后其余动作明确标为“未派发”：既不能算执行失败，也不能被当成 INVALID_RESPONSE 或未确认证据。
+function executionResults(exec, actions) {
+  const raw = Array.isArray(exec?.results) ? exec.results : [];
+  if (raw.length === 1 && PRE_DISPATCH_REJECTIONS.has(String(raw[0]?.code || ''))) {
+    return [{ ...raw[0], ok: false, notDispatched: true },
+      ...actions.slice(1).map(() => ({ ok: false, code: 'NOT_DISPATCHED', msg: '本批在执行前已被页面拒绝，此操作未派发', notDispatched: true }))];
+  }
+  return actions.map((_action, index) => {
+    const result = raw[index];
+    return result && typeof result === 'object' ? result : { ok: false, code: 'INVALID_RESPONSE', msg: '页面执行器返回无效' };
+  });
+}
 
 function targetEvidenceDescription(page, action) {
   const description = targetDescription(page, action).replace(/^\[\d+\]\s*/u, '');
@@ -587,7 +625,8 @@ function addPendingEvidence(unresolved, key, entry) {
 }
 
 async function recordActionEvidence(unresolved, result, action, page, tabId, uncertain = false) {
-  if (result?.code === 'SKIPPED_AFTER_NAVIGATION') return;
+  // 跳过的动作与整批未派发的动作都没有副作用，不欠任何确认；否则旧快照 key 永远清不掉。
+  if (result?.code === 'SKIPPED_AFTER_NAVIGATION' || result?.notDispatched === true) return;
   const success = result?.ok === true;
   if (success && (action.action === 'wait' || result.code === 'NO_CHANGE' || !unresolved.pending.size)) return;
   const key = await actionEvidenceKey(action, page, tabId);
@@ -615,6 +654,10 @@ async function executionEvidence(results, actions, rawResults, page, tabId, unre
   const record = (result, action) => recordActionEvidence(result?.ok === true ? unresolved : failuresThisBatch, result, action, page, tabId);
   for (const [index, result] of results.entries()) {
     const action = actions[index];
+    // 整批在执行前已被页面拒绝（含被补齐的 NOT_DISPATCHED 槽位）：没有任何子动作派发过，不欠任何确认。
+    // 必须在这里早退，否则 repeat 槽位没有 children，下面的 !failures 分支会把 incomplete 永久钉死，
+    // 让真实完成的收尾被判成 unverified。
+    if (result.notDispatched === true) continue;
     if (action.action !== 'repeat') {
       succeeded ||= result.ok;
       await record(result, action);
@@ -637,6 +680,26 @@ async function executionEvidence(results, actions, rawResults, page, tabId, unre
     }
     // Missing/truncated child failures cannot be safely attributed to a target or erased by other successes.
     if ((summary?.failureCount || 0) > failures || (!result.ok && result.code !== 'SKIPPED_AFTER_NAVIGATION' && !failures)) failuresThisBatch.incomplete = true;
+    // Iterations never started after a failure are still owed for non-idempotent actions; one later success
+    // cannot settle all of them. Idempotent actions are settled by any success and tracked by their enumerated result.
+    if (!result.ok && result.code !== 'SKIPPED_AFTER_NAVIGATION' && Number.isSafeInteger(summary?.plannedIterations)) {
+      const iteration = Number.isSafeInteger(summary.iteration) && summary.iteration >= 0 && summary.iteration <= summary.plannedIterations ? summary.iteration : null;
+      for (const [offset, subAction] of action.actions.entries()) {
+        // 幂等动作由任一成功结算；wait 没有副作用且其成功本身不结算证据（见 recordActionEvidence 早退），
+        // 对未启动的 wait 计欠只会留下永远清不掉的条目。
+        if (['fill', 'select', 'check', 'checkRadio', 'wait'].includes(subAction.action)) continue;
+        // Retained children may omit earlier successes; only iterations after the known boundary are owed.
+        if (iteration === null && rawResults[index]?.repeatSummary?.omittedCount > 0) {
+          failuresThisBatch.incomplete = true;
+          continue;
+        }
+        const enumerated = children.filter((child) => child?.subIndex === offset + 1);
+        const remaining = iteration === null ? summary.plannedIterations - enumerated.length
+          : summary.plannedIterations - iteration - enumerated.filter((child) => Number.isSafeInteger(child.iteration) && child.iteration > iteration && child.iteration <= summary.plannedIterations).length;
+        if (remaining <= 0) continue;
+        addPendingEvidence(failuresThisBatch, await actionEvidenceKey(subAction, page, tabId), { idempotent: false, uncertain: false, count: remaining });
+      }
+    }
   }
   // A later planned action is not an extra retry of an earlier failure in this same batch.
   for (const [key, entry] of failuresThisBatch.pending) addPendingEvidence(unresolved, key, entry);
@@ -741,6 +804,22 @@ async function waitForTabReady(tabId, run, previousUrl = '', timeoutMs = 15000, 
     await delay(100);
   }
   return null;
+}
+
+// 回执丢失时旧文档可能正在卸载：先给导航一个短观察窗口，
+// 确认换了文档/进入 loading 才等待加载完成，否则返回 null 由调用方按同一文档重读。
+async function settleUnconfirmedNavigation(run, tabId, beforeUrl, navigationVersion, timeoutMs = 1000) {
+  const moved = () => (run.navigationVersions.get(tabId) || 0) > navigationVersion;
+  let tab = null;
+  const deadline = Date.now() + timeoutMs;
+  while (!moved() && Date.now() < deadline) {
+    if (run.cancelled) return null;
+    try { tab = await chrome.tabs.get(tabId); } catch { break; }
+    if (tab?.status === 'loading' || (tab?.url && tab.url !== beforeUrl)) break;
+    await delay(50);
+  }
+  if (!moved() && tab?.status !== 'loading' && (!tab?.url || tab.url === beforeUrl)) return null;
+  return waitForTabReady(tabId, run, beforeUrl, 15000, navigationVersion);
 }
 
 async function drainNewTabs(run) {
@@ -862,7 +941,7 @@ async function agentLoop(run, question, options) {
     emit(run, 'status', { text: '读取页面…' });
     let page;
     try {
-      page = await csSend(run.activeTabId, { type: 'EXTRACT', runId: run.runId, includeImages: await visionEnabled() });
+      page = await csSend(run.activeTabId, { type: 'EXTRACT', runId: run.runId, includeImages: await visionEnabled() }, run);
     } catch {
       throw new Error('无法读取该页面；浏览器内部页面、扩展商店和受限页面不支持');
     }
@@ -887,6 +966,8 @@ async function agentLoop(run, question, options) {
     let repeatedOperationCount = 0;
     let noProgressRounds = 0;
     let failedRounds = 0;
+    // 已派发但回执丢失的轮次独立记账：既不是确认成功，也不是确认失败。
+    let unconfirmedRounds = 0;
     let lastRoundFailed = false;
     const unresolvedEvidence = { pending: new Map(), incomplete: false };
     const hasUnconfirmedFailure = () => unresolvedEvidence.incomplete || unresolvedEvidence.pending.size > 0;
@@ -946,7 +1027,7 @@ async function agentLoop(run, question, options) {
       const followed = await drainNewTabs(run);
       if (!followed || run.cancelled) return false;
       let freshPage;
-      try { freshPage = await csSend(run.activeTabId, { type: 'EXTRACT', runId: run.runId, includeImages: await visionEnabled() }); }
+      try { freshPage = await csSend(run.activeTabId, { type: 'EXTRACT', runId: run.runId, includeImages: await visionEnabled() }, run); }
       catch { if (!run.cancelled) throw new Error('无法读取操作打开的新标签页，任务已停止'); }
       if (run.cancelled) return false;
       if (!freshPage?.snapshotId || !/^https?:/.test(freshPage.url || '')) throw new Error('新标签页快照无效，未继续使用旧页面');
@@ -1037,8 +1118,8 @@ async function agentLoop(run, question, options) {
         else {
           try {
             chunk = read.kind === 'continue'
-              ? await csSend(run.activeTabId, { type: 'EXTRACT', runId: run.runId, continueSnapshotId: read.snapshotId, includeImages: await visionEnabled() })
-              : await csSend(run.activeTabId, { type: 'READ_SEGMENT', runId: run.runId, snapshotId: read.snapshotId, index: read.index });
+              ? await csSend(run.activeTabId, { type: 'EXTRACT', runId: run.runId, continueSnapshotId: read.snapshotId, includeImages: await visionEnabled() }, run)
+              : await csSend(run.activeTabId, { type: 'READ_SEGMENT', runId: run.runId, snapshotId: read.snapshotId, index: read.index }, run);
           } catch { chunk = { code: 'READ_FAILED', error: '页面分段读取失败' }; }
         }
         if (run.cancelled) return { outcome: 'cancelled' };
@@ -1143,7 +1224,7 @@ async function agentLoop(run, question, options) {
       if (lastRoundFailed && batchTouchesSubmit(actions, page)) {
         emit(run, 'status', { text: '提交前重新读取页面…' });
         let freshPage;
-        try { freshPage = await csSend(run.activeTabId, { type: 'EXTRACT', runId: run.runId, includeImages: await visionEnabled() }); }
+        try { freshPage = await csSend(run.activeTabId, { type: 'EXTRACT', runId: run.runId, includeImages: await visionEnabled() }, run); }
         catch (error) {
           if (run.cancelled) return { outcome: 'cancelled' };
           throw new Error(`提交前无法取得新快照，任务已停止（${String(error.message || error).slice(0, 200)}）`);
@@ -1170,46 +1251,84 @@ async function agentLoop(run, question, options) {
         run.capturingNewTabs = true;
       }
       let exec;
+      let unconfirmedError = null;
       try {
-        exec = await csSend(executionTabId, { type: 'EXECUTE', runId: run.runId, operationId, snapshotId: page.snapshotId, approved, actions, includeImages: executionIncludeImages });
+        exec = await csSend(executionTabId, { type: 'EXECUTE', runId: run.runId, operationId, snapshotId: page.snapshotId, approved, actions, includeImages: executionIncludeImages }, run);
       } catch (error) {
         run.capturingNewTabs = false;
         if (run.newTabOperationId) run.expectingNewTabUntil = Date.now() + 4000;
         if (run.cancelled) return { outcome: 'cancelled' };
-        actions.forEach((_action, index) => emit(run, 'result', { operationId, round: step + 1, index, ok: false, code: 'ACTION_COMMUNICATION_FAILED' }));
-        await recordCommunicationFailure(unresolvedEvidence, actions, page, executionTabId);
-        await drainNewTabs(run);
-        if (run.cancelled) return { outcome: 'cancelled' };
-        await waitForTabReady(run.activeTabId, run);
-        if (run.cancelled) return { outcome: 'cancelled' };
-        let freshPage = null;
-        try { freshPage = await csSend(run.activeTabId, { type: 'EXTRACT', runId: run.runId, includeImages: await visionEnabled() }); } catch {}
-        if (run.cancelled) return { outcome: 'cancelled' };
-        if (!freshPage?.snapshotId) throw new Error('操作通信失败且无法重新读取页面，任务已停止');
-        failedRounds += 1;
-        lastRoundFailed = true;
-        if (failedRounds >= 3) {
-          emit(run, 'say', { text: '页面连续三轮通信失败，已停止以避免无效调用。' });
-          return { outcome: 'stalled' };
+        if (error.deliveryUnconfirmed !== true) {
+          actions.forEach((_action, index) => emit(run, 'result', { operationId, round: step + 1, index, ok: false, code: 'ACTION_COMMUNICATION_FAILED' }));
+          await recordCommunicationFailure(unresolvedEvidence, actions, page, executionTabId);
+          await drainNewTabs(run);
+          if (run.cancelled) return { outcome: 'cancelled' };
+          await waitForTabReady(run.activeTabId, run);
+          if (run.cancelled) return { outcome: 'cancelled' };
+          let freshPage = null;
+          try { freshPage = await csSend(run.activeTabId, { type: 'EXTRACT', runId: run.runId, includeImages: await visionEnabled() }, run); } catch {}
+          if (run.cancelled) return { outcome: 'cancelled' };
+          if (!freshPage?.snapshotId) throw new Error('操作通信失败且无法重新读取页面，任务已停止');
+          failedRounds += 1;
+          lastRoundFailed = true;
+          if (failedRounds >= 3) {
+            emit(run, 'say', { text: '页面连续三轮通信失败，已停止以避免无效调用。' });
+            return { outcome: 'stalled' };
+          }
+          page = freshPage;
+          images = [];
+          appendObservation(historyReply, `操作通信失败：${String(error.message).slice(0, 500)}\n已重新读取页面，请核对结果，不要直接重复提交类操作。`);
+          continue;
         }
-        page = freshPage;
-        images = [];
-        appendObservation(historyReply, `操作通信失败：${String(error.message).slice(0, 500)}\n已重新读取页面，请核对结果，不要直接重复提交类操作。`);
-        continue;
+        unconfirmedError = error;
       }
       run.capturingNewTabs = false;
       if (run.newTabOperationId) run.expectingNewTabUntil = Date.now() + 4000;
       const followedNewTab = !!await drainNewTabs(run);
       if (run.cancelled) return { outcome: 'cancelled' };
-      const results = actions.map((_action, index) => {
-        const result = exec?.results?.[index];
-        return result && typeof result === 'object' ? result : { ok: false, code: 'INVALID_RESPONSE', msg: '页面执行器返回无效' };
-      });
+      if (unconfirmedError) {
+        // 页面在操作期间卸载：本批已派发但没有回执。先核对是否真的换了文档，再读新页面。
+        // 绝不把旧 snapshot/旧 ref 重发到新文档，也不宣称整批成功。
+        emit(run, 'status', { text: '未收到页面回执，正在核对页面状态…' });
+        if (!followedNewTab) await settleUnconfirmedNavigation(run, executionTabId, beforePage.url, navigationVersion);
+        if (run.cancelled) return { outcome: 'cancelled' };
+        let freshPage = null;
+        try { freshPage = await csSend(run.activeTabId, { type: 'EXTRACT', runId: run.runId, includeImages: await visionEnabled() }, run); } catch {}
+        if (run.cancelled) return { outcome: 'cancelled' };
+        if (!freshPage?.snapshotId) throw new Error('操作已派发但未收到回执，且无法重新读取页面，任务已停止');
+        const documentChanged = freshPage.snapshotId.split(':')[0] !== beforePage.documentId || freshPage.url !== beforePage.url;
+        const note = documentChanged
+          ? `操作已派发给页面，但没有收到执行回执（页面在操作期间跳转或重建），已读取新页面：${String(freshPage.url || '').slice(0, 300)}`
+          : '操作已派发给页面，但没有收到执行回执，页面地址与文档均未变化';
+        actions.forEach((_action, index) => emit(run, 'result', {
+          operationId, round: step + 1, index, ok: false,
+          msg: `${note}。具体是否生效无法确认，不能视为成功。`,
+          code: 'DISPATCH_UNCONFIRMED',
+          notDispatched: false,
+          navigationUrl: documentChanged ? String(freshPage.url || '').slice(0, 1000) : '',
+        }));
+        // 已派发但未知：按未确认证据登记，既不能被其它成功抹掉，也不算已确认失败。
+        await recordCommunicationFailure(unresolvedEvidence, actions, page, executionTabId);
+        if (documentChanged) {
+          // 文档重建是可观察的进展：不占失败预算，也不宣称本批成功。
+          unconfirmedRounds = 0;
+        } else if ((unconfirmedRounds += 1) >= 3) {
+          emit(run, 'say', { text: '连续三轮未收到页面执行回执且页面没有变化，已停止以避免重复派发。' });
+          return { outcome: 'stalled' };
+        }
+        lastRoundFailed = true;
+        page = freshPage;
+        images = [];
+        appendObservation(historyReply, `${note}；本批操作的最终结果未知，不能视为成功，也不要整体重放。请依据最新页面判断：若页面已呈现预期结果，如实说明这次操作未获回执；若尚未生效，在新页面上重新定位目标后再操作。`);
+        continue;
+      }
+      const results = executionResults(exec, actions);
       actions.forEach((_action, index) => {
         const result = results[index] || { ok: false, code: 'INVALID_RESPONSE' };
-        emit(run, 'result', { operationId, round: step + 1, index, ok: result.ok === true, msg: result.msg || result.error || '', state: result.state || '', code: result.code || '', navigationUrl: result.navigationUrl || '' });
+        emit(run, 'result', { operationId, round: step + 1, index, ok: result.ok === true, msg: result.msg || result.error || '', state: result.state || '', code: result.code || '', navigationUrl: result.navigationUrl || '', notDispatched: result.notDispatched === true });
       });
       const navigating = results.some((result) => ['NAVIGATING', 'NAVIGATED'].includes(result.code))
+        || (exec?.navigation?.ok === true && ['NAVIGATING', 'NAVIGATED'].includes(exec.navigation.code))
         || (run.navigationVersions.get(executionTabId) || 0) > navigationVersion;
       if (navigating && !followedNewTab) {
         emit(run, 'status', { text: '等待页面跳转完成…' });
@@ -1223,7 +1342,7 @@ async function agentLoop(run, question, options) {
       const hasFreshSameDocumentPage = typeof nextPage?.snapshotId === 'string' && nextPage.snapshotId !== page.snapshotId
         && nextPage.snapshotId.split(':')[0] === beforePage.documentId && nextPage.url === beforePage.url;
       if ((followedNewTab || navigating || !hasFreshSameDocumentPage) && !run.cancelled) {
-        try { nextPage = await csSend(run.activeTabId, { type: 'EXTRACT', runId: run.runId, includeImages: await visionEnabled() }); } catch { nextPage = null; }
+        try { nextPage = await csSend(run.activeTabId, { type: 'EXTRACT', runId: run.runId, includeImages: await visionEnabled() }, run); } catch { nextPage = null; }
       }
       if (run.cancelled) return { outcome: 'cancelled' };
       const resultSummary = summarizeResults(results);
@@ -1232,7 +1351,7 @@ async function agentLoop(run, question, options) {
       // The zero-success budget and unresolved completion evidence are separate contracts.
       failedRounds = roundSucceeded ? 0 : failedRounds + 1;
       lastRoundFailed = !roundSucceeded;
-      if (roundSucceeded) emptyReplyNudges = 0;
+      if (roundSucceeded) { emptyReplyNudges = 0; unconfirmedRounds = 0; }
       if (failedRounds >= 3) {
         emit(run, 'say', { text: '页面连续三轮未能执行任何操作，已停止以避免重复或误操作。' });
         return { outcome: 'stalled' };

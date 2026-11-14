@@ -121,3 +121,43 @@ test('标识符分词识别常见凭据并避免普通字段误遮', { timeout: 
     assert.equal(Object.values(snapshot.targetMeta).filter((meta) => meta.sensitive).length, 7);
   } finally { await page.close(); }
 });
+
+for (const role of ['textbox', 'combobox']) {
+  test(`最终审查 敏感${role}宿主的Shadow内容不进入父级描述，普通Shadow仍可读`, { timeout: 30000 }, async () => {
+    const page = await setup('<div role="button"><audit-secret></audit-secret><audit-public></audit-public></div>');
+    try {
+      await page.evaluate((role) => {
+        const sensitive = document.querySelector('audit-secret');
+        sensitive.setAttribute('role', role);
+        sensitive.setAttribute('aria-label', '验证码');
+        sensitive.attachShadow({ mode: 'open' }).innerHTML = '<span>SYNTHETIC_SHADOW_SECRET</span><div id="inner"></div>';
+        sensitive.shadowRoot.querySelector('#inner').attachShadow({ mode: 'open' }).innerHTML = '<span>SYNTHETIC_NESTED_SECRET</span>';
+        document.querySelector('audit-public').attachShadow({ mode: 'open' }).innerHTML = '<span>Public shadow text</span><button type="button">Public shadow action</button>';
+      }, role);
+      const snapshot = await extract(page);
+      assertAbsent(snapshot, ['SYNTHETIC_SHADOW_SECRET', 'SYNTHETIC_NESTED_SECRET']);
+      assert.match(snapshot.text, /Public shadow text/);
+      assert.match(snapshot.text, /Public shadow action/);
+      assert.equal(Object.values(snapshot.targetMeta).filter((meta) => meta.sensitive).length, 1);
+      const parentRef = Object.entries(snapshot.targets).find(([, description]) => description.includes('按钮「Public shadow text'))?.[0];
+      assert.ok(parentRef, '普通父级按钮及非敏感Shadow文字必须保留');
+      const response = await execute(page, snapshot, [{ action: 'click', ref: Number(parentRef) }], `sensitive-shadow-parent-${role}`);
+      assert.equal(response.results[0].ok, true, JSON.stringify(response));
+      assertAbsent(response, ['SYNTHETIC_SHADOW_SECRET', 'SYNTHETIC_NESTED_SECRET']);
+      assert.match(response.page.text, /Public shadow text/);
+    } finally { await page.close(); }
+  });
+}
+
+test('最终审查 多选状态完整化不回显敏感select的选项和值', { timeout: 30000 }, async () => {
+  const page = await setup('<div role="button"><label>验证码<select autocomplete="one-time-code" multiple><option value="private-a" selected>Private option A</option><option value="private-b" selected>Private option B</option></select></label></div>');
+  try {
+    const snapshot = await extract(page);
+    assertAbsent(snapshot, ['private-a', 'private-b', 'Private option A', 'Private option B']);
+    const [ref] = Object.entries(snapshot.targetMeta).find(([, meta]) => meta.tag === 'select');
+    const response = await execute(page, snapshot, [{ action: 'select', ref: Number(ref), value: ['private-b'] }], 'sensitive-multiple-state');
+    assert.equal(response.results[0].code, 'SELECTED');
+    assertAbsent(response, ['private-a', 'private-b', 'Private option A', 'Private option B']);
+    assert.deepEqual(await page.locator('select').evaluate((el) => [...el.selectedOptions].map((option) => option.value)), ['private-b']);
+  } finally { await page.close(); }
+});

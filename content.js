@@ -240,7 +240,8 @@
             parts.push(text);
             length = offset + text.length;
           }
-        } else if (child.nodeType === Node.ELEMENT_NODE && !SKIP_TAGS.has(child.tagName.toLowerCase()) && !isHidden(child)) {
+        } else if (child.nodeType === Node.ELEMENT_NODE && !SKIP_TAGS.has(child.tagName.toLowerCase()) && !isHidden(child) && !isSensitive(child)) {
+          // The host and its shadow tree share the same sensitivity gate.
           visit(child);
           if (child.shadowRoot) visit(child.shadowRoot);
         }
@@ -327,14 +328,16 @@
     const parts = [];
     const visit = (node) => {
       if (node.nodeType === Node.TEXT_NODE) { parts.push(node.textContent); return; }
-      if (!(node instanceof Element)) return;
-      if (SKIP_TAGS.has(node.tagName.toLowerCase()) || ['INPUT', 'TEXTAREA', 'SELECT'].includes(node.tagName)
-        || node.isContentEditable || isIdentityState(node) || choiceTarget(node)) return;
+      if (!(node instanceof Element) && !(node instanceof ShadowRoot)) return;
+      if (node instanceof Element && (SKIP_TAGS.has(node.tagName.toLowerCase()) || ['INPUT', 'TEXTAREA', 'SELECT'].includes(node.tagName)
+        || node.isContentEditable || isIdentityState(node) || choiceTarget(node))) return;
       for (const child of node.childNodes) visit(child);
+      if (node.shadowRoot) visit(node.shadowRoot);
     };
     // 页级容器只取标题；进度等全局状态不能成为每一道题的身份。
     if (['MAIN', 'BODY', 'HTML'].includes(element.tagName)) {
       for (const heading of element.querySelectorAll(HEADING_SELECTOR)) parts.push(identityText(heading));
+      if (element.shadowRoot) visit(element.shadowRoot);
     } else visit(element);
     const labelled = (element.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
       .map((id) => element.getRootNode().getElementById?.(id)).filter(Boolean).map(identityText);
@@ -353,15 +356,42 @@
         : node instanceof Element && !choiceTarget(node) && !node.querySelector(CHOICE_SELECTOR) && !!identityText(node));
       const namedGroup = parent.matches('[role="group"],[role="radiogroup"],[role="listbox"]')
         && !!(parent.getAttribute('aria-label') || parent.getAttribute('aria-labelledby'));
-      const peer = (namedGroup || (choices.size > 1 && hasPrompt)) && container
+      const peer = (namedGroup || ((choices.size > 1 || parent.querySelector(HEADING_SELECTOR)) && hasPrompt)) && container
         && !container.matches('ul,ol,[role="list"],[role="listbox"],[role="radiogroup"]')
         && [...container.children].some((sibling) => sibling !== parent
           && !choiceTarget(sibling) && sibling.querySelector(CHOICE_SELECTOR));
-      // 序号/说明不证明单个 .option 是题目；多选项分组还须有独立于选项分支的题干。
-      if (parent.matches('section,article,fieldset') || parent.querySelector(HEADING_SELECTOR) || peer) break;
+      // 选项内的说明标题不证明已经包含题干；继续至语义题块或独立的同级题块。
+      if (parent.matches('section,article,fieldset') || peer) break;
       parent = parent.parentElement || parent.getRootNode().host;
     }
     return scopes;
+  }
+
+  // 原生字段的身份只取控件自身与显式语义上下文：labels、aria-labelledby 由调用方另取，
+  // 这里只取最近的题块/字段集标题。表单区块里的联想词、热搜、隐藏计数等可变文本
+  // 不属于字段身份，否则自动补全一出现就会被误判为控件变化。
+  const HEADING_TAGS = new Set(['H1', 'H2', 'H3', 'H4', 'H5', 'H6']);
+  function fieldContextText(element) {
+    const parts = [];
+    const headingOf = (block) => {
+      for (const child of block.children) {
+        if (child.tagName === 'LEGEND' || HEADING_TAGS.has(child.tagName)) return child;
+      }
+      const nested = block.matches('SECTION,ARTICLE') ? block.querySelector('h1,h2,h3,h4,h5,h6') : null;
+      return nested && nested.closest('section,article') === block ? nested : null;
+    };
+    let parent = element.parentElement || element.getRootNode().host;
+    while (parent && parent !== document.body && parent !== document.documentElement) {
+      const heading = headingOf(parent);
+      if (heading) {
+        const text = identityText(heading);
+        if (text) parts.push(`${heading.tagName}|${text}`);
+      }
+      // 找到最近的显式题块（标题/legend/语义分组）即停，不把整页容器文字拉进字段身份。
+      if (heading || parent.matches('FIELDSET,SECTION,ARTICLE,[role="group"],[role="radiogroup"]')) break;
+      parent = parent.parentElement || parent.getRootNode().host;
+    }
+    return JSON.stringify(parts);
   }
 
   function withinScope(element, scope) {
@@ -432,7 +462,19 @@
     const tag = target.tagName.toLowerCase();
     if (isSensitive(target)) return (target.value || (target.isContentEditable && target.textContent)) ? '已有敏感内容（已隐藏）' : '当前为空';
     if (tag === 'input' && ['checkbox', 'radio'].includes(target.type)) return target.checked ? '已选中' : '未选中';
-    if (tag === 'select') return `当前选项=${cleanText(target.selectedOptions[0]?.textContent || target.value, 60)}`;
+    if (tag === 'select') {
+      if (!target.multiple) return `当前选项=${cleanText(target.selectedOptions[0]?.textContent || target.value, 60)}`;
+      const selected = [...target.selectedOptions];
+      const shown = [];
+      let length = 0;
+      for (const option of selected) {
+        const text = `${cleanText(option.textContent, 30)}(value=${cleanText(option.value, 30)})`;
+        if (shown.length >= 50 || length + text.length + (shown.length ? 3 : 0) > 400) break;
+        length += text.length + (shown.length ? 3 : 0);
+        shown.push(text);
+      }
+      return `当前选项=${shown.join(' | ') || '(无)'}（多选，已选${selected.length}项${selected.length > shown.length ? `，其余${selected.length - shown.length}项已省略` : ''}）`;
+    }
     if (tag === 'input' || tag === 'textarea') return target.value ? `当前值="${cleanText(target.value, 80)}"` : '当前为空';
     if (target.isContentEditable) return target.textContent.trim() ? `当前内容="${cleanText(target.textContent, 80)}"` : '当前为空';
     const aria = target.getAttribute('aria-checked');
@@ -467,8 +509,13 @@
     return cleanText(text, max);
   }
 
+  function selectOptionIdentity(option) {
+    return JSON.stringify([option.value, option.textContent, option.label, option.disabled,
+      option.parentElement?.tagName === 'OPTGROUP' ? [option.parentElement.label, option.parentElement.disabled] : null]);
+  }
+
   // 排除 checked、普通字段 value 等可变状态；radio/checkbox 的 value 属于选项身份。
-  // 用于执行前逐目标核验：若节点被复用成别的内容，拒绝旧编号，避免点错。
+  // 标签、题目上下文及下拉选项在读取时冻结，不能到派发时才接受新身份。
   function fingerprintOf(el) {
     if (el === document.body || el === document.documentElement) return el === document.body ? 'body' : 'html';
     const tag = el.tagName.toLowerCase();
@@ -481,9 +528,18 @@
         native ? [choice.type, choice.id, choice.name, choice.value] : el.getAttribute('value')]);
     }
     if (tag === 'label') return `label|${safeSlice(identityText(el), 120)}`;
-    if (tag === 'input') return `input|${String(el.type || '').toLowerCase()}|${cleanText(el.getAttribute('aria-label') || el.getAttribute('title') || el.placeholder || el.name || el.id || '')}`;
-    if (tag === 'textarea') return `textarea|${cleanText(el.getAttribute('aria-label') || el.getAttribute('title') || el.placeholder || el.name || el.id || '')}`;
-    if (tag === 'select') return `select|${labelOf(el)}`;
+    if (['input', 'textarea', 'select'].includes(tag)) {
+      const root = el.getRootNode();
+      const labelled = (el.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
+        .map((id) => root.getElementById?.(id) || document.getElementById(id)).filter(Boolean).map(identityText);
+      // 按钮类 input 的 value 就是可见文字（如「百度一下」），属于控件身份；
+      // 普通字段的 value 是可变状态，仍排除在指纹外以保证同批填写。
+      const buttonValue = el instanceof HTMLInputElement && ['submit', 'button', 'reset', 'image'].includes(el.type) ? el.value : null;
+      return JSON.stringify([tag, el.type, el.id, el.name,
+        ['aria-label', 'title', 'placeholder', 'aria-labelledby'].map((name) => el.getAttribute(name)),
+        [...(el.labels || [])].map(identityText), labelled, fieldContextText(el), buttonValue,
+        tag === 'select' ? [el.multiple, [...el.options].map(selectOptionIdentity)] : null]);
+    }
     const role = (el.getAttribute('role') || '').toLowerCase();
     // 富文本的正文也是可变值，不能把本批合法输入当作节点身份变化。
     if (el.isContentEditable || role === 'textbox') return `${tag}|${role}|${labelOf(el)}`;
@@ -773,8 +829,9 @@
         if (el.nodeType !== Node.ELEMENT_NODE) continue;
         const tag = el.tagName.toLowerCase();
         if (SKIP_TAGS.has(tag)) continue;
-        const style = getComputedStyle(el);
-        if (isHidden(el) && style.display !== 'contents') continue;
+        // isHidden already permits display:contents without a layout box;
+        // semantic hiding must still suppress that element's entire subtree.
+        if (isHidden(el)) continue;
         if (tag === 'iframe') {
           if (!controlsOnly) append(`嵌入页面: ${cleanText(el.title || el.src, 120)}（跨域内容可能无法读取）`);
           continue;
@@ -1009,6 +1066,11 @@
     return errorResult('VALUE_NOT_APPLIED', '页面未保留完整的预期内容或选区，可能存在字段限制或页面回退；本批后续操作已停止，请重新读取并核对');
   }
 
+  function targetReplacedDuringValue() {
+    // 字段本身被页面替换/改身份时不能冒充“值没写进去”，否则会掩盖真实身份变化。
+    return errorResult('STALE_TARGET', '目标在填写期间被页面替换或改变，请重新读取页面');
+  }
+
   function exceedsFieldLimit(element, value) {
     return (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement)
       && element.maxLength >= 0 && value.length > element.maxLength;
@@ -1021,10 +1083,10 @@
       element.selectionStart === element.selectionEnd ? 'none' : element.selectionDirection];
   }
 
-  function expectedFieldState(element, text, changed) {
-    const state = fieldValueState(element);
-    return [text, changed && state[1] != null ? text.length : state[1],
-      changed && state[2] != null ? text.length : state[2], changed ? 'none' : state[3]];
+  // fill/type 的成功依据是值本身：页面合法重置光标/选区不算填写失败。
+  // 光标语义只由 press 的按键结果核验。
+  function fieldValueOnly(element) {
+    return [element.isContentEditable ? element.textContent : element.value];
   }
 
   function sameValueState(left, right) {
@@ -1037,24 +1099,25 @@
       element.getAttribute('autocomplete'), element.getAttribute('aria-labelledby'), element.isContentEditable,
       element instanceof HTMLSelectElement ? element.multiple : null]);
     const identity = identityOf(target);
-    const scopes = optionContext(target);
+    const context = fieldContextText(target);
     const form = target.form || target.closest('form');
     const formPath = form && optionPathOf(form);
     const formIdentityOf = (element) => element ? JSON.stringify([element.id, element.getAttribute('name'), element.action, element.method, element.target]) : '';
     const formIdentity = formIdentityOf(form);
+    // 返回 {target} 或 {stale:true}：身份变化与“值没保留”是两类不同结果。
     return () => {
       assertActive(runId);
       if (target.isConnected) {
-        try { verify(); } catch (error) { if (error.code === 'STALE_TARGET' || error.code === 'TARGET_DISABLED') return null; throw error; }
-        return identityOf(target) === identity ? target : null;
+        try { verify(); } catch (error) { if (error.code === 'STALE_TARGET' || error.code === 'TARGET_DISABLED') return { stale: true }; throw error; }
+        return identityOf(target) === identity ? { target } : { stale: true };
       }
       // Recovery is read-only and only after writing. Never re-resolve a selector
       // to dispatch events or continue typing into a replacement node.
       const current = optionAt(path);
-      if (!current || identityOf(current) !== identity || !optionContextMatches({ scopes })) return null;
+      if (!current || identityOf(current) !== identity || fieldContextText(current) !== context) return { stale: true };
       const currentForm = current.form || current.closest('form');
-      if (formIdentityOf(currentForm) !== formIdentity || (form && currentForm !== form && (form.isConnected || optionAt(formPath) !== currentForm))) return null;
-      return current;
+      if (formIdentityOf(currentForm) !== formIdentity || (form && currentForm !== form && (form.isConnected || optionAt(formPath) !== currentForm))) return { stale: true };
+      return { target: current };
     };
   }
 
@@ -1074,16 +1137,18 @@
     // complete value/selection as well as identity, allowing a bounded quiet period.
     while (performance.now() - started < 1200) {
       const current = observe();
-      const state = current ? read(current) : [];
-      if (current !== previousTarget || !previousState || !sameValueState(state, previousState)) {
-        stableSince = performance.now(); previousTarget = current; previousState = state;
+      const target = current?.target || null;
+      const state = target ? read(target) : [];
+      if (target !== previousTarget || !previousState || !sameValueState(state, previousState)) {
+        stableSince = performance.now(); previousTarget = target; previousState = state;
       }
       if (performance.now() - stableSince >= TIMING.settle) {
-        return current && sameValueState(state, expected) ? { target: current } : { error: valueNotApplied() };
+        if (!target) return { error: targetReplacedDuringValue() };
+        return sameValueState(state, expected) ? { target } : { error: valueNotApplied() };
       }
       await sleep(40, runId);
     }
-    return { error: valueNotApplied() };
+    return { error: previousTarget ? valueNotApplied() : targetReplacedDuringValue() };
   }
 
   function safeLink(element) {
@@ -1095,7 +1160,8 @@
     return anchor;
   }
 
-  async function clickOnce(element, runId, verify, detail = 1, visualElement = element, recoverChoice = null) {
+  // stillNeeded 仅由 check 传入：等待绘制期间页面可能自行恢复选中，此时不能再点一次把它反选。
+  async function clickOnce(element, runId, verify, detail = 1, visualElement = element, recoverChoice = null, stillNeeded = null) {
     const prepare = () => {
       if (recoverChoice) {
         const current = recoverChoice();
@@ -1109,6 +1175,7 @@
     visualElement.scrollIntoView({ block: 'center', inline: 'nearest' });
     await sleep(TIMING.paint, runId);
     prepare();
+    if (stillNeeded && !stillNeeded(element)) return false;
     const anchor = safeLink(element);
     const originalTarget = anchor?.getAttribute('target');
     if (anchor && /^_blank$/i.test(originalTarget || '')) anchor.setAttribute('target', '_self');
@@ -1118,6 +1185,8 @@
       // 每个前置事件都可能同步复用/移除节点或发起导航，不能只在整串事件前检查一次。
       for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
         prepare();
+        // Pointer handlers or equivalent redraws can satisfy check after paint.
+        if (type === 'click' && stillNeeded && !stillNeeded(element)) return false;
         if (type.startsWith('pointer')) {
           if (window.PointerEvent) element.dispatchEvent(new PointerEvent(type, { ...init, pointerId: 1, pointerType: 'mouse', isPrimary: true }));
         } else element.dispatchEvent(new MouseEvent(type, init));
@@ -1296,6 +1365,17 @@
     element.focus?.();
     verify();
     if (focusedElement() !== element) return errorResult('NO_EFFECT', '目标未获得键盘焦点');
+    // 动作前身份校验保持严格；一旦默认行为已派发（提交/选中），后续只做效果确认：
+    // 页面在提交后改写文字、替换节点属于正常响应，不能再报“未执行”或继续派发到旧节点。
+    let dispatched = false;
+    const identityStillValid = () => {
+      try { verify(); return true; }
+      catch (error) { if (error.code === 'STALE_TARGET' || error.code === 'TARGET_DISABLED') return false; throw error; }
+    };
+    const postVerify = () => {
+      if (!dispatched) { verify(); return true; }
+      return identityStillValid();
+    };
     const before = textField ? textFieldState(element) : null;
     // Event-driven widgets may implement their own keys. Only local semantic
     // effects/focus count as evidence; unrelated page timers/animation do not.
@@ -1336,10 +1416,11 @@
       } else if (toggle) {
         const checked = element.checked;
         verify();
+        dispatched = true;
         element.click();
-        verify();
+        const intact = postVerify();
         expectedChecked = element.checked;
-        if (checked === expectedChecked) failure = errorResult('NO_EFFECT', 'Space 未改变选中状态');
+        if (intact && checked === expectedChecked) failure = errorResult('NO_EFFECT', 'Space 未改变选中状态');
       } else if (submit) {
         let submitted = false;
         let submissionError;
@@ -1357,6 +1438,7 @@
         form.addEventListener('submit', onSubmit, true);
         try {
           verify();
+          dispatched = true;
           if (submitter) form.requestSubmit(submitter);
           else if (defaultSubmitter) {
             // Native click activation preserves submitter, name/value,
@@ -1371,21 +1453,23 @@
             if (blockers.length <= 1) form.requestSubmit();
           }
           if (submissionError) throw submissionError;
-          verify();
+          // 提交事件已触发：只确认已派发，业务结果由页面/用户核对；身份变化不再算未执行。
+          postVerify();
           if (!submitted) failure = errorResult('NO_EFFECT', 'Enter 未触发表单提交事件，请检查默认提交按钮、页面事件或原生约束校验');
         } finally { form.removeEventListener('submit', onSubmit, true); }
       }
     }
-    verify();
-    element.dispatchEvent(new KeyboardEvent('keyup', init));
-    verify();
+    postVerify();
+    // 已派发后节点被替换/改身份则不再向旧节点补发 keyup。
+    if (!dispatched || identityStillValid()) element.dispatchEvent(new KeyboardEvent('keyup', init));
+    postVerify();
     await sleep(TIMING.settle, runId);
-    verify();
+    postVerify();
     if (expected != null && textFieldState(element) !== expected) failure = errorResult('NO_EFFECT', '按键后页面未保留预期字段值或选区');
     if (expectedFocus && focusedElement() !== expectedFocus) failure = errorResult('NO_EFFECT', '按键后页面未保留预期焦点');
     if (expectedChecked != null && element.checked !== expectedChecked) failure = errorResult('NO_EFFECT', '按键后页面未保留预期选中状态');
     if (custom && beforeEffect === pageStateSignature(effectRoot) && beforeFocus === focusedElement()) failure = errorResult('UNSUPPORTED_KEY', '未观察到此按键的局部语义或焦点效果；无法保证自定义控件/富文本或未实现按键的浏览器默认行为');
-    return failure || { ok: true, msg: `已按键 ${requested}`, state: readState(element) };
+    return failure || { ok: true, msg: `已按键 ${requested}`, state: element.isConnected ? readState(element) : '页面已更新' };
   }
 
   async function typeText(element, value, runId, verify) {
@@ -1401,31 +1485,38 @@
     const text = normalizedFieldValue(element, value);
     if (exceedsFieldLimit(element, text)) return valueNotApplied();
     const changed = fieldValueState(element)[0] !== text;
-    const expected = expectedFieldState(element, text, changed);
+    const expected = [text];
     const observe = valueTargetObserver(element, verify, runId);
+    const wholeNumber = element instanceof HTMLInputElement && element.type === 'number';
     if (changed) {
-      if (element.isContentEditable) element.textContent = '';
-      else setNativeValue(element, '', verify);
-      // type retains its whole-field replacement contract; each native append
-      // places the caret at the end, rather than inserting at the old selection.
-      for (const char of text) {
-        if (!canContinueValueEvents(element, verify, runId)) break;
-        const down = element.dispatchEvent(new KeyboardEvent('keydown', { key: char, bubbles: true, cancelable: true, composed: true }));
-        if (!canContinueValueEvents(element, verify, runId)) break;
-        if (down) {
-          if (element.isContentEditable) element.textContent += char;
-          else setNativeValue(element, element.value + char, verify);
-          element.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, inputType: 'insertText', data: char }));
+      if (wholeNumber) {
+        // Native number setters reject intermediate strings such as '-' or '12.'.
+        // Keep the whole-field replacement contract and verify the complete value.
+        setNativeValue(element, text, verify);
+        element.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, inputType: 'insertText', data: text }));
+      } else {
+        if (element.isContentEditable) element.textContent = '';
+        else setNativeValue(element, '', verify);
+        // Each native append places the caret at the end of the replaced field.
+        for (const char of text) {
+          if (!canContinueValueEvents(element, verify, runId)) break;
+          const down = element.dispatchEvent(new KeyboardEvent('keydown', { key: char, bubbles: true, cancelable: true, composed: true }));
+          if (!canContinueValueEvents(element, verify, runId)) break;
+          if (down) {
+            if (element.isContentEditable) element.textContent += char;
+            else setNativeValue(element, element.value + char, verify);
+            element.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, inputType: 'insertText', data: char }));
+          }
+          if (!canContinueValueEvents(element, verify, runId)) break;
+          element.dispatchEvent(new KeyboardEvent('keyup', { key: char, bubbles: true, cancelable: true, composed: true }));
+          await sleep(12, runId);
         }
-        if (!canContinueValueEvents(element, verify, runId)) break;
-        element.dispatchEvent(new KeyboardEvent('keyup', { key: char, bubbles: true, cancelable: true, composed: true }));
-        await sleep(12, runId);
       }
       if (canContinueValueEvents(element, verify, runId)) element.dispatchEvent(new Event('change', { bubbles: true }));
     }
-    const confirmed = await confirmValueApplied(observe, fieldValueState, expected, runId);
+    const confirmed = await confirmValueApplied(observe, fieldValueOnly, expected, runId);
     if (confirmed.error) return confirmed.error;
-    return { ok: true, ...(changed ? {} : { code: 'NO_CHANGE' }), msg: changed ? '已逐字输入' : '目标已是指定内容', state: readState(confirmed.target) };
+    return { ok: true, ...(changed ? {} : { code: 'NO_CHANGE' }), msg: changed ? (wholeNumber ? '已输入数字' : '已逐字输入') : '目标已是指定内容', state: readState(confirmed.target) };
   }
 
   function isNavigationResult(result) {
@@ -1585,14 +1676,18 @@
       // 原生控件以 checked 为准（aria 可能与实际状态脱节）；仅非原生 ARIA 控件才信 aria-checked
       if (checkbox?.checked || (!checkbox && target.getAttribute('aria-checked') === 'true')) return { ok: true, code: 'NO_CHANGE', msg: '目标已选中', state: '已选中' };
       // label 引用时 target 是其内部 input，直接点 input 保证原生翻转与 change 事件
-      await clickOnce(checkbox || element, runId, verify, 1, element, resolved.recoverChoice);
+      const isChecked = (node) => {
+        const control = choiceTarget(node) || node;
+        return control instanceof HTMLInputElement ? control.checked : control?.getAttribute('aria-checked') === 'true';
+      };
+      const clicked = await clickOnce(checkbox || element, runId, verify, 1, element, resolved.recoverChoice, (node) => !isChecked(node));
       const record = action.ref != null && optionRecords.get(Number(action.ref));
       const observedElement = element.isConnected ? element : record && optionAt(record.path);
       if (record && !optionMatches(observedElement, record)) return errorResult('STALE_TARGET', '点击后题目或选项身份已变化，请重新读取页面核对实际状态');
       const observed = observedElement && (choiceTarget(observedElement) || observedElement);
       const checked = observed instanceof HTMLInputElement ? observed.checked : observed?.getAttribute('aria-checked') === 'true';
       if (!checked) return errorResult('CHECK_NOT_APPLIED', '点击后目标仍未选中，页面可能阻止了合成点击，请重新读取页面或手动选择');
-      return { ok: true, msg: '已选中目标', state: readState(observedElement) };
+      return { ok: true, ...(clicked === false ? { code: 'NO_CHANGE' } : {}), msg: clicked === false ? '目标已选中' : '已选中目标', state: readState(observedElement) };
     }
     if (action.action === 'click') {
       const before = pageSignature();
@@ -1635,7 +1730,7 @@
       const next = normalizedFieldValue(target, action.value);
       if (exceedsFieldLimit(target, next)) return valueNotApplied();
       const changed = fieldValueState(target)[0] !== next;
-      const expected = expectedFieldState(target, next, changed);
+      const expected = [next];
       const observe = valueTargetObserver(target, verify, runId);
       if (changed) {
         if (target.isContentEditable) target.textContent = next;
@@ -1644,7 +1739,7 @@
         if (canContinueValueEvents(target, verify, runId)) target.dispatchEvent(new Event('change', { bubbles: true }));
       }
       if (canContinueValueEvents(target, verify, runId)) target.blur();
-      const confirmed = await confirmValueApplied(observe, fieldValueState, expected, runId);
+      const confirmed = await confirmValueApplied(observe, fieldValueOnly, expected, runId);
       if (confirmed.error) return confirmed.error;
       return { ok: true, code: changed ? 'FILLED' : 'NO_CHANGE', msg: changed ? '已填写目标' : '目标已是指定内容', state: readState(confirmed.target) };
     }
@@ -1656,10 +1751,15 @@
       if (!requestedList.length || requestedList.includes('')) return errorResult('OPTION_NOT_FOUND', '选项不存在');
       const hits = [];
       for (const requested of requestedList) {
-        const exact = [...target.options].filter((option) => option.value === requested || option.textContent.trim() === requested);
-        const prefix = exact.length ? [] : [...target.options].filter((option) => option.textContent.trim().startsWith(requested));
-        const hit = exact[0] || (prefix.length === 1 ? prefix[0] : null);
-        if (!hit) return errorResult('OPTION_NOT_FOUND', prefix.length > 1 ? '选项前缀不唯一' : '选项不存在');
+        // 提交值优先；只有没有同值选项时才按可见文字匹配，文字重复或前缀不唯一均拒绝，避免静默选中首项。
+        const byValue = [...target.options].filter((option) => option.value === requested);
+        const byText = byValue.length ? [] : [...target.options].filter((option) => option.textContent.trim() === requested);
+        const prefix = byValue.length || byText.length ? [] : [...target.options].filter((option) => option.textContent.trim().startsWith(requested));
+        const candidates = byValue.length ? byValue : byText.length ? byText : prefix;
+        if (candidates.length !== 1) {
+          return errorResult('OPTION_NOT_FOUND', candidates.length > 1 ? '匹配到多个选项，请使用唯一的选项值' : '选项不存在');
+        }
+        const hit = candidates[0];
         if (!hits.includes(hit)) hits.push(hit);
       }
       const options = [...target.options];
@@ -1775,10 +1875,16 @@
       assertActive(message.runId);
       return { results, page };
     } catch (error) {
-      // 导航也可能发生于批间等待或最终快照等待，把边界归到最后一个已执行动作。
+      // 导航也可能发生于批间等待或最终快照等待。仅把它归到成功的最后动作；失败或跳过的结果保持原样，
+      // 由批级 navigation 告知后台等待新文档，避免把未执行的提交显示为成功。
       if (!isNavigationResult(error)) throw error;
-      if (results.length) Object.assign(results.at(-1), navigationResult());
-      else results.push(navigationResult());
+      const last = results.at(-1);
+      if (last?.ok === true && !isNavigationResult(last)) Object.assign(last, navigationResult());
+      else if (!results.length) results.push(navigationResult());
+      else {
+        while (results.length < message.actions.length) results.push(skippedAfterNavigation());
+        return { results, navigation: navigationResult() };
+      }
       while (results.length < message.actions.length) results.push(skippedAfterNavigation());
       return { results };
     } finally {

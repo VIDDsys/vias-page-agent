@@ -148,7 +148,7 @@ function renderList() {
   for (const model of models) {
     const active = model.id === activeModelId;
     const card = document.createElement('section');
-    card.className = `card${active ? ' active' : ''}`;
+    card.className = 'card';
     const row = document.createElement('div');
     row.className = 'row';
     const name = document.createElement('strong');

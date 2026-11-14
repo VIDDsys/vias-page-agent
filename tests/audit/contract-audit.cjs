@@ -1,5 +1,5 @@
 'use strict';
-// 契约一致性审计：跨文件的常量、错误码、状态码、动作名是否真的对齐
+// 历史契约审计器：依赖旧版源码布局；适用边界见本目录 README.md。
 const fs = require('node:fs');
 const path = require('node:path');
 const root = path.resolve(__dirname, '..', '..');
@@ -10,6 +10,15 @@ const background = read('background.js');
 const sidepanel = read('sidepanel.js');
 const options = read('options.js');
 const core = read('core.js');
+
+const legacySourceLayout = /\bconst DEFAULT_TEXT_BUDGET\s*=/.test(content)
+  && /\bconst DEFAULT_TARGET_BUDGET\s*=/.test(content)
+  && /\bconst ACTION_PROTOCOL\s*=/.test(background);
+if (!legacySourceLayout) {
+  console.error('审计器不适配：此历史脚本依赖的源码结构已变更，未执行契约判定。');
+  console.error('当前验证请在源码目录执行 npm run test:all；历史脚本说明见 tests/audit/README.md。');
+  process.exit(2);
+}
 
 let problems = 0;
 const check = (label, condition, detail = '') => {

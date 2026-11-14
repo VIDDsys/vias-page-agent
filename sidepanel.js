@@ -139,6 +139,9 @@ const ACTION_FAILURES = {
   VALUE_NOT_APPLIED: '网站未保留填写/选择结果，已停止后续操作，请检查字段要求。',
   SKIPPED_AFTER_NAVIGATION: '页面正在跳转，此操作已跳过，请检查新页面。',
   SKIPPED_AFTER_FAILURE: '前序操作失败，此操作已跳过，请检查前面的结果。',
+  NOT_DISPATCHED: '本批操作在执行前已被页面拒绝，此操作未执行，请重新读取页面后重试。',
+  DISPATCH_UNCONFIRMED: '操作已发出，但未收到页面返回的结果，是否生效未知；请先核对当前页面的实际状态，再决定是否重试。',
+  INVALID_RESPONSE: '页面返回的结果无效，无法确认操作是否生效；请先核对当前页面，再决定是否重试。',
   BUSY: '页面正在处理其他操作，请稍后重试。',
   CANCELLED: '操作已取消，请检查页面状态。',
   INTERRUPTED: '操作已中断，请检查页面状态后重试。',
@@ -154,7 +157,7 @@ const ACTION_FAILURES = {
   IMAGE_REASON_REQUIRED: '图片读取缺少原因，请补充读取原因后重试。',
   IMAGE_ALREADY_READ: '这张图片已读取，无需重复读取。',
   READ_FAILED: '读取未完成，请重新读取页面后重试。',
-  ACTION_COMMUNICATION_FAILED: '页面通信失败，请检查页面状态后重试。',
+  ACTION_COMMUNICATION_FAILED: '页面通信失败，本批操作未能派发、未执行；请核对页面状态后再重试。',
   UNSUPPORTED_KEY: '当前页面无法可靠模拟该按键，请改用点击或填写。',
   NO_EFFECT: '按键未生效，请重新读取页面后核对状态。',
 };
@@ -162,6 +165,62 @@ const ACTION_FAILURES = {
 function toolText(value, limit) {
   const text = String(value ?? '');
   return globalThis.ViasCore.isInternalToolText(text) ? '' : text.slice(0, limit);
+}
+
+// 单一结果分类：操作行状态与任务记录共用，避免把未执行、已跳过、回执丢失一概算成失败。
+const RESULT_KINDS = Object.freeze({
+  ok: 'ok',
+  notDispatched: 'notDispatched',
+  skipped: 'skipped',
+  unconfirmed: 'unconfirmed',
+  cancelled: 'cancelled',
+  interrupted: 'interrupted',
+  failed: 'failed',
+});
+const UNCONFIRMED_CODES = new Set(['DISPATCH_UNCONFIRMED', 'INVALID_RESPONSE']);
+const RESULT_CLASS = {
+  ok: 'ok',
+  notDispatched: 'not-executed',
+  skipped: 'skipped',
+  unconfirmed: 'uncertain',
+  cancelled: 'fail',
+  interrupted: 'fail',
+  failed: 'fail',
+};
+const RESULT_LABEL = {
+  notDispatched: '未执行',
+  skipped: '已跳过',
+  unconfirmed: '未确认',
+  cancelled: '已取消',
+  interrupted: '已中断',
+  failed: '失败',
+};
+const RESULT_FALLBACK_REASON = {
+  notDispatched: '本批操作在执行前已被页面拒绝，此操作未执行，请重新读取页面后重试。',
+  skipped: '此操作已跳过，请检查前面的结果或页面跳转情况。',
+  unconfirmed: '未收到页面返回的结果，操作是否生效未知；请先核对当前页面的实际状态，再决定是否重试。',
+  cancelled: '操作已取消，请检查页面状态。',
+  interrupted: '操作已中断，请检查页面状态后重试。',
+  failed: '操作未完成，请检查页面状态后重试。',
+};
+
+// 未识别的明确错误仍按失败兜底；只有“已派发但结果未知”的码才归为未确认。
+// ACTION_COMMUNICATION_FAILED 由后台在确认消息未能送达页面时产生，属于未派发，不能写成已派发。
+function classifyResult(result) {
+  if (!result || typeof result !== 'object') return RESULT_KINDS.unconfirmed;
+  if (result.ok === true) return RESULT_KINDS.ok;
+  const code = String(result.code || '');
+  if (result.notDispatched === true || code === 'NOT_DISPATCHED' || code === 'ACTION_COMMUNICATION_FAILED') return RESULT_KINDS.notDispatched;
+  if (code.startsWith('SKIPPED_')) return RESULT_KINDS.skipped;
+  if (code === 'CANCELLED') return RESULT_KINDS.cancelled;
+  if (code === 'INTERRUPTED') return RESULT_KINDS.interrupted;
+  if (UNCONFIRMED_CODES.has(code)) return RESULT_KINDS.unconfirmed;
+  return RESULT_KINDS.failed;
+}
+
+function resultReason(result, kind) {
+  const code = String(result?.code || '');
+  return Object.hasOwn(ACTION_FAILURES, code) ? ACTION_FAILURES[code] : RESULT_FALLBACK_REASON[kind] || RESULT_FALLBACK_REASON.failed;
 }
 
 function addTools(round, actions, title) {
@@ -202,13 +261,14 @@ function addTools(round, actions, title) {
 
 function updateTool(context, slot, result) {
   if (!slot || !context.pendingTools.has(slot)) return;
-  const ok = result.ok === true;
+  const kind = classifyResult(result);
   slot.row.classList.remove('pending');
-  slot.row.classList.add(ok ? 'ok' : 'fail');
-  slot.state.textContent = ok ? (slot.image ? '已读取' : toolText(result.state, 160).replace('当前值=', '') || '完成')
-    : result.code === 'CANCELLED' ? '已取消' : result.code === 'INTERRUPTED' ? '已中断' : '失败';
-  slot.reason.hidden = ok;
-  slot.reason.textContent = ok ? '' : (Object.hasOwn(ACTION_FAILURES, result.code) ? ACTION_FAILURES[result.code] : '操作未完成，请检查页面状态后重试。');
+  slot.row.classList.add(RESULT_CLASS[kind]);
+  slot.state.textContent = kind === RESULT_KINDS.ok
+    ? (slot.image ? '已读取' : toolText(result.state, 160).replace('当前值=', '') || '完成')
+    : RESULT_LABEL[kind];
+  slot.reason.hidden = kind === RESULT_KINDS.ok;
+  slot.reason.textContent = kind === RESULT_KINDS.ok ? '' : resultReason(result, kind);
   context.pendingTools.delete(slot);
 }
 
@@ -238,15 +298,19 @@ async function copyText(text, success) {
   }
 }
 
+function copyCodeBlock(pre) {
+  void copyText((pre.querySelector('code') || pre).textContent ?? '', '代码块已复制');
+}
+
 document.addEventListener('keydown', (event) => {
   const pre = event.target.closest?.('.md-content pre');
-  if (pre && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); void copyText((pre.innerText || '').trim(), '代码块已复制'); }
+  if (pre && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); copyCodeBlock(pre); }
 });
 document.addEventListener('click', (event) => {
   if (String(getSelection() || '').length) return;
   const pre = event.target.closest('pre');
-  if (pre?.closest('.md-content')) { void copyText((pre.innerText || '').trim(), '代码块已复制'); return; }
-  if (event.target.tagName === 'CODE' && event.target.closest('.md-content') && !event.target.closest('pre')) void copyText((event.target.innerText || '').trim(), '行内代码已复制');
+  if (pre?.closest('.md-content')) { copyCodeBlock(pre); return; }
+  if (event.target.tagName === 'CODE' && event.target.closest('.md-content') && !event.target.closest('pre')) void copyText(event.target.textContent ?? '', '行内代码已复制');
 });
 
 function setControlsRunning(running) {
@@ -534,12 +598,14 @@ for (const chip of CHIPS) {
   chipsEl.appendChild(button);
 }
 
-function describeJournalResult(action, result, prefix = '') {
+function describeJournalResult(action, result, prefix = '', kind = classifyResult(result)) {
   const name = toolText(action.action, 32) || '操作';
   const detail = toolText(typeof action.detail === 'string' ? action.detail : '', 80);
-  const state = !result ? '结果未知'
-    : result.ok === true ? '成功'
-      : `失败（${Object.hasOwn(ACTION_FAILURES, result.code) ? ACTION_FAILURES[result.code] : '未完成，请检查页面状态'}）`;
+  const state = !result ? '未确认（未收到页面结果）'
+    : kind === RESULT_KINDS.ok ? '成功'
+      : kind === RESULT_KINDS.failed || kind === RESULT_KINDS.unconfirmed || kind === RESULT_KINDS.notDispatched || kind === RESULT_KINDS.skipped
+        ? `${RESULT_LABEL[kind]}（${resultReason(result, kind)}）`
+        : RESULT_LABEL[kind];
   return `${prefix}${name}${detail ? ` ${detail}` : ''}：${state}`;
 }
 
@@ -547,22 +613,40 @@ function buildRunJournal(context, outcome, error = '') {
   const operations = [...context.operations.values()];
   if (!operations.length) return error ? `上一任务已停止。停止原因：${toolText(error, 300)}`.slice(0, 1500) : '';
   const total = operations.reduce((count, entry) => count + entry.actions.length, 0);
-  const failed = [];
+  const groups = { unconfirmed: [], failed: [], cancelled: [], interrupted: [], skipped: [], notDispatched: [] };
+  let okCount = 0;
   operations.forEach((entry, batch) => entry.actions.forEach((action, index) => {
     const result = entry.results.get(index);
-    if (result && result.ok !== true) failed.push(describeJournalResult(action, result, `第 ${batch + 1} 批 ${index + 1}. `));
+    const kind = classifyResult(result);
+    if (kind === RESULT_KINDS.ok) { okCount += 1; return; }
+    groups[kind].push(describeJournalResult(action, result, `第 ${batch + 1} 批 ${index + 1}. `, kind));
   }));
   const last = operations.at(-1);
-  const lines = failed.length
-    ? failed.slice(-8)
-    : last.actions.slice(0, 10).map((action, index, _all) => describeJournalResult(action, last.results.get(index), `${index + 1}. `));
-  const heading = failed.length ? '本任务失败或未确认的操作' : '最后一批操作';
+  // 未确认与失败各占一半名额，避免未知回执被相邻的失败条目挤掉；跳过与未执行随后补齐。
+  const lines = groups.failed.length || groups.unconfirmed.length
+    ? [...groups.failed.slice(0, 4), ...groups.unconfirmed.slice(0, 4),
+      ...groups.failed.slice(4), ...groups.unconfirmed.slice(4),
+      ...groups.cancelled, ...groups.interrupted, ...groups.skipped, ...groups.notDispatched]
+    : [...groups.cancelled, ...groups.interrupted, ...groups.skipped, ...groups.notDispatched];
+  const shown = lines.length
+    ? lines.slice(0, 8)
+    : last.actions.slice(0, 10).map((action, index) => describeJournalResult(action, last.results.get(index), `${index + 1}. `));
+  const heading = groups.failed.length || groups.unconfirmed.length ? '本任务失败或未确认的操作'
+    : groups.cancelled.length || groups.interrupted.length ? '本任务已停止的操作'
+      : lines.length ? '本任务跳过或未执行的操作' : '最后一批操作';
   const outcomeText = outcome === 'unverified' ? '已结束，但仍有未确认的操作'
     : outcome === 'stalled' ? '因连续无进展或重复而停止'
       : outcome === 'limit' ? '达到执行上限后停止'
         : outcome === 'cancelled' ? '已停止' : '已结束';
+  const counts = [`成功 ${okCount}`];
+  if (groups.unconfirmed.length) counts.push(`未确认 ${groups.unconfirmed.length}`);
+  if (groups.failed.length) counts.push(`失败 ${groups.failed.length}`);
+  if (groups.cancelled.length) counts.push(`已取消 ${groups.cancelled.length}`);
+  if (groups.interrupted.length) counts.push(`已中断 ${groups.interrupted.length}`);
+  if (groups.skipped.length) counts.push(`已跳过 ${groups.skipped.length}`);
+  if (groups.notDispatched.length) counts.push(`未执行 ${groups.notDispatched.length}`);
   const errorText = error ? `\n停止原因：${toolText(error, 300)}` : '';
-  return `上一任务${outcomeText}，共执行 ${total} 个页面操作。${heading}：\n${lines.join('\n')}${errorText}`.slice(0, 1500);
+  return `上一任务${outcomeText}，共计划 ${total} 个页面操作（${counts.join('，')}）。${heading}：\n${shown.join('\n')}${errorText}`.slice(0, 1500);
 }
 
 function finishRun(context, outcome, error = '') {
@@ -736,7 +820,10 @@ formEl.addEventListener('submit', (event) => {
   else void send();
 });
 inputEl.addEventListener('keydown', (event) => {
-  if (event.key === 'Enter' && !event.isComposing) { event.preventDefault(); if (activeRun) stopRun(); else void send(); }
+  if (event.key !== 'Enter' || event.isComposing) return;
+  event.preventDefault();
+  if (event.repeat) return;
+  if (activeRun) stopRun(); else void send();
 });
 
 function autosize() {

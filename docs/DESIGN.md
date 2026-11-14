@@ -1,6 +1,6 @@
 # Vias 页面助手界面规范
 
-适用版本：0.15.0。覆盖侧栏 `sidepanel.html` 与设置页 `options.html`。
+覆盖侧栏 `sidepanel.html` 与设置页 `options.html`。
 
 ## 设计目标
 
@@ -61,26 +61,26 @@
 
 | Token | Value | Use |
 | --- | --- | --- |
-| `--site-page` | `#ffffff` | 页面与输入表面 |
-| `--site-surface` | `#fafafa` | 次级表面、当前模型行 |
-| `--site-surface-strong` | `#f4f4f5` | 标签、只读区 |
-| `--site-ink` | `#111111` | 主文字、主按钮 |
-| `--site-body` | `#3f3f46` | 正文、次级按钮文字 |
-| `--site-muted` | `#71717a` | 辅助文字 |
-| `--site-faint` | `#a1a1aa` | 占位文字 |
-| `--site-line` | `#e4e4e7` | 分隔线、卡片边界 |
-| `--site-line-strong` | `#d4d4d8` | 输入与按钮边界 |
-| `--site-fail` | `#b42318` | 删除与错误 |
-| `--site-page-dark` | `#111113` | 深色页面 |
-| `--site-surface-dark` | `#17171a` | 深色次级表面 |
-| `--site-surface-strong-dark` | `#1f1f23` | 深色标签与只读区 |
-| `--site-line-dark` | `#2a2a2e` | 深色分隔线 |
-| `--site-line-strong-dark` | `#3f3f46` | 深色输入边界 |
-| `--site-fail-dark` | `#f97066` | 深色错误 |
+| `--color-page` | `#ffffff` | 页面与输入表面 |
+| `--color-surface` | `#fafafa` | 次级表面、按钮悬停 |
+| `--color-surface-strong` | `#f4f4f5` | 标签、只读区 |
+| `--color-ink` | `#111111` | 主文字、主按钮 |
+| `--color-body` | `#3f3f46` | 正文、次级按钮文字 |
+| `--color-muted` | `#71717a` | 辅助文字 |
+| `--color-faint` | `#a1a1aa` | 占位文字 |
+| `--color-line` | `#e4e4e7` | 分隔线、卡片边界 |
+| `--color-line-strong` | `#d4d4d8` | 输入与按钮边界 |
+| `--color-fail` | `#b42318` | 删除与错误 |
+| `--color-page`（深色） | `#111113` | 深色页面 |
+| `--color-surface`（深色） | `#17171a` | 深色次级表面 |
+| `--color-surface-strong`（深色） | `#1f1f23` | 深色标签与只读区 |
+| `--color-line`（深色） | `#2a2a2e` | 深色分隔线 |
+| `--color-line-strong`（深色） | `#3f3f46` | 深色输入边界 |
+| `--color-fail`（深色） | `#f97066` | 深色错误 |
 
 深色文字与中性色在两套体系间复用：`#f4f4f5`、`#d4d4d8`、`#a1a1aa`、`#71717a`、`#3f3f46` 在设置页深色模式中分别承担主文字、正文、辅助、占位与边界角色。
 
-阴影只用于确实需要分层的弹出菜单；设置页以边框和表面色分层，不使用投影。两页都不使用彩色强调：选中、当前状态与成功使用石墨或灰阶，只有失败、删除等错误语义使用红色。Markdown 高亮使用中性灰底，不引入黄色。
+阴影只用于确实需要分层的弹出菜单；设置页以边框和表面色分层，不使用投影。两页都不使用彩色强调：选中、当前状态与成功使用石墨或灰阶，只有失败、删除与停止使用红色。Markdown 高亮使用中性灰底，不引入黄色。
 
 ## Fonts
 
@@ -89,8 +89,8 @@
 | `--font-body` | `"Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif` | 侧栏正文、表单与控件 |
 | `--font-title` | `"Segoe UI Variable Display", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif` | 侧栏品牌、页面与分区标题 |
 | `--font-code` | `"Cascadia Code", Consolas, monospace` | 侧栏代码、工具名与标识符 |
-| `--font-site` | `-apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif` | 设置页全部界面文字 |
-| `--font-site-mono` | `ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace` | 设置页接口地址与模型标识 |
+| `--font-sans` | `-apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif` | 设置页全部界面文字 |
+| `--font-mono` | `ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace` | 设置页接口地址与模型标识 |
 
 采用系统字体是本项目的明确决定：面向 Windows/Edge，保证中文可读、加载稳定，并避免扩展新增远程资源。设置页的字体顺序直接对齐网站 token。
 
@@ -128,8 +128,8 @@
 | `--radius-sm` | `4px` | 侧栏按钮、标签、行内代码 |
 | `--radius` | `6px` | 侧栏输入区、工具记录、菜单 |
 | `--radius-lg` | `8px` | 侧栏用户任务表面与头像 |
-| `--site-radius-sm` | `6px` | 设置页标签与头像 |
-| `--site-radius` | `10px` | 设置页按钮、输入、面板、当前模型行 |
+| `--radius-sm`（设置页） | `6px` | 设置页标签与头像 |
+| `--radius`（设置页） | `10px` | 设置页按钮、输入、面板与模型列表 |
 
 分段按钮贴合父容器的内角时可减去 1px 边框；复选标记自身属于图形，不作为页面容器圆角。两页都禁止全局胶囊、大圆角聊天气泡、层层卡片与悬浮变形；设置页的 10px 对齐网站卡片口径，不超过该值。
 
@@ -153,4 +153,4 @@
 
 至少检查侧栏 320px、360px、390px，以及设置页 320px、390px、768px、1280px；覆盖浅色、深色、空态、长名称、错误态、工具时间线、模型编辑及提示词冲突。通过渲染后实测确认正文对比度、触控尺寸、边距、无意的横向溢出和真实点击命中。
 
-执行 `design-lint.mjs` 对照本文件的色板、字体与间距检查，并结合截图复查；自动扫描不能替代真实交互与视觉审查。项目自动化测试使用隔离 Edge 和本地模拟接口，不代替所有业务网站验证。
+在源码目录执行 `npm run test:ui`，验证布局、交互、主题对比度与反馈状态；完整回归使用 `npm run test:all`。本仓库不提供 `design-lint.mjs`，色板、字体、间距和圆角需结合本文件、渲染后的计算样式与截图核对。自动化检查不能替代真实交互与视觉审查；项目测试使用隔离 Edge 和本地模拟接口，不代替所有业务网站验证。

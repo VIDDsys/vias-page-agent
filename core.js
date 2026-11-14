@@ -88,6 +88,7 @@
     }
     if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('API 地址仅支持 http(s)');
     if (parsed.username || parsed.password) throw new Error('API 地址不能包含账号或密码');
+    if (/[?#]/.test(baseUrl)) throw new Error('API 地址不能包含查询参数或片段，请填写 API 基础地址');
     const model = String(cfg.model || '').trim();
     if (!model || model.length > 200) throw new Error('模型名不能为空且不能超过 200 个字符');
     const name = String(cfg.name || '').trim();
@@ -201,6 +202,17 @@
     return () => parent.removeEventListener('abort', onAbort);
   }
 
+  function decodeJsonEscapes(text) {
+    const controls = { b: '\b', f: '\f', n: '\n', r: '\r', t: '\t' };
+    return text.replace(/\\(?:u([0-9a-fA-F]{4})|(["\\/bfnrt]))/g, (_match, hex, escaped) =>
+      hex ? String.fromCharCode(parseInt(hex, 16)) : (controls[escaped] ?? escaped));
+  }
+
+  function containsApiKey(text, apiKey) {
+    // 仅检查解码副本，绝不改写正常回复或动作值。
+    return !!apiKey && (text.includes(apiKey) || decodeJsonEscapes(text).includes(apiKey));
+  }
+
   function redactErrorText(text, apiKey) {
     let safe = String(text);
     if (apiKey) {
@@ -208,6 +220,8 @@
       for (const secret of new Set([apiKey, JSON.stringify(apiKey).slice(1, -1)])) {
         safe = safe.split(secret).join('[REDACTED]');
       }
+      const decoded = decodeJsonEscapes(safe);
+      if (decoded.includes(apiKey)) safe = decoded.split(apiKey).join('[REDACTED]');
     }
     return safe.replace(/(\bauthorization["']?\s*:\s*["']?(?:bearer|basic)\s+)[^\s"',;<>\\]+/gi, '$1[REDACTED]');
   }
@@ -308,6 +322,9 @@
           throw new Error('模型响应缺少 choices[0].message.content 最终回答（推理内容不会执行）');
         }
         if (content.length > replyLimit) throw new Error(`模型回复过长（最多 ${replyLimit} 个 UTF-16 代码单元），已拒绝接收，未执行任何操作；请拆分任务或回复`);
+        if (containsApiKey(content, cfg.apiKey)) {
+          throw Object.assign(new Error('模型响应包含本次接口凭据，已拒绝整条回复，未执行任何操作；请检查接口网关并更换密钥'), { retryable: false });
+        }
         if (now() >= deadline) throw budgetError();
         return content;
       } catch (error) {
@@ -438,25 +455,22 @@
     return { say: text, actions: [], done: false };
   }
 
-  function cleanSay(value) {
-    const text = typeof value === 'string' ? value : '';
+  // say 是展示文本；其中出现指令或协议片段时整条回复不可信，不能删去片段后继续执行同条动作或完成信号。
+  function sayEmbedsProtocol(text) {
     const scan = scanInstructions(text);
-    if (scan.malformed.length) return '';
-    let cleaned = text;
-    let removed = false;
-    for (const item of scan.found.reverse()) {
-      cleaned = cleaned.slice(0, item.index) + cleaned.slice(item.end);
-      removed = true;
-    }
-    return removed ? cleaned.replace(/```(?:json)?\s*```/gi, '').trim() : text;
+    return scan.found.length > 0 || scan.malformed.length > 0;
   }
 
   function normalizeInstruction(value) {
     if (typeof value.say === 'string' && value.say.length > TEXT_LIMITS.say) {
       return replyLimitResult(`say 不能超过 ${TEXT_LIMITS.say} 个 UTF-16 代码单元，未执行本批操作；请拆分回复`);
     }
+    // 读取请求必须单独成条，不能与 say/actions/done 混排。
+    if (Object.hasOwn(value, 'vias_read') || (typeof value.say === 'string' && sayEmbedsProtocol(value.say))) {
+      return { say: '', actions: [], done: false, malformed: true };
+    }
     return {
-      say: cleanSay(value.say),
+      say: typeof value.say === 'string' ? value.say : '',
       actions: Array.isArray(value.actions) ? value.actions : [],
       done: value.done === true,
     };

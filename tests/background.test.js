@@ -26,6 +26,8 @@ function harness(options = {}) {
   const emitted = [];
   const extracts = [];
   const pageMessages = [];
+  const session = structuredClone(options.session || {});
+  const removedSessionKeys = [];
   let serial = 0;
   let current;
   const state = {
@@ -47,7 +49,8 @@ function harness(options = {}) {
     chrome: {
       sidePanel: { setPanelBehavior: async () => {} },
       ...(options.navigationSource ? { webNavigation: { onCreatedNavigationTarget: event() } } : {}),
-      storage: { local: {
+      ...(options.session ? { windows: { onRemoved: event() } } : {}),
+      storage: { ...(options.session ? { session: { remove: async (key) => { removedSessionKeys.push(key); delete session[key]; } } } : {}), local: {
         get: async (keys) => Array.isArray(keys)
           ? Object.fromEntries(keys.filter((key) => key in state).map((key) => [key, state[key]]))
           : { ...keys, ...state },
@@ -90,7 +93,7 @@ function harness(options = {}) {
   };
   const run = context.createRun({ postMessage: (message) => emitted.push(structuredClone(message)) }, 'test-run', 1);
   return {
-    context, run, calls, executions, emitted, extracts, pageMessages, nativeRequestModel, state,
+    context, run, calls, executions, emitted, extracts, pageMessages, nativeRequestModel, state, session, removedSessionKeys,
     start: (question = 'Complete the task', extra = {}) => context.agentLoop(run, question, { allowActions: true, ...extra }),
   };
 }
@@ -706,9 +709,11 @@ test('分段读取保留前轮失败状态及已读目标提交属性，提交�
 
 test('损坏协议不展示、不执行、不进入后续消息，修复后继续执行', async () => {
   const bad = '{"say":"LEAK_MARKER","actions":[{"action":"click","ref":1}],}';
-  const h = harness({ reply: (n) => n === 1 ? bad : n === 2 ? { say: '进行中 {"actions":[{"action":"click","value":"EMBEDDED_MARKER"}]}', ...click } : done });
+  const embedded = { say: '进行中 {"actions":[{"action":"click","value":"EMBEDDED_MARKER"}]}', ...click };
+  const h = harness({ reply: (n) => n === 1 ? bad : n === 2 ? embedded : n === 3 ? { say: '进行中', ...click } : done });
   const outcome = await h.start();
   assert.equal(outcome.outcome, 'completed');
+  // say 内嵌指令整条拒绝：同条 click 不执行，只有修复后的第 3 轮才执行。
   assert.equal(h.executions.length, 1);
   assert.equal(h.executions[0].actions[0].ref, 1);
   assert.ok(!JSON.stringify(h.emitted).includes('LEAK_MARKER'));
@@ -1082,6 +1087,7 @@ for (const communication of [false, true]) {
       execute: ({ snapshot, executions, message }) => {
         if (message.operationId === executions[0].operationId) {
           filled = '页面残留前缀';
+          // 回执丢失不再重发到（可能已重建的）文档：本批按“已派发但未知”结算。
           if (communication) throw new Error('Disconnected after dispatch');
           return { results: [{ ok: false, code: 'VALUE_NOT_APPLIED' }], page: page(snapshot, 1) };
         }
@@ -1090,9 +1096,9 @@ for (const communication of [false, true]) {
       },
     });
     assert.equal((await h.start()).outcome, 'completed');
-    assert.equal(h.calls.length, 3); assert.equal(h.executions.length, communication ? 3 : 2);
+    assert.equal(h.calls.length, 3); assert.equal(h.executions.length, 2);
     assert.equal(new Set(h.executions.map((execution) => execution.operationId)).size, 2);
-    assert.deepEqual(h.executions.map((execution) => execution.actions[0].ref), communication ? [1, 1, 3] : [1, 3]);
+    assert.deepEqual(h.executions.map((execution) => execution.actions[0].ref), [1, 3]);
     assert.equal(filled, desired); assert.equal(writes, 1);
   });
 }
@@ -1113,7 +1119,7 @@ for (const followup of ['other-fill', 'NO_CHANGE', 'same-click']) {
       },
     });
     assert.equal((await h.start()).outcome, 'unverified');
-    assert.equal(h.executions.length, 3);
+    assert.equal(h.executions.length, 2);
     assert.equal(new Set(h.executions.map((execution) => execution.operationId)).size, 2);
   });
 }
@@ -1491,7 +1497,7 @@ for (const kind of ['no-operation', 'wrong-opener', 'expired', 'closed', 'non-ht
   });
 }
 
-test('通信失败按operationId逐slot结算且计入预算，替换旧观察后不空转五十轮', async () => {
+test('派发结果未知按operationId逐slot结算且计入预算，替换旧观察后不空转五十轮', async () => {
   const actions = [{ action: 'click', ref: 1 }, { action: 'fill', ref: 1, value: '答案37' }, { action: 'check', ref: 1 }];
   const h = harness({ reply: () => ({ actions }), execute: () => { throw new Error('Disconnected'); } });
   assert.equal((await h.start()).outcome, 'stalled');
@@ -1506,9 +1512,9 @@ test('通信失败按operationId逐slot结算且计入预算，替换旧观察�
     assert.ok(batch.operationId); assert.equal(batch.round, index + 1);
     const settled = results.filter((result) => result.operationId === batch.operationId);
     assert.deepEqual(settled.map(({ index, ok, code }) => ({ index, ok, code })), [
-      { index: 0, ok: false, code: 'ACTION_COMMUNICATION_FAILED' },
-      { index: 1, ok: false, code: 'ACTION_COMMUNICATION_FAILED' },
-      { index: 2, ok: false, code: 'ACTION_COMMUNICATION_FAILED' },
+      { index: 0, ok: false, code: 'DISPATCH_UNCONFIRMED' },
+      { index: 1, ok: false, code: 'DISPATCH_UNCONFIRMED' },
+      { index: 2, ok: false, code: 'DISPATCH_UNCONFIRMED' },
     ]);
     settled.forEach((result) => {
       assert.equal(result.round, batch.round);
@@ -1633,6 +1639,159 @@ test('普通点击即使未返回导航code也按浏览器loading事件等待并
   assert.ok(!JSON.stringify(h.calls[1]).includes('OLD_DOCUMENT'));
 });
 
+test('EXECUTE点击导航丢回执不重放旧快照，读取新文档并按已派发但未知结算', async () => {
+  let arrived = false;
+  const h = harness({
+    reply: (n) => n === 1 ? { actions: [{ action: 'click', ref: 1 }] } : done,
+    getTab: async () => arrived
+      ? { id: 1, url: 'http://127.0.0.1:1/search?q=test', status: 'complete' }
+      : { id: 1, url: 'http://127.0.0.1:1/page', status: 'complete' },
+    extract: ({ snapshot, extracts }) => {
+      const page = snapshot(extracts.length === 1 ? 'INITIAL_SNAPSHOT' : 'SEARCH_RESULTS_FOUND');
+      if (extracts.length > 1) { page.snapshotId = 'new-document:1'; page.url = 'http://127.0.0.1:1/search?q=test'; }
+      return page;
+    },
+    execute: () => {
+      if (arrived) {
+        // 最小复现实测形态：旧代码会把携带旧 snapshotId 的 EXECUTE 重发到已经重建的文档，
+        // 新文档只能回批次级 STALE_SNAPSHOT，用户看到“页面已变化/未执行”。
+        return { results: [{ ok: false, code: 'STALE_SNAPSHOT', msg: '页面已跳转或快照已重建，请重新读取页面' }] };
+      }
+      // 真实浏览器：点击导致文档卸载，消息端口随之关闭，回执永远收不到。
+      arrived = true;
+      h.context.chrome.tabs.onUpdated.dispatch(1, { status: 'loading' });
+      throw new Error('The message port closed before a response was received');
+    },
+  });
+  const outcome = await h.start('在搜索框输入并点击搜索');
+  // 旧行为正是在这里重发旧快照并收到 STALE_SNAPSHOT，界面因此提示“页面已变化/未执行”。
+  assert.ok(!h.emitted.some((event) => event.code === 'STALE_SNAPSHOT'));
+  // 只派发一次：旧 snapshotId 绝不重发到新文档。
+  assert.equal(h.executions.length, 1);
+  assert.equal(h.pageMessages.filter((message) => message.type === 'EXECUTE').length, 1);
+  assert.equal(h.executions[0].snapshotId, 'document:1');
+  const firstRound = h.emitted.filter((event) => event.t === 'result' && event.round === 1);
+  assert.deepEqual(firstRound.map(({ index, ok, code }) => ({ index, ok, code })), [{ index: 0, ok: false, code: 'DISPATCH_UNCONFIRMED' }]);
+  assert.deepEqual(firstRound.map((event) => event.notDispatched), [false]);
+  assert.ok(firstRound.every((event) => /没有收到执行回执/u.test(event.msg)));
+  assert.equal(firstRound[0].navigationUrl, 'http://127.0.0.1:1/search?q=test');
+  // 新页面被如实读取并交给模型核对，而不是把旧页面或“未执行”当结果。
+  assert.equal(h.extracts.length, 2);
+  assert.match(JSON.stringify(h.calls[1]), /SEARCH_RESULTS_FOUND/);
+  assert.doesNotMatch(JSON.stringify(h.calls[1]), /INITIAL_SNAPSHOT/);
+  assert.match(h.calls[1].at(-1).content, /没有收到执行回执/u);
+  assert.match(h.calls[1].at(-1).content, /不能视为成功/u);
+  // 未确认的点击不能被后续 done 冒充成功。
+  assert.equal(outcome.outcome, 'unverified');
+  assert.equal(h.calls.length, 2);
+});
+
+test('连续三轮导航丢回执不占失败预算，不被误判为“未能执行任何操作”', async () => {
+  let round = 0;
+  const h = harness({
+    reply: (n) => n <= 3 ? { actions: [{ action: 'click', ref: 1 }] } : done,
+    getTab: async () => ({ id: 1, url: `http://127.0.0.1:1/step${round}`, status: 'complete' }),
+    extract: ({ snapshot, extracts }) => {
+      const page = snapshot(`STEP_${extracts.length}`);
+      page.snapshotId = `document-${extracts.length}:1`;
+      page.url = `http://127.0.0.1:1/step${extracts.length}`;
+      return page;
+    },
+    execute: () => {
+      round += 1;
+      h.context.chrome.tabs.onUpdated.dispatch(1, { status: 'loading' });
+      throw new Error('The message port closed before a response was received');
+    },
+  });
+  const outcome = await h.start('连续点击跳转');
+  assert.equal(h.calls.length, 4);
+  assert.equal(h.executions.length, 3);
+  assert.equal(h.extracts.length, 4);
+  assert.ok(!h.emitted.some((event) => event.t === 'say' && /未能执行任何操作|没有变化/u.test(event.text)));
+  assert.equal(outcome.outcome, 'unverified');
+});
+
+test('批次级快照拒绝整批标记未派发，不留永久未确认证据，重读后可完成', async () => {
+  const h = harness({
+    reply: (n) => n === 1
+      ? { actions: [{ action: 'fill', ref: 1, value: '答案37' }, { action: 'click', ref: 2 }] }
+      : n === 2 ? { actions: [{ action: 'fill', ref: 1, value: '答案37' }] } : done,
+    execute: ({ snapshot, message, executions }) => executions.length === 1
+      ? { results: [{ ok: false, code: 'STALE_SNAPSHOT', msg: '页面已跳转或快照已重建，请重新读取页面' }] }
+      : { results: message.actions.map(() => ({ ok: true, code: 'FILLED' })), page: snapshot() },
+  });
+  const outcome = await h.start('填写答案');
+  assert.equal(h.extracts.length, 2);
+  const firstRound = h.emitted.filter((event) => event.t === 'result' && event.round === 1);
+  // 批次级拒绝发生在任何动作之前：第一个是拒绝原因，其余明确为未派发，不能变成 INVALID_RESPONSE。
+  assert.deepEqual(firstRound.map(({ index, ok, code }) => ({ index, ok, code })), [
+    { index: 0, ok: false, code: 'STALE_SNAPSHOT' },
+    { index: 1, ok: false, code: 'NOT_DISPATCHED' },
+  ]);
+  // 侧栏据此显示“未执行”，不能把首项 STALE_SNAPSHOT 当成执行失败。
+  assert.deepEqual(firstRound.map((event) => event.notDispatched), [true, true]);
+  assert.match(JSON.stringify(h.calls[1]), /NOT_DISPATCHED/);
+  assert.doesNotMatch(JSON.stringify(h.calls[1]), /INVALID_RESPONSE/);
+  // 重读后的真实成功即算完成：未派发的批次不欠确认。
+  assert.equal(outcome.outcome, 'completed');
+  assert.equal(h.calls.length, 3);
+});
+
+test('整批拒绝含repeat动作时未派发槽位不欠确认，重读真实成功后仍可完成', async () => {
+  const h = harness({
+    reply: (n) => n === 1
+      ? { actions: [{ action: 'repeat', times: 2, actions: [{ action: 'click', ref: 1 }] }] }
+      : n === 2 ? { actions: [{ action: 'click', ref: 1 }] } : done,
+    execute: ({ snapshot, message, executions }) => executions.length === 1
+      ? { results: [{ ok: false, code: 'STALE_SNAPSHOT', msg: '页面已跳转或快照已重建，请重新读取页面' }] }
+      : { results: message.actions.map(() => ({ ok: true })), page: snapshot() },
+  });
+  const outcome = await h.start('循环点击两次');
+  const firstRound = h.emitted.filter((event) => event.t === 'result' && event.round === 1);
+  // repeat 槽位同样是整批拒绝，没有任何子动作派发过。
+  assert.deepEqual(firstRound.map(({ index, ok, code, notDispatched }) => ({ index, ok, code, notDispatched })),
+    [{ index: 0, ok: false, code: 'STALE_SNAPSHOT', notDispatched: true }]);
+  assert.equal(h.extracts.length, 2);
+  // repeat 分支不能因为没有 children 就把 incomplete 永久钉死。
+  assert.doesNotMatch(JSON.stringify(h.calls[1]), /仍有操作未获成功确认/u);
+  assert.equal(outcome.outcome, 'completed');
+  assert.equal(h.calls.length, 3);
+});
+
+test('多动作批次整批拒绝时补齐槽位的repeat不新增未确认证据', async () => {
+  const h = harness({
+    reply: (n) => n === 1
+      ? { actions: [{ action: 'click', ref: 1 }, { action: 'repeat', times: 2, actions: [{ action: 'click', ref: 1 }] }] }
+      : n === 2 ? { actions: [{ action: 'click', ref: 1 }] } : done,
+    execute: ({ snapshot, message, executions }) => executions.length === 1
+      ? { results: [{ ok: false, code: 'STALE_SNAPSHOT', msg: '页面已跳转或快照已重建，请重新读取页面' }] }
+      : { results: message.actions.map(() => ({ ok: true })), page: snapshot() },
+  });
+  const outcome = await h.start('点击并循环点击');
+  const firstRound = h.emitted.filter((event) => event.t === 'result' && event.round === 1);
+  assert.deepEqual(firstRound.map(({ index, code, notDispatched }) => ({ index, code, notDispatched })), [
+    { index: 0, code: 'STALE_SNAPSHOT', notDispatched: true },
+    { index: 1, code: 'NOT_DISPATCHED', notDispatched: true },
+  ]);
+  assert.doesNotMatch(JSON.stringify(h.calls[1]), /仍有操作未获成功确认/u);
+  assert.equal(outcome.outcome, 'completed');
+  assert.equal(h.calls.length, 3);
+});
+
+test('批次级拒绝后零确认提交仍被硬闸拦下一次并重读', async () => {
+  const h = harness({
+    reply: (n) => n === 1 ? { actions: [{ action: 'submitForm', ref: 2 }] } : n === 2 ? { actions: [{ action: 'submitForm', ref: 2 }] } : done,
+    execute: ({ snapshot, message, executions }) => executions.length === 1
+      ? { results: [{ ok: false, code: 'STALE_SNAPSHOT' }] }
+      : { results: message.actions.map(() => ({ ok: true })), page: snapshot() },
+  });
+  await h.start('提交表单');
+  // 第二轮提交被硬闸拦下，只重读页面未执行；未派发的批次不能替代这道闸。
+  assert.equal(h.executions.length, 1);
+  assert.equal(h.extracts.length, 3);
+  assert.match(JSON.stringify(h.calls[2]), /已拦下这一次提交并重新读取页面/);
+});
+
 test('合法长回复规范化后入历史，未声明padding不回灌且实际操作不被截短', async () => {
   const value = 'keep-entire-action-'.repeat(1000);
   const h = harness({
@@ -1656,3 +1815,381 @@ test('大批嵌套动作历史有界且敏感值不重复送回模型', () => {
   assert.ok(!text.includes('x'.repeat(100)));
   assert.equal(JSON.parse(text).detailsOmitted, true);
 });
+
+// P1 回归：repeat[click, wait, fill] times=3，第 2 轮 fill 失败导致第 3 轮未启动。
+// 未启动的 wait 没有副作用，且 wait 的成功从不结算证据，不能计欠；只有 click 这类真实副作用欠账要补。
+function repeatWaitFixture(catchUpActions) {
+  const page = (snapshot, round) => targetSnapshot(snapshot, `repeat等待观察${round}`, [
+    { ref: 1, identity: 'document:target:answer', tag: 'input', type: 'text', description: '输入框(text) 标签:答案 当前为空' },
+  ]);
+  const children = [
+    { action: 'click', iteration: 1, subIndex: 1, ok: true },
+    { action: 'wait', iteration: 1, subIndex: 2, ok: true },
+    { action: 'fill', iteration: 1, subIndex: 3, ok: true },
+    { action: 'click', iteration: 2, subIndex: 1, ok: true },
+    { action: 'wait', iteration: 2, subIndex: 2, ok: true },
+    { action: 'fill', iteration: 2, subIndex: 3, ok: false, code: 'VALUE_NOT_APPLIED', msg: '字段未保留' },
+  ];
+  return harness({
+    extract: ({ snapshot, executions }) => page(snapshot, executions.length),
+    reply: (n) => n === 1
+      ? { actions: [{ action: 'repeat', times: 3, value: 0, actions: [
+        { action: 'click', ref: 1 }, { action: 'wait', value: 50 }, { action: 'fill', ref: 1, value: 'x' },
+      ] }] }
+      : n === 2 ? { actions: catchUpActions } : done,
+    execute: ({ snapshot, message, executions }) => {
+      if (executions.length === 1) {
+        return { results: [{
+          ok: false, code: 'VALUE_NOT_APPLIED', msg: '循环在第 2 轮停止', results: children,
+          repeatSummary: { plannedIterations: 3, completedIterations: 1, iteration: 2, subIndex: 3, successCount: 5, failureCount: 1, skippedCount: 3, omittedCount: 0 },
+        }], page: page(snapshot, 1) };
+      }
+      return { results: message.actions.map(() => ({ ok: true })), page: page(snapshot, 2) };
+    },
+  });
+}
+
+test('repeat未启动的wait不计欠：click与fill补齐后completed', async () => {
+  const h = repeatWaitFixture([
+    { action: 'click', ref: 1 }, { action: 'wait', value: 50 }, { action: 'fill', ref: 1, value: 'x' },
+  ]);
+  assert.equal((await h.start('重复点击并填写三次')).outcome, 'completed');
+  assert.equal(h.executions.length, 2);
+  // 未启动的 wait 不再进入欠账列表（fill 幂等、click 由本轮 click 结算）。
+  const observation = h.calls.at(-1).at(-1).content;
+  assert.doesNotMatch(observation, /仍有操作未获成功确认/u);
+});
+
+test('repeat未启动的wait不计欠不等于放行真实副作用：click次数不足仍unverified', async () => {
+  const h = repeatWaitFixture([
+    { action: 'wait', value: 50 }, { action: 'fill', ref: 1, value: 'x' },
+  ]);
+  assert.equal((await h.start('重复点击并填写三次')).outcome, 'unverified');
+  assert.equal(h.executions.length, 2);
+  assert.match(h.calls.at(-1).at(-1).content, /仍有操作未获成功确认/u);
+});
+
+for (const repairCount of [1, 3]) {
+  test(`repeat未枚举的后续非幂等次数补做${repairCount}次${repairCount === 3 ? '足额恢复' : '仍未确认'}`, async () => {
+    let clicks = 0;
+    const page = (snapshot, round) => targetSnapshot(snapshot, `实际点击${clicks}次；观察${round}`, [{
+      ref: round + 1, identity: 'document:target:counter', tag: 'button', type: 'button', description: '按钮「累加」',
+    }]);
+    const h = harness({
+      extract: ({ snapshot }) => page(snapshot, 0),
+      reply: (n) => n === 1 ? { actions: [{ action: 'repeat', times: 3, value: 0, actions: [{ action: 'click', ref: 1 }] }] }
+        : n === 2 ? { actions: Array.from({ length: repairCount }, () => ({ action: 'click', ref: 2 })) } : done,
+      execute: ({ snapshot, executions, message }) => {
+        if (executions.length === 1) return { results: [{
+          ok: false, code: 'TARGET_HIDDEN', results: [{ action: 'click', iteration: 1, subIndex: 1, ok: false, code: 'TARGET_HIDDEN' }],
+          repeatSummary: { plannedIterations: 3, completedIterations: 1, iteration: 1, subIndex: 1, successCount: 0, failureCount: 1, skippedCount: 2, omittedCount: 0 },
+        }], page: page(snapshot, 1) };
+        clicks += message.actions.length;
+        return { results: message.actions.map(() => ({ ok: true })), page: page(snapshot, 2) };
+      },
+    });
+    assert.equal((await h.start('点击累加三次')).outcome, repairCount === 3 ? 'completed' : 'unverified');
+    assert.equal(clicks, repairCount);
+    assert.equal(h.executions.length, 2);
+    assert.equal(/仍有操作未获成功确认/.test(h.calls.at(-1).at(-1).content), repairCount !== 3);
+  });
+}
+
+for (const repairBoth of [false, true]) {
+  test(`repeat已枚举的失败与跳过项补做${repairBoth ? '足够可恢复完成' : '不足仍未确认'}`, async () => {
+    let clicks = 0;
+    const page = (snapshot, round) => targetSnapshot(snapshot, `实际点击${clicks}次；观察${round}`, [{
+      ref: round + 1, identity: 'document:target:counter', tag: 'button', type: 'button', description: '按钮「累加」',
+    }]);
+    const h = harness({
+      extract: ({ snapshot }) => page(snapshot, 0),
+      reply: (n) => n === 1 ? { actions: [{ action: 'repeat', times: 1, value: 0, actions: [{ action: 'click', ref: 1 }, { action: 'click', ref: 1 }] }] }
+        : n === 2 ? { actions: Array.from({ length: repairBoth ? 2 : 1 }, () => ({ action: 'click', ref: 2 })) } : done,
+      execute: ({ snapshot, executions, message }) => {
+        if (executions.length === 1) return { results: [{
+          ok: false, code: 'ACTION_ERROR', results: [
+            { action: 'click', iteration: 1, subIndex: 1, ok: false, code: 'ACTION_ERROR' },
+            { action: 'click', iteration: 1, subIndex: 2, ok: false, code: 'SKIPPED_AFTER_FAILURE' },
+          ], repeatSummary: { plannedIterations: 1, completedIterations: 0, iteration: 1, subIndex: 1, successCount: 0, failureCount: 1, skippedCount: 1, omittedCount: 0 },
+        }], page: page(snapshot, 1) };
+        clicks += message.actions.length;
+        return { results: message.actions.map(() => ({ ok: true })), page: page(snapshot, 2) };
+      },
+    });
+    assert.equal((await h.start('点击累加两次')).outcome, repairBoth ? 'completed' : 'unverified');
+    assert.equal(clicks, repairBoth ? 2 : 1);
+  });
+}
+
+for (const code of ['NAVIGATING', 'NAVIGATED', 'SKIPPED_AFTER_NAVIGATION']) {
+  test(`repeat导航跳过${code}不新增未枚举失败`, async () => {
+    const h = harness({ reply: () => done });
+    const actions = [{ action: 'repeat', times: 3, value: 0, actions: [{ action: 'click', ref: 1 }] }];
+    const ok = code !== 'SKIPPED_AFTER_NAVIGATION';
+    const raw = [{ ok, code, results: [{ action: 'click', iteration: 1, subIndex: 1, ok, code }],
+      repeatSummary: { plannedIterations: 3, completedIterations: 0, iteration: 1, subIndex: 1, successCount: ok ? 1 : 0, failureCount: 0, skippedCount: ok ? 2 : 3, omittedCount: 0 } }];
+    const unresolved = { pending: new Map(), incomplete: false };
+    await h.context.executionEvidence(h.context.summarizeResults(raw), actions, raw, {}, 1, unresolved);
+    assert.equal(unresolved.pending.size, 0);
+    assert.equal(unresolved.incomplete, false);
+  });
+}
+
+for (const state of ['cancelled', 'finished']) {
+  for (const stage of ['入口', '注入前', '注入后']) {
+    test(`csSend在${stage}阻断${state}任务，不重发页面消息`, async () => {
+      const h = harness({ reply: () => done });
+      let sends = 0;
+      let injections = 0;
+      if (stage === '入口') h.run[state] = true;
+      h.context.chrome.tabs.sendMessage = async () => {
+        sends++;
+        if (stage === '入口') return { ok: true };
+        if (stage === '注入前') h.run[state] = true;
+        throw new Error('Receiving end does not exist');
+      };
+      h.context.chrome.scripting.executeScript = async () => { injections++; if (stage === '注入后') h.run[state] = true; };
+      await assert.rejects(h.context.csSend(1, { type: 'EXTRACT', runId: h.run.runId }, h.run), (error) => error.code === 'CANCELLED');
+      assert.equal(sends, stage === '入口' ? 0 : 1);
+      assert.equal(injections, stage === '注入后' ? 1 : 0);
+    });
+  }
+}
+
+test('csSend对只读消息仍注入后重发一次', async () => {
+  const h = harness({ reply: () => done });
+  const sent = [];
+  let injections = 0;
+  h.context.chrome.tabs.sendMessage = async (_id, message) => {
+    sent.push(structuredClone(message));
+    if (sent.length === 1) throw new Error('Receiving end does not exist');
+    return { snapshotId: 'document:1' };
+  };
+  h.context.chrome.scripting.executeScript = async () => { injections++; };
+  const message = { type: 'EXTRACT', runId: h.run.runId };
+  assert.equal((await h.context.csSend(1, message, h.run)).snapshotId, 'document:1');
+  assert.equal(injections, 1);
+  assert.deepEqual(sent, [message, message]);
+});
+
+test('EXECUTE回执丢失不注入也不重发，交后台按已派发但未知结算', async () => {
+  const h = harness({ reply: () => done });
+  const sent = [];
+  let injections = 0;
+  h.context.chrome.tabs.sendMessage = async (_id, message) => {
+    sent.push(structuredClone(message));
+    throw new Error('The message port closed before a response was received');
+  };
+  h.context.chrome.scripting.executeScript = async () => { injections++; };
+  const message = { type: 'EXECUTE', runId: h.run.runId, operationId: 'same-operation', snapshotId: 'document:1', actions: [{ action: 'click', ref: 1 }] };
+  await assert.rejects(h.context.csSend(1, message, h.run), (error) => error.code === 'DELIVERY_UNCONFIRMED' && error.deliveryUnconfirmed === true);
+  assert.equal(injections, 0);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].snapshotId, 'document:1');
+});
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+function connectAgent(context) {
+  const messages = [];
+  const port = {
+    name: 'agent', sender: { id: 'mock', url: 'chrome-extension://mock/sidepanel.html' },
+    onMessage: event(), onDisconnect: event(), postMessage: (message) => messages.push(structuredClone(message)),
+  };
+  context.chrome.runtime.onConnect.dispatch(port);
+  return { port, messages };
+}
+
+test('取消注入按先旧后新完成时旧EXTRACT不抢占新run快照', async () => {
+  const h = harness({ reply: () => done });
+  h.context.requestModel = h.nativeRequestModel;
+  const firstStarted = deferred();
+  const secondStarted = deferred();
+  const injections = [deferred(), deferred()];
+  const oldExtraction = deferred();
+  const originalSend = h.context.chrome.tabs.sendMessage;
+  const extractedRuns = [];
+  let injectionCount = 0;
+  let installed = false;
+  let extracting = false;
+  h.context.chrome.scripting.executeScript = async () => {
+    const index = injectionCount++;
+    (index === 0 ? firstStarted : secondStarted).resolve();
+    await injections[index].promise;
+    installed = true;
+  };
+  h.context.chrome.tabs.sendMessage = async (tabId, message) => {
+    if (!installed) throw new Error('Receiving end does not exist');
+    if (message.type !== 'EXTRACT') return originalSend(tabId, message);
+    extractedRuns.push(message.runId);
+    if (extracting) return { code: 'BUSY', error: '页面正在处理另一项请求' };
+    extracting = true;
+    try {
+      if (message.runId === 'cancelled-old') await oldExtraction.promise;
+      return await originalSend(tabId, message);
+    } finally { extracting = false; }
+  };
+  const old = connectAgent(h.context);
+  let next;
+  try {
+    old.port.onMessage.dispatch({ t: 'RUN', runId: 'cancelled-old', tabId: 1, question: '旧任务', allowActions: true });
+    await firstStarted.promise;
+    old.port.onDisconnect.dispatch();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(vm.runInContext('activeRun', h.context), null);
+    next = connectAgent(h.context);
+    next.port.onMessage.dispatch({ t: 'RUN', runId: 'new-run', tabId: 1, question: '新任务', allowActions: true });
+    await secondStarted.promise;
+    injections[0].resolve();
+    await new Promise((resolve) => setImmediate(resolve));
+    injections[1].resolve();
+    for (let n = 0; n < 20 && !next.messages.some((message) => ['model_request', 'done'].includes(message.t)); n++) await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(extractedRuns, ['new-run'], '已取消的旧任务不得在注入后重发EXTRACT');
+    const request = next.messages.find((message) => message.t === 'model_request');
+    assert.ok(request, '新任务必须正常读取并请求模型，不能因旧任务的BUSY中断');
+    next.port.onMessage.dispatch({ t: 'model_response', runId: 'new-run', requestId: request.requestId, text: JSON.stringify(done) });
+    for (let n = 0; n < 20 && !next.messages.some((message) => message.t === 'done'); n++) await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(next.messages.find((message) => message.t === 'done')?.outcome, 'completed');
+  } finally {
+    injections.forEach((gate) => gate.resolve());
+    oldExtraction.resolve();
+    next?.port.onDisconnect.dispatch();
+    old.port.onDisconnect.dispatch();
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+});
+
+test('关闭窗口只回收对应chat键，仍存在窗口及其他会话设置全部保留', async () => {
+  const session = Object.fromEntries(Array.from({ length: 12 }, (_, index) => [`chat:${index + 1}`, [{ role: 'user', content: `窗口${index + 1}历史` }]]));
+  session['chat:100'] = [{ role: 'assistant', content: '不同窗口，不能按前缀删除' }];
+  session.mode = 'agent';
+  const h = harness({ reply: () => done, session });
+  h.context.chrome.windows.onRemoved.dispatch(1);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(h.removedSessionKeys, ['chat:1']);
+  const { 'chat:1': removed, ...remaining } = session;
+  assert.ok(removed);
+  assert.deepEqual(h.session, remaining);
+});
+
+test('侧栏断开和普通标签关闭不删除窗口聊天历史', async () => {
+  const session = { 'chat:1': [{ role: 'user', content: '关闭侧栏后还需恢复' }], 'chat:2': [{ role: 'user', content: '另一个仍存在窗口' }] };
+  const h = harness({ reply: () => done, session });
+  const panel = connectAgent(h.context);
+  panel.port.onDisconnect.dispatch();
+  h.context.chrome.tabs.onRemoved.dispatch(1);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(h.removedSessionKeys, []);
+  assert.deepEqual(h.session, session);
+});
+
+for (const hasBoundary of [true, false]) {
+  test(`repeat截断成功历史后补足剩余次数${hasBoundary ? '可完成且不重计旧成功' : '缺少迭代边界保持未确认'}`, async () => {
+    const counts = [0, 0];
+    const page = (snapshot, round) => targetSnapshot(snapshot, `实际点击${counts.join('/')}次；观察${round}`, counts.map((_count, index) => ({
+      ref: round * 2 + index + 1, identity: `document:target:counter-${index}`, tag: 'button', type: 'button', description: `按钮「累加${index}」`,
+    })));
+    const history = Array.from({ length: 116 }, (_unused, index) => ({
+      action: 'click', iteration: Math.floor(index / 2) + 1, subIndex: index % 2 + 1,
+      ok: index !== 114, ...(index === 114 ? { code: 'TARGET_HIDDEN' } : {}),
+    }));
+    const h = harness({
+      extract: ({ snapshot }) => page(snapshot, 0),
+      reply: (n) => n === 1 ? { actions: [{ action: 'repeat', times: 60, value: 0, actions: [{ action: 'click', ref: 1 }, { action: 'click', ref: 2 }] }] }
+        : n === 2 ? { actions: [...Array.from({ length: 3 }, () => ({ action: 'click', ref: 3 })), ...Array.from({ length: 2 }, () => ({ action: 'click', ref: 4 }))] } : done,
+      execute: ({ snapshot, executions, message }) => {
+        if (executions.length === 1) {
+          counts[0] = 57; counts[1] = 58;
+          return { results: [{ ok: false, code: 'TARGET_HIDDEN', results: history.slice(-100), repeatSummary: {
+            plannedIterations: 60, completedIterations: 58, ...(hasBoundary ? { iteration: 58 } : {}), subIndex: 2,
+            successCount: 115, failureCount: 1, skippedCount: 4, omittedCount: 16,
+          } }], page: page(snapshot, 1) };
+        }
+        for (const action of message.actions) counts[action.ref - 3]++;
+        return { results: message.actions.map(() => ({ ok: true })), page: page(snapshot, 2) };
+      },
+    });
+    assert.equal((await h.start('两个计数器各点击60次')).outcome, hasBoundary ? 'completed' : 'unverified');
+    assert.deepEqual(counts, [60, 60]);
+    assert.equal(h.executions.length, 2);
+  });
+}
+
+test('repeat未来跳过项已枚举时补足三次即可恢复，不重复记债', async () => {
+  let clicks = 0;
+  const page = (snapshot, round) => targetSnapshot(snapshot, `实际点击${clicks}次；观察${round}`, [{
+    ref: round + 1, identity: 'document:target:counter', tag: 'button', type: 'button', description: '按钮「累加」',
+  }]);
+  const h = harness({
+    extract: ({ snapshot }) => page(snapshot, 0),
+    reply: (n) => n === 1 ? { actions: [{ action: 'repeat', times: 3, value: 0, actions: [{ action: 'click', ref: 1 }] }] }
+      : n === 2 ? { actions: Array.from({ length: 3 }, () => ({ action: 'click', ref: 2 })) } : done,
+    execute: ({ snapshot, executions, message }) => {
+      if (executions.length === 1) return { results: [{ ok: false, code: 'ACTION_ERROR', results: [1, 2, 3].map((iteration) => ({
+        action: 'click', iteration, subIndex: 1, ok: false, code: iteration === 1 ? 'ACTION_ERROR' : 'SKIPPED_AFTER_FAILURE',
+      })), repeatSummary: { plannedIterations: 3, completedIterations: 0, iteration: 1, subIndex: 1, successCount: 0, failureCount: 1, skippedCount: 2, omittedCount: 0 } }], page: page(snapshot, 1) };
+      clicks += message.actions.length;
+      return { results: message.actions.map(() => ({ ok: true })), page: page(snapshot, 2) };
+    },
+  });
+  assert.equal((await h.start('点击累加三次')).outcome, 'completed');
+  assert.equal(clicks, 3);
+});
+
+for (const code of ['NAVIGATING', 'NAVIGATED']) {
+  test(`仅批级导航${code}仍等待新文档，保留填写失败与submit跳过`, async () => {
+    const arrivedUrl = 'http://127.0.0.1:1/arrived';
+    const internalMessage = 'BATCH_NAVIGATION_INTERNAL_MESSAGE';
+    let tabChecks = 0;
+    const h = harness({
+      reply: (n) => n === 1 ? { actions: [{ action: 'fill', ref: 1, value: 'answer' }, { action: 'submitForm', ref: 2 }] } : done,
+      getTab: async () => ++tabChecks === 1 ? { id: 1, status: 'loading', url: 'http://127.0.0.1:1/page' }
+        : { id: 1, status: 'complete', url: arrivedUrl },
+      extract: ({ snapshot, extracts }) => {
+        const page = targetSnapshot(snapshot, extracts.length === 1 ? 'SOURCE_FORM' : 'ARRIVED_NEW_DOCUMENT', [
+          { ref: 1, identity: 'document:target:answer', tag: 'input', type: 'text', description: '输入框(text) 标签:答案 当前为空' },
+          { ref: 2, identity: 'document:target:submit', tag: 'button', type: 'submit', submitsForm: true, description: '按钮「提交」',
+          },
+        ]);
+        if (extracts.length > 1) { page.snapshotId = 'arrived-document:1'; page.url = arrivedUrl; }
+        return page;
+      },
+      execute: ({ snapshot }) => ({
+        results: [{ ok: false, code: 'VALUE_NOT_APPLIED' }, { ok: false, code: 'SKIPPED_AFTER_FAILURE' }],
+        navigation: { ok: true, code, navigationUrl: arrivedUrl, msg: internalMessage },
+        page: snapshot('OLD_EXECUTOR_PAGE'),
+      }),
+    });
+    assert.equal((await h.start('填写成功后再提交')).outcome, 'unverified');
+    assert.equal(tabChecks, 2, '没有loading事件或动作导航code兜底，也必须等待批级导航');
+    assert.equal(h.extracts.length, 2);
+    const results = h.emitted.filter((event) => event.t === 'result');
+    assert.deepEqual(results.map(({ ok, code }) => ({ ok, code })), [
+      { ok: false, code: 'VALUE_NOT_APPLIED' }, { ok: false, code: 'SKIPPED_AFTER_FAILURE' },
+    ]);
+    assert.ok(h.emitted.some((event) => event.t === 'status' && event.text === '等待页面跳转完成…'));
+    const latest = h.calls[1].at(-1).content;
+    assert.match(latest, /ARRIVED_NEW_DOCUMENT/);
+    assert.doesNotMatch(latest, /OLD_EXECUTOR_PAGE/);
+    assert.match(latest, /VALUE_NOT_APPLIED/);
+    assert.match(latest, /SKIPPED_AFTER_FAILURE/);
+    assert.ok(!JSON.stringify(h.calls).includes(internalMessage), '批级导航原文不得进入模型历史');
+  });
+}
+
+for (const navigation of [{ ok: false, code: 'NAVIGATING' }, { ok: true, code: 'UNKNOWN' }]) {
+  test(`无效批级导航${JSON.stringify(navigation)}不触发导航等待`, async () => {
+    const h = harness({
+      reply: (n) => n === 1 ? { actions: [{ action: 'fill', ref: 1, value: 'answer' }] } : done,
+      getTab: async () => { throw new Error('无效批级导航不应查询标签状态'); },
+      execute: ({ snapshot }) => ({ results: [{ ok: false, code: 'VALUE_NOT_APPLIED' }], navigation, page: snapshot('FRESH_SAME_DOCUMENT') }),
+    });
+    assert.equal((await h.start()).outcome, 'unverified');
+    assert.equal(h.extracts.length, 1);
+    assert.ok(!h.emitted.some((event) => event.t === 'status' && event.text === '等待页面跳转完成…'));
+  });
+}

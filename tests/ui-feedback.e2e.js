@@ -622,16 +622,60 @@ async function checkModelFormLifecycle(context, optionsUrl) {
     // The next task must see the previous task's last actions and failures, even after the run stopped.
     await startRun('验证执行记录同步');
     await deliver([
-      { t: 'actions', operationId: 'journal-op', round: 1, actions: [{ action: 'click', ref: 1, detail: '@1 提交按钮' }] },
-      { t: 'result', operationId: 'journal-op', round: 1, index: 0, ok: false, code: 'TARGET_NOT_FOUND' },
+      { t: 'actions', operationId: 'journal-op', round: 1, actions: [
+        { action: 'click', ref: 1, detail: '@1 提交按钮' }, { action: 'fill', ref: 2, detail: '@2 姓名' },
+        { action: 'click', ref: 3, detail: '@3 下一步' }, { action: 'click', ref: 4, detail: '@4 保存' },
+        { action: 'click', ref: 5, detail: '@5 确认' }, { action: 'fill', ref: 6, detail: '@6 备注' },
+        { action: 'read', ref: 7, detail: '@7 成绩表' },
+      ] },
+      { t: 'result', operationId: 'journal-op', round: 1, index: 0, ok: true, state: '完成' },
+      { t: 'result', operationId: 'journal-op', round: 1, index: 1, ok: false, code: 'TARGET_NOT_FOUND' },
+      { t: 'result', operationId: 'journal-op', round: 1, index: 2, ok: false, code: 'SKIPPED_AFTER_FAILURE' },
+      { t: 'result', operationId: 'journal-op', round: 1, index: 3, ok: false, code: 'ACTION_COMMUNICATION_FAILED' },
+      { t: 'result', operationId: 'journal-op', round: 1, index: 4, ok: false, code: 'DISPATCH_UNCONFIRMED' },
+      { t: 'result', operationId: 'journal-op', round: 1, index: 5, ok: false, code: 'NOT_DISPATCHED', notDispatched: true },
+      { t: 'result', operationId: 'journal-op', round: 1, index: 6, ok: false, code: 'READ_FAILED' },
       { t: 'done', outcome: 'unverified' },
     ]);
+    const journalBlock = panel.locator('.tools').last();
+    const journalRows = journalBlock.locator('.tool');
+    assert.deepEqual(await journalBlock.locator('.tool-state').allTextContents(), ['完成', '失败', '已跳过', '未执行', '未确认', '未执行', '失败']);
+    assert.equal(await journalBlock.locator('.tool.ok').count(), 1);
+    assert.equal(await journalBlock.locator('.tool.fail').count(), 2, '只有实际错误才标红');
+    assert.equal(await journalBlock.locator('.tool.uncertain').count(), 1);
+    assert.equal(await journalBlock.locator('.tool.skipped').count(), 1);
+    assert.equal(await journalBlock.locator('.tool.not-executed').count(), 2);
+    assert.match(await journalRows.nth(1).locator('.tool-reason').textContent(), /找不到目标/);
+    assert.match(await journalRows.nth(2).locator('.tool-reason').textContent(), /此操作已跳过/);
+    assert.match(await journalRows.nth(3).locator('.tool-reason').textContent(), /页面通信失败.*未能派发/u);
+    assert.doesNotMatch(await journalRows.nth(3).locator('.tool-reason').textContent(), /已派发/u);
+    assert.match(await journalRows.nth(4).locator('.tool-reason').textContent(), /未收到页面返回的结果.*核对当前页面/u);
+    assert.match(await journalRows.nth(5).locator('.tool-reason').textContent(), /未执行/);
+    assert.match(await journalRows.nth(6).locator('.tool-reason').textContent(), /读取未完成/);
+    const journalColors = await panel.evaluate(() => {
+      const color = (selector) => getComputedStyle(document.querySelector(selector)).color;
+      return { uncertain: color('.tool.uncertain .tool-state'), skipped: color('.tool.skipped .tool-state'), fail: color('.tool.fail .tool-state'), ok: color('.tool.ok .tool-state') };
+    });
+    assert.notEqual(journalColors.uncertain, journalColors.fail, '未确认不能用失败红色');
+    assert.notEqual(journalColors.skipped, journalColors.fail, '已跳过不能用失败红色');
     assert.match(await panel.locator('.msg.sys').last().textContent(), /未获成功确认/);
+    await panel.screenshot({ path: path.join(artifacts, 'panel-1280-dark-journal-states.png') });
     await startRun('继续处理页面');
     const priorRun = await panel.evaluate(() => window.__feedbackPorts.at(-1).sent.find((message) => message.t === 'RUN').priorRun);
     assert.match(priorRun, /上一任务/);
     assert.match(priorRun, /click/);
     assert.match(priorRun, /找不到目标/);
+    assert.match(priorRun, /共计划 \d+ 个页面操作/);
+    assert.doesNotMatch(priorRun, /共执行/);
+    assert.match(priorRun, /未确认 1/);
+    assert.match(priorRun, /失败 2/);
+    assert.match(priorRun, /已跳过 1/);
+    assert.match(priorRun, /未执行 2/);
+    assert.match(priorRun, /未确认（操作已发出/u);
+    assert.match(priorRun, /页面通信失败，本批操作未能派发/u);
+    assert.match(priorRun, /读取未完成/);
+    assert.match(priorRun, /已跳过/);
+    assert.ok(priorRun.length <= 1500);
     await deliver([{ t: 'done' }]);
     await startRun('验证中断原因同步');
     await deliver([{ t: 'done', outcome: 'interrupted', error: '后台连接中断，任务已停止' }]);
@@ -643,11 +687,102 @@ async function checkModelFormLifecycle(context, optionsUrl) {
     await panel.locator('.msg.sys').filter({ hasText: '已新建对话' }).waitFor();
     assert.equal(await panel.evaluate(() => lastRunJournal), '', '新建对话必须清空上一任务记录');
 
-    await panel.locator('#input').fill('验证 Enter 发送');
-    await panel.locator('#input').press('Enter');
-    await panel.waitForFunction(() => activeRun && window.__feedbackPorts.at(-1)?.sent.some((message) => message.t === 'RUN' && message.question === '验证 Enter 发送'));
-    assert.equal(await panel.locator('.composer-hint').count(), 0, '输入区不再显示换行提示');
-    await deliver([{ t: 'done' }]);
+    await panel.evaluate(() => {
+      window.__keyboardPortStart = window.__feedbackPorts.length;
+      window.__inputKeyEvents = [];
+      window.__recordInputKey = (event) => window.__inputKeyEvents.push({ key: event.key, repeat: event.repeat,
+        composing: event.isComposing, shift: event.shiftKey, prevented: event.defaultPrevented });
+      document.querySelector('#input').addEventListener('keydown', window.__recordInputKey);
+      window.__originalQuery = chrome.tabs.query;
+      chrome.tabs.query = () => new Promise((resolve) => { window.__releaseKeyboardQuery = resolve; });
+    });
+    const composingEnter = () => panel.locator('#input').evaluate((input) => {
+      input.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true, data: '输入法组字' }));
+      const event = new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', isComposing: true, bubbles: true, cancelable: true });
+      input.dispatchEvent(event);
+      input.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: '输入法组字' }));
+      return event.defaultPrevented;
+    });
+    try {
+      await panel.locator('#input').fill('组字期间不能发送');
+      assert.equal(await composingEnter(), false, '组字确认不能被发送处理器 preventDefault');
+      assert.equal(await panel.evaluate(() => activeRun === null && window.__feedbackPorts.length === window.__keyboardPortStart), true);
+      await panel.locator('#input').fill('验证 Enter 长按仅发送一次');
+      await panel.locator('#input').focus();
+      await panel.keyboard.down('Enter');
+      await panel.waitForFunction(() => activeRun && !activeRun.port && typeof window.__releaseKeyboardQuery === 'function');
+      const runId = await panel.evaluate(() => activeRun.runId);
+      await panel.keyboard.down('Enter');
+      await panel.keyboard.down('Enter');
+      assert.equal(await panel.evaluate((id) => activeRun?.runId === id && !activeRun.stopRequested && !activeRun.port, runId), true, '准备阶段的 repeat 不能停止或重发');
+      assert.equal(await panel.locator('#input').inputValue(), '验证 Enter 长按仅发送一次');
+      assert.equal(await panel.locator('#status').textContent(), '准备任务…');
+      await panel.evaluate(() => {
+        chrome.tabs.query = window.__originalQuery;
+        window.__releaseKeyboardQuery([{ id: 42, url: 'http://127.0.0.1/keyboard-test' }]);
+      });
+      await panel.waitForFunction(() => activeRun?.port && window.__feedbackPorts.at(-1).sent.some((message) => message.t === 'RUN'));
+      await panel.keyboard.down('Enter');
+      await panel.keyboard.down('Enter');
+      assert.equal(await panel.evaluate((id) => activeRun?.runId === id && !activeRun.stopRequested, runId), true, 'RUN 后的 repeat 不能停止任务');
+      assert.equal(await composingEnter(), false);
+      assert.equal(await panel.evaluate(() => activeRun.stopRequested), false, '运行期间组字 Enter 不能停止任务');
+      assert.equal(await panel.evaluate(() => window.__feedbackPorts.length), await panel.evaluate(() => window.__keyboardPortStart + 1));
+      assert.deepEqual(await panel.evaluate(() => window.__feedbackPorts.at(-1).sent.map((message) => message.t)), ['RUN']);
+      const repeated = await panel.evaluate(() => window.__inputKeyEvents.filter((event) => event.repeat));
+      assert.equal(repeated.length, 4, '须由真实浏览器键盘 down 生成四次 repeat');
+      assert.ok(repeated.every((event) => event.prevented && !event.composing), JSON.stringify(repeated));
+      assert.equal(await panel.locator('#input').inputValue(), '', 'repeat 不能插入换行');
+      await panel.keyboard.up('Enter');
+      await panel.locator('#input').press('Enter');
+      assert.equal(await panel.evaluate(() => activeRun.stopRequested), true, '运行中新的单次 Enter 仍须停止');
+      assert.deepEqual(await panel.evaluate(() => window.__feedbackPorts.at(-1).sent.map((message) => message.t)), ['RUN', 'cancel']);
+      await deliver([{ t: 'done', outcome: 'cancelled' }]);
+      await panel.locator('#input').fill('验证 Shift+Enter 按既定规则发送');
+      await panel.locator('#input').press('Shift+Enter');
+      await panel.waitForFunction(() => activeRun?.port && window.__feedbackPorts.at(-1).sent.some((message) => message.t === 'RUN' && message.question === '验证 Shift+Enter 按既定规则发送'));
+      assert.equal(await panel.locator('#input').inputValue(), '');
+      assert.equal(await panel.evaluate(() => window.__inputKeyEvents.some((event) => event.key === 'Enter' && event.shift && !event.repeat && event.prevented)), true);
+      assert.equal(await panel.locator('.composer-hint').count(), 0, '输入区不再显示换行提示');
+      await deliver([{ t: 'done' }]);
+      console.log('PASS Enter: preparation/RUN repeats ignored after preventDefault, composing Enter inert, single Enter sends/stops, Shift+Enter sends');
+    } finally {
+      await panel.keyboard.up('Enter');
+      await panel.evaluate(() => {
+        chrome.tabs.query = window.__originalQuery;
+        document.querySelector('#input').removeEventListener('keydown', window.__recordInputKey);
+      });
+    }
+
+    const blockCode = '    x = 1  \n    y = 2\t \n\n';
+    const inlineCode = '  literal\t  ';
+    await panel.evaluate(({ blockCode, inlineCode }) => {
+      window.__copiedCode = [];
+      window.__originalClipboardWrite = navigator.clipboard.writeText;
+      // Spy on the clipboard boundary inside this disposable browser, without changing the system clipboard.
+      navigator.clipboard.writeText = async (text) => { window.__copiedCode.push(text); };
+      getSelection()?.removeAllRanges();
+      // Separate the closing fence from code whitespace; marked consumes that separator newline.
+      addMessage('ai', `\`\`\`python\n${blockCode}\n\`\`\`\n\n行内：<code>${inlineCode}</code>`);
+    }, { blockCode, inlineCode });
+    try {
+      const answer = panel.locator('.msg.ai').last();
+      const pre = answer.locator('pre');
+      assert.equal(await pre.locator('code').textContent(), blockCode, '渲染后的原始代码须保留首行缩进、尾空白和空行');
+      assert.equal(await answer.locator('p code').textContent(), inlineCode);
+      await pre.locator('code').click();
+      await pre.press('Enter');
+      await pre.press('Space');
+      await answer.locator('p code').click();
+      await panel.waitForFunction(() => window.__copiedCode.length === 4);
+      assert.deepEqual(await panel.evaluate(() => window.__copiedCode), [blockCode, blockCode, blockCode, inlineCode], '点击及 Enter/Space 复制须逐字等于原始 code.textContent');
+      await panel.bringToFront();
+      await pre.scrollIntoViewIfNeeded();
+      await panel.screenshot({ path: path.join(artifacts, 'panel-code-copy-whitespace.png') });
+      console.log('PASS code copy: click/Enter/Space preserve first-line indentation, trailing spaces/tabs/newlines; inline code preserves whitespace');
+    } finally {
+      await panel.evaluate(() => { navigator.clipboard.writeText = window.__originalClipboardWrite; });
+    }
 
     // Every image failure uses a fixed, useful reason instead of an untrusted backend message.
     const imageFailures = [

@@ -238,6 +238,30 @@ async function screenshot(page, name) {
       await panel.setViewportSize({ width: 360, height: 850 });
     });
 
+    await check('设置页 320/768px 无横向溢出；减弱动效关闭实际按钮过渡', async () => {
+      await optionsA.locator('#modelList .card').first().getByRole('button', { name: '编辑', exact: true }).click();
+      await optionsA.locator('#fName').fill('设置页窄屏中的未保存长名称'.repeat(4));
+      await optionsA.emulateMedia({ reducedMotion: 'no-preference' });
+      assert.equal(await optionsA.locator('button').evaluateAll((buttons) => buttons.some((button) =>
+        getComputedStyle(button).transitionDuration.split(',').some((duration) => parseFloat(duration) > 0))), true, '对照组须存在真实按钮过渡');
+      await optionsA.emulateMedia({ reducedMotion: 'reduce' });
+      assert.equal(await optionsA.locator('button').evaluateAll((buttons) => buttons.length > 0 && buttons.every((button) =>
+        getComputedStyle(button).transitionDuration.split(',').every((duration) => parseFloat(duration) === 0))), true, '减弱动效须使每个实际按钮的 transitionDuration 为 0');
+      for (const width of [320, 768]) {
+        await optionsA.setViewportSize({ width, height: 900 });
+        assert.equal(await optionsA.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, `${width}px 设置页不得横向溢出`);
+        await optionsA.evaluate(() => scrollTo(0, 0));
+        await screenshot(optionsA, `options-${width}-reduced-motion`);
+        await optionsA.locator('#formWrap').scrollIntoViewIfNeeded();
+        assert.equal(await optionsA.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, `${width}px 模型编辑器不得横向溢出`);
+        await screenshot(optionsA, `options-form-${width}-reduced-motion`);
+      }
+      await optionsA.locator('#btnCancel').click();
+      await optionsA.setViewportSize({ width: 900, height: 850 });
+      await optionsA.emulateMedia({ reducedMotion: 'no-preference' });
+      await optionsA.evaluate(() => scrollTo(0, 0));
+    });
+
     await check('浅深色 mark 普通/粗体/链接/code 对比度均 >= 4.5', async () => {
       await panel.evaluate(() => addMessage('ai', '==普通 **加粗** [链接](https://example.invalid) `code`=='));
       for (const colorScheme of ['light', 'dark']) {
@@ -480,6 +504,55 @@ async function screenshot(page, name) {
       await race.locator('#send').click();
       await race.waitForFunction(() => activeRun?.port);
     };
+
+    await check('浅深色选中模式与停止按钮：键盘焦点内线可见且与填充对比 >= 3', async () => {
+      const inspectFocus = async (selector) => {
+        const style = await race.locator(selector).evaluate((element) => {
+          const computed = getComputedStyle(element);
+          const shadowColor = computed.boxShadow.match(/rgba?\([^)]+\)/)?.[0] || '';
+          const luminance = (color) => {
+            const rgb = color.match(/[\d.]+/g)?.slice(0, 3).map(Number).map((value) => {
+              value /= 255;
+              return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+            });
+            return rgb ? rgb[0] * .2126 + rgb[1] * .7152 + rgb[2] * .0722 : NaN;
+          };
+          const foreground = luminance(shadowColor), background = luminance(computed.backgroundColor);
+          return { focused: element === document.activeElement, visible: element.matches(':focus-visible'),
+            shadow: computed.boxShadow, shadowColor, background: computed.backgroundColor,
+            contrast: (Math.max(foreground, background) + .05) / (Math.min(foreground, background) + .05) };
+        });
+        assert.equal(style.focused, true, `${selector} 必须取得真实键盘焦点`);
+        assert.equal(style.visible, true, `${selector} 必须命中 :focus-visible`);
+        assert.match(style.shadow, /2px inset|inset.*2px/);
+        assert.notEqual(style.shadowColor, style.background, `${selector} 焦点不得与填充同色`);
+        assert.ok(style.contrast >= 3, JSON.stringify(style));
+        return style;
+      };
+      await race.setViewportSize({ width: 360, height: 850 });
+      for (const colorScheme of ['light', 'dark']) {
+        await race.emulateMedia({ colorScheme });
+        const focusStyles = [];
+        for (const [id, tabs] of [['modeAsk', 1], ['modeAgent', 2]]) {
+          await race.locator(`#${id}`).click();
+          await race.locator('#modelPill').focus();
+          for (let index = 0; index < tabs; index++) await race.keyboard.press('Tab');
+          focusStyles.push(await inspectFocus(`#${id}`));
+        }
+        await screenshot(race, `focus-selected-${colorScheme}`);
+        await raceSend(`验证 ${colorScheme} 停止按钮焦点`);
+        await race.locator('#input').focus();
+        await race.keyboard.press('Tab');
+        focusStyles.push(await inspectFocus('#send'));
+        await screenshot(race, `focus-stop-${colorScheme}`);
+        console.log(`Focus styles ${colorScheme}: ${JSON.stringify(focusStyles)}`);
+        await race.evaluate(() => window.__ports.at(-1).deliver({ t: 'done' }));
+      }
+      await race.emulateMedia({ colorScheme: 'light' });
+      await race.setViewportSize({ width: 900, height: 850 });
+      // All focus runs have ended; the following race cases use explicit old/new port indexes.
+      await race.evaluate(() => { window.__ports = []; });
+    });
 
     await check('停止后迟到 model_request 不发请求；旧 run 的回复/done 不污染新任务', async () => {
       await raceSend('旧任务');

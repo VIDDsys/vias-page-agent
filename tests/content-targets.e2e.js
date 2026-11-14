@@ -339,3 +339,262 @@ test('状态增补但原生点击被取消仍报告 CHECK_NOT_APPLIED', { timeou
     assert.equal(await page.evaluate(() => document.querySelector('input').checked), false);
   });
 });
+
+for (const tag of ['input', 'textarea', 'select']) {
+  for (const mutation of ['label', 'question']) {
+    test(`最终审查 原生${tag}快照后${mutation}变化拒绝旧ref`, { timeout: 20000 }, async () => {
+      const field = tag === 'select' ? '<select id="field"><option value="original">Original</option><option value="next">Next</option></select>'
+        : tag === 'textarea' ? '<textarea id="field">original</textarea>' : '<input id="field" value="original">';
+      await fixture(`<fieldset><legend>Original question</legend><label for="field">Original field</label>${field}</fieldset>`, null, async (page) => {
+        const snapshot = await extract(page);
+        await page.evaluate((kind) => {
+          document.querySelector(kind === 'label' ? 'label' : 'legend').textContent = 'Different meaning';
+          window.fieldWrites = 0;
+          document.querySelector('#field').addEventListener('input', () => window.fieldWrites++);
+        }, mutation);
+        stale(await execute(page, snapshot, [{ action: tag === 'select' ? 'select' : 'fill', ref: ref(snapshot, '标签:Original field'), value: 'next' }]));
+        assert.equal(await page.evaluate(() => document.querySelector('#field').value), 'original');
+        assert.equal(await page.evaluate(() => window.fieldWrites), 0);
+      });
+    });
+  }
+}
+
+for (const mutation of ['text', 'value']) {
+  test(`最终审查 select快照后选项${mutation}变化不能复用旧身份`, { timeout: 20000 }, async () => {
+    await fixture('<fieldset><legend>Question</legend><select aria-label="Answer"><option value="a">Apple</option><option value="b">Banana</option></select></fieldset>', null, async (page) => {
+      const snapshot = await extract(page);
+      await page.evaluate((kind) => {
+        const option = document.querySelectorAll('option')[1];
+        if (kind === 'text') option.textContent = 'Different answer';
+        else option.value = 'different-value';
+      }, mutation);
+      stale(await execute(page, snapshot, [{ action: 'select', ref: ref(snapshot, '下拉框'), value: 'b' }]));
+      assert.equal(await page.evaluate(() => document.querySelector('select').value), 'a');
+    });
+  });
+}
+
+test('最终审查 aria-labelledby真实文字变化拒绝原生字段旧ref', { timeout: 20000 }, async () => {
+  await fixture('<fieldset><span id="field-name">Original field</span><input aria-labelledby="field-name" value="original"></fieldset>', null, async (page) => {
+    const snapshot = await extract(page);
+    await page.evaluate(() => { document.querySelector('span').textContent = 'Different field'; });
+    stale(await execute(page, snapshot, [{ action: 'fill', ref: ref(snapshot, 'Original field'), value: 'next' }]));
+    assert.equal(await page.evaluate(() => document.querySelector('input').value), 'original');
+  });
+});
+
+test('最终审查 原生字段值/多选状态/题内状态与题外抖动不使旧ref失效', { timeout: 20000 }, async () => {
+  await fixture('<main><p id="progress">0</p><fieldset><legend>Stable question</legend><label>Text<input value="before"></label><label>Choice<select multiple><option value="a" selected>A</option><option value="b">B</option></select></label><output></output></fieldset></main>', null, async (page) => {
+    const snapshot = await extract(page);
+    await page.evaluate(() => {
+      document.querySelector('input').value = 'restored';
+      document.querySelectorAll('option')[1].selected = true;
+      document.querySelector('output').textContent = 'Saved';
+      document.querySelector('#progress').textContent = 'Unrelated progress';
+      document.querySelector('input').className = 'focused';
+    });
+    const response = await execute(page, snapshot, [
+      { action: 'fill', ref: ref(snapshot, '输入框'), value: 'after' },
+      { action: 'select', ref: ref(snapshot, '下拉框'), value: ['b'] },
+    ]);
+    assert.ok(response.results.every((result) => result.ok), JSON.stringify(response));
+    assert.equal(await page.evaluate(() => document.querySelector('input').value), 'after');
+    assert.deepEqual(await page.evaluate(() => [...document.querySelector('select').selectedOptions].map((option) => option.value)), ['b']);
+  });
+});
+
+for (const wrapper of ['section', 'div', 'shadow']) {
+  for (const redraw of [false, true]) {
+    test(`最终审查 ${wrapper}内层说明标题不遮蔽真实题干（${redraw ? '重绘' : '复用'}）`, { timeout: 20000 }, async () => {
+      const question = '<h2>Original question</h2><div><h3>Choose an answer</h3><label><input type="checkbox" name="answer" value="a">Constant option</label></div>';
+      await fixture(wrapper === 'shadow' ? '<div id="host"></div>' : `<${wrapper} id="question">${question}</${wrapper}>`, null, async (page) => {
+        if (wrapper === 'shadow') await page.evaluate((html) => { document.querySelector('#host').attachShadow({ mode: 'open' }).innerHTML = html; }, question);
+        const snapshot = await extract(page);
+        const originalIdentity = snapshot.targetMeta[ref(snapshot, 'Constant option')].choiceIdentity;
+        await page.evaluate(({ shadow, redraw }) => {
+          const root = shadow ? document.querySelector('#host').shadowRoot : document.querySelector('#question');
+          root.querySelector('h2').textContent = 'Different question';
+          if (redraw) root.innerHTML = root.innerHTML;
+        }, { shadow: wrapper === 'shadow', redraw });
+        const response = await execute(page, snapshot, [{ action: 'check', ref: ref(snapshot, 'Constant option') }]);
+        stale(response);
+        assert.deepEqual(await page.evaluate(() => window.clicks), []);
+        assert.equal(await page.evaluate((shadow) => (shadow ? document.querySelector('#host').shadowRoot : document).querySelector('input').checked, wrapper === 'shadow'), false);
+        const next = response.page.targetMeta[ref(response.page, 'Constant option')];
+        assert.notEqual(next.choiceIdentity, originalIdentity);
+      });
+    });
+  }
+}
+
+for (const kind of ['checkbox', 'radio', 'aria']) {
+  for (const phase of ['paint', 'pointerdown']) {
+    test(`最终审查 check ${kind}在${phase}已选中保持NO_CHANGE且不反选`, { timeout: 20000 }, async () => {
+      const option = kind === 'aria' ? '<div role="checkbox" aria-checked="false" id="answer">Answer</div>'
+        : `<label><input type="${kind}" name="answer" value="a">Answer</label>`;
+      await fixture(`<fieldset><legend>Stable question</legend>${option}</fieldset>`, null, async (page) => {
+        const snapshot = await extract(page);
+        await page.evaluate(({ kind, phase }) => {
+          const control = document.querySelector('input,[role="checkbox"]');
+          const restore = () => {
+            window.restoredBeforeClick = true;
+            if (kind === 'aria') control.setAttribute('aria-checked', 'true');
+            else control.checked = true;
+          };
+          if (phase === 'paint') (control.closest('label') || control).scrollIntoView = () => setTimeout(restore, 20);
+          else control.addEventListener('pointerdown', restore, { once: true });
+          if (kind === 'aria') control.onclick = () => control.setAttribute('aria-checked', String(control.getAttribute('aria-checked') !== 'true'));
+        }, { kind, phase });
+        const response = await execute(page, snapshot, [{ action: kind === 'radio' ? 'checkRadio' : 'check', ref: ref(snapshot, 'Answer') }]);
+        assert.equal(response.results[0].code, 'NO_CHANGE', JSON.stringify(response));
+        assert.equal(response.results[0].ok, true);
+        assert.equal(await page.evaluate(() => window.restoredBeforeClick), true);
+        assert.deepEqual(await page.evaluate(() => window.clicks), []);
+        assert.equal(await page.evaluate(() => { const control = document.querySelector('input,[role="checkbox"]'); return control instanceof HTMLInputElement ? control.checked : control.getAttribute('aria-checked') === 'true'; }), true);
+      });
+    });
+  }
+}
+
+test('最终审查 check派发中等价重绘为已选中只恢复身份不再次点击', { timeout: 20000 }, async () => {
+  await fixture('<fieldset><legend>Stable question</legend><label><input type="checkbox" name="answer" value="a">Answer</label></fieldset>', null, async (page) => {
+    const snapshot = await extract(page);
+    await page.evaluate(() => document.querySelector('input').addEventListener('pointerdown', (event) => {
+      event.target.setAttribute('checked', '');
+      const fieldset = document.querySelector('fieldset');
+      fieldset.outerHTML = fieldset.outerHTML;
+    }, { once: true }));
+    const response = await execute(page, snapshot, [{ action: 'check', ref: ref(snapshot, 'Answer') }]);
+    assert.equal(response.results[0].code, 'NO_CHANGE', JSON.stringify(response));
+    assert.equal(await page.evaluate(() => document.querySelector('input').checked), true);
+    assert.deepEqual(await page.evaluate(() => window.clicks), []);
+  });
+});
+
+// —— 搜索/聊天类页面：联想词、热搜、隐藏计数等外围动态不属于字段身份 ——
+const searchMarkup = `<div id="wrapper">
+  <div id="head">新闻 贴吧 知道 地图</div>
+  <form id="form" action="/s">
+    <span class="s_ipt_wr"><textarea id="kw" name="wd" autocomplete="off"></textarea><i class="quickdelete">清空</i></span>
+    <span class="s_btn_wr"><input id="su" type="submit" value="百度一下"></span>
+    <div id="sug" class="bdsug"></div>
+  </form>
+  <div id="hot">热搜榜</div>
+  <div id="counter" style="display:none">0</div>
+</div>`;
+const setupSearch = () => {
+  window.ev = { input: 0, click: 0, submit: 0 };
+  document.getElementById('form').addEventListener('submit', (event) => { window.ev.submit++; event.preventDefault(); });
+  document.getElementById('su').addEventListener('click', () => { window.ev.click++; });
+  document.getElementById('kw').addEventListener('input', () => {
+    window.ev.input++;
+    document.getElementById('sug').innerHTML = '<ul><li>测试查询 百度百科</li><li>测试查询 新闻</li></ul>';
+  });
+};
+
+test('搜索联想/热搜/隐藏计数变化不使输入框与提交按钮旧ref失效', { timeout: 20000 }, async () => {
+  await fixture(searchMarkup, setupSearch, async (page) => {
+    const snapshot = await extract(page);
+    await page.evaluate(() => {
+      document.getElementById('sug').innerHTML = '<ul><li>测试查询 百度百科</li></ul>';
+      document.getElementById('hot').textContent = '热搜榜：换了新词';
+      document.getElementById('counter').textContent = '37';
+    });
+    const response = await execute(page, snapshot, [
+      { action: 'fill', ref: ref(snapshot, '文本域'), value: '测试查询' },
+      { action: 'click', ref: ref(snapshot, '输入框(submit)') },
+    ]);
+    assert.ok(response.results.every((result) => result.ok), JSON.stringify(response));
+    assert.deepEqual(await page.evaluate(() => window.ev), { input: 1, click: 1, submit: 1 });
+    assert.equal(await page.locator('#kw').inputValue(), '测试查询');
+  });
+});
+
+test('搜索联想同步出现时 fill 仍以值保真为成功，不误报 VALUE_NOT_APPLIED', { timeout: 20000 }, async () => {
+  await fixture(searchMarkup, setupSearch, async (page) => {
+    const snapshot = await extract(page);
+    const response = await execute(page, snapshot, [{ action: 'fill', ref: ref(snapshot, '文本域'), value: '浏览器 自动化 测试' }]);
+    assert.equal(response.results[0].ok, true, JSON.stringify(response));
+    assert.equal(response.results[0].code, 'FILLED');
+    assert.equal(await page.locator('#kw').inputValue(), '浏览器 自动化 测试');
+  });
+});
+
+test('提交按钮文字变成删除全部后拒绝旧ref，不误点危险操作', { timeout: 20000 }, async () => {
+  await fixture(searchMarkup, setupSearch, async (page) => {
+    const snapshot = await extract(page);
+    await page.evaluate(() => { document.getElementById('su').value = '删除全部'; });
+    stale(await execute(page, snapshot, [{ action: 'click', ref: ref(snapshot, '输入框(submit)') }]));
+    assert.deepEqual(await page.evaluate(() => window.ev), { input: 0, click: 0, submit: 0 });
+  });
+});
+
+test('纯div题块标题是字段题干：标题变化拒绝输入框旧ref', { timeout: 20000 }, async () => {
+  await fixture('<div class="question"><h3>Original prompt</h3><input id="field" aria-label="Answer" value="original"><div id="hint">0</div></div>', null, async (page) => {
+    const snapshot = await extract(page);
+    await page.evaluate(() => { document.querySelector('h3').textContent = 'Different prompt'; });
+    stale(await execute(page, snapshot, [{ action: 'fill', ref: ref(snapshot, '输入框'), value: 'next' }]));
+    assert.equal(await page.locator('#field').inputValue(), 'original');
+  });
+});
+
+test('纯div题块内联想/提示文字变化不算题干变化，字段旧ref仍可填写', { timeout: 20000 }, async () => {
+  await fixture('<div class="question"><h3>Stable prompt</h3><input id="field" aria-label="Answer" value="original"><div id="hint">建议：无</div></div>', null, async (page) => {
+    const snapshot = await extract(page);
+    await page.evaluate(() => { document.querySelector('#hint').textContent = '建议：测试查询'; });
+    success(await execute(page, snapshot, [{ action: 'fill', ref: ref(snapshot, '输入框'), value: 'next' }]));
+    assert.equal(await page.locator('#field').inputValue(), 'next');
+  });
+});
+
+test('字段集legend变化仍拒绝字段旧ref；同批无关提示文字变化不阻断有效字段', { timeout: 20000 }, async () => {
+  await fixture('<p id="progress">0</p><fieldset><legend>Original question</legend><label for="field">Original field</label><input id="field" value="original"><span id="hint">无</span></fieldset><fieldset><legend>Stable question</legend><label for="other">Stable field</label><input id="other" value="before"></fieldset>', null, async (page) => {
+    const snapshot = await extract(page);
+    await page.evaluate(() => {
+      document.querySelector('legend').textContent = 'Different question';
+      document.querySelector('#hint').textContent = '联想：测试';
+      document.querySelector('#progress').textContent = '已答 1 题';
+    });
+    const response = await execute(page, snapshot, [
+      { action: 'fill', ref: ref(snapshot, '标签:Original field'), value: 'must-not-write' },
+      { action: 'fill', ref: ref(snapshot, '标签:Stable field'), value: 'after' },
+    ]);
+    assert.equal(response.results[0].code, 'STALE_TARGET', JSON.stringify(response));
+    assert.equal(response.results[1].ok, true, JSON.stringify(response));
+    assert.equal(await page.locator('#field').inputValue(), 'original');
+    assert.equal(await page.locator('#other').inputValue(), 'after');
+  });
+});
+
+// 补全浮层在 mousedown 关闭属于搜索页正常时序，不能因此放弃点击。
+const closeOnMousedownMarkup = '<div id="wrapper"><form id="form" action="/s"><textarea id="kw" name="wd"></textarea><input id="su" type="submit" value="百度一下"><div id="sug"><ul><li>测试查询 百科</li></ul></div></form></div>';
+const setupCloseOnMousedown = () => {
+  window.ev = { click: 0, submit: 0, mousedown: 0 };
+  document.addEventListener('mousedown', () => { window.ev.mousedown++; document.getElementById('sug').innerHTML = ''; }, true);
+  document.getElementById('form').addEventListener('submit', (event) => { window.ev.submit++; event.preventDefault(); });
+  document.getElementById('su').addEventListener('click', () => { window.ev.click++; });
+};
+
+test('mousedown 关闭联想浮层不阻止提交按钮点击', { timeout: 20000 }, async () => {
+  await fixture(closeOnMousedownMarkup, setupCloseOnMousedown, async (page) => {
+    const snapshot = await extract(page);
+    const response = await execute(page, snapshot, [{ action: 'click', ref: ref(snapshot, '输入框(submit)') }]);
+    assert.equal(response.results[0].ok, true, JSON.stringify(response));
+    assert.deepEqual(await page.evaluate(() => window.ev), { click: 1, submit: 1, mousedown: 1 });
+  });
+});
+
+test('mousedown 中提交按钮文字被换成删除全部时拒绝派发点击', { timeout: 20000 }, async () => {
+  await fixture(closeOnMousedownMarkup, () => {
+    window.ev = { click: 0, submit: 0, mousedown: 0 };
+    document.addEventListener('mousedown', () => { window.ev.mousedown++; document.getElementById('sug').innerHTML = ''; }, true);
+    document.getElementById('form').addEventListener('submit', (event) => { window.ev.submit++; event.preventDefault(); });
+    document.getElementById('su').addEventListener('click', () => { window.ev.click++; });
+    document.getElementById('su').addEventListener('mousedown', () => { document.getElementById('su').value = '删除全部'; }, { once: true });
+  }, async (page) => {
+    const snapshot = await extract(page);
+    stale(await execute(page, snapshot, [{ action: 'click', ref: ref(snapshot, '输入框(submit)') }]));
+    assert.deepEqual(await page.evaluate(() => window.ev), { click: 0, submit: 0, mousedown: 1 });
+  });
+});
