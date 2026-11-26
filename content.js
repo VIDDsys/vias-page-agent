@@ -323,11 +323,17 @@
 
   const CHOICE_SELECTOR = 'input[type="radio"],input[type="checkbox"],[role="radio"],[role="checkbox"],[role="option"]';
   const HEADING_SELECTOR = 'h1,h2,h3,h4,h5,h6,legend';
+  const CLOCK_TEXT_PATTERN = /^\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/;
 
   function optionContextText(element) {
     const parts = [];
     const visit = (node) => {
-      if (node.nodeType === Node.TEXT_NODE) { parts.push(node.textContent); return; }
+      if (node.nodeType === Node.TEXT_NODE) {
+        const normalized = cleanText(node.textContent, Infinity);
+        // 独立时钟/倒计时跳动（如 HH:MM:SS）不是题干变化，与 pageStateSignature 保持同一规则。
+        if (normalized) parts.push(normalized.replace(CLOCK_TEXT_PATTERN, '[clock]'));
+        return;
+      }
       if (!(node instanceof Element) && !(node instanceof ShadowRoot)) return;
       if (node instanceof Element && (SKIP_TAGS.has(node.tagName.toLowerCase()) || ['INPUT', 'TEXTAREA', 'SELECT'].includes(node.tagName)
         || node.isContentEditable || isIdentityState(node) || choiceTarget(node))) return;
@@ -335,13 +341,33 @@
       if (node.shadowRoot) visit(node.shadowRoot);
     };
     // 页级容器只取标题；进度等全局状态不能成为每一道题的身份。
-    if (['MAIN', 'BODY', 'HTML'].includes(element.tagName)) {
+    if (['MAIN', 'BODY', 'HTML'].includes(element.tagName) || element.getAttribute('role') === 'main') {
       for (const heading of element.querySelectorAll(HEADING_SELECTOR)) parts.push(identityText(heading));
       if (element.shadowRoot) visit(element.shadowRoot);
     } else visit(element);
     const labelled = (element.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
       .map((id) => element.getRootNode().getElementById?.(id)).filter(Boolean).map(identityText);
     return JSON.stringify([element.getAttribute('aria-label') || '', labelled, cleanText(parts.join(' '), Infinity)]);
+  }
+
+  // 题块常在列表项与题干/选项间多包一层布局容器；
+  // 只顺着唯一的含选项包装元素拆包，遇到多个选项分支（如选项列表容器）即停，避免把选项序号误当题干。
+  function hasOptionPrompt(root) {
+    let current = root;
+    while (current) {
+      const choiceBranches = [];
+      for (const node of current.childNodes) {
+        if (node.nodeType === Node.TEXT_NODE) {
+          if (cleanText(node.textContent)) return true;
+        } else if (node instanceof Element) {
+          if (choiceTarget(node) || node.querySelector(CHOICE_SELECTOR)) choiceBranches.push(node);
+          else if (identityText(node)) return true;
+        }
+      }
+      if (choiceBranches.length !== 1 || choiceTarget(choiceBranches[0])) return false;
+      current = choiceBranches[0];
+    }
+    return false;
   }
 
   function optionContext(element) {
@@ -352,8 +378,7 @@
       scopes.push({ element: parent, path: optionPathOf(parent), text });
       const container = parent.parentElement;
       const choices = new Set([...parent.querySelectorAll(CHOICE_SELECTOR)].map(choiceTarget).filter(Boolean));
-      const hasPrompt = [...parent.childNodes].some((node) => node.nodeType === Node.TEXT_NODE ? !!cleanText(node.textContent)
-        : node instanceof Element && !choiceTarget(node) && !node.querySelector(CHOICE_SELECTOR) && !!identityText(node));
+      const hasPrompt = hasOptionPrompt(parent);
       const namedGroup = parent.matches('[role="group"],[role="radiogroup"],[role="listbox"]')
         && !!(parent.getAttribute('aria-label') || parent.getAttribute('aria-labelledby'));
       const peer = (namedGroup || ((choices.size > 1 || parent.querySelector(HEADING_SELECTOR)) && hasPrompt)) && container
@@ -1222,7 +1247,7 @@
       if (node.nodeType === Node.TEXT_NODE) {
         // Clock/timer ticks are not task progress. Keep ordinary content changes,
         // but ignore explicit timers and the seconds of standalone clock text.
-        if (!clock) mix(cleanText(node.textContent, remaining).replace(/^\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/, '[clock]'), remaining);
+        if (!clock) mix(cleanText(node.textContent, remaining).replace(CLOCK_TEXT_PATTERN, '[clock]'), remaining);
         return;
       }
       if (node.nodeType !== Node.ELEMENT_NODE && !(node instanceof ShadowRoot)) return;

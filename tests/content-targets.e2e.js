@@ -598,3 +598,131 @@ test('mousedown 中提交按钮文字被换成删除全部时拒绝派发点击'
     assert.deepEqual(await page.evaluate(() => window.ev), { click: 0, submit: 0, mousedown: 1 });
   });
 });
+
+const wrappedQuizMarkup = `
+<div id="app" class="appNew">
+  <div id="screen" class="test">
+    <div class="gobackbox">
+      <div class="statistic" style="display:none"><div class="el-statistic"><div class="con"><span class="number"> 06:20:11</span></div></div></div>
+      <div class="status-bar">已答 0/2 题</div>
+    </div>
+    <div class="previewContent">
+      <form class="el-form">
+        <div id="q1" class="subjectDet">
+          <div class="rich-text">
+            <div class="title_test">1.【判断题】</div>
+            <h5><span>局部变量的名称区分大小写。</span></h5>
+            <div class="optionList">
+              <div role="radiogroup" class="el-radio-group"><label role="radio" tabindex="0" class="el-radio"><span class="el-radio__input"><input type="radio" aria-hidden="true" tabindex="-1" class="el-radio__original" value="1"></span><span class="el-radio__label">A.正确</span></label></div>
+              <div role="radiogroup" class="el-radio-group"><label role="radio" tabindex="0" class="el-radio"><span class="el-radio__input"><input type="radio" aria-hidden="true" tabindex="-1" class="el-radio__original" value="0"></span><span class="el-radio__label">B.错误</span></label></div>
+            </div>
+          </div>
+        </div>
+        <div id="q2" class="subjectDet">
+          <div class="rich-text">
+            <div class="title_test">2.【单选题】</div>
+            <h5><span>下列哪个是字符串数据？</span></h5>
+            <div class="optionList">
+              <div role="radiogroup" class="el-radio-group"><label role="radio" tabindex="0" class="el-radio"><span class="el-radio__input"><input type="radio" aria-hidden="true" tabindex="-1" class="el-radio__original" value="3"></span><span class="el-radio__label">A. hello</span></label></div>
+              <div role="radiogroup" class="el-radio-group"><label role="radio" tabindex="0" class="el-radio"><span class="el-radio__input"><input type="radio" aria-hidden="true" tabindex="-1" class="el-radio__original" value="2"></span><span class="el-radio__label">B. "hello"</span></label></div>
+            </div>
+          </div>
+        </div>
+      </form>
+      <div class="previewtab1">已做 0 未做 2</div>
+    </div>
+  </div>
+</div>`;
+
+test('嵌套包装层题块识别同级边界，页顶倒计时与答题卡变化不阻断批量 checkRadio', { timeout: 20000 }, async () => {
+  await fixture(wrappedQuizMarkup, () => {
+    let answered = 0;
+    document.addEventListener('change', (event) => {
+      if (event.target.matches('input[type="radio"]')) {
+        answered++;
+        document.querySelector('.status-bar').textContent = `已答 ${answered}/2 题`;
+        document.querySelector('.previewtab1').textContent = `已做 ${answered} 未做 ${2 - answered}`;
+      }
+    });
+  }, async (page) => {
+    const snapshot = await extract(page);
+    await page.evaluate(() => {
+      document.querySelector('.el-statistic .number').textContent = ' 06:20:05';
+      document.querySelector('.status-bar').textContent = '自动保存于 17:40:05';
+    });
+    const response = await execute(page, snapshot, [
+      { action: 'checkRadio', ref: ref(snapshot, 'B.错误') },
+      { action: 'checkRadio', ref: ref(snapshot, 'B. "hello"') },
+    ]);
+    assert.ok(response.results.every((item) => item.ok), JSON.stringify(response));
+    assert.deepEqual(await page.evaluate(() => [...document.querySelectorAll('input[type="radio"]')].map((input) => input.checked)), [false, true, false, true]);
+  });
+});
+
+test('嵌套包装层题块内题干变化仍严格拒绝且不点击', { timeout: 20000 }, async () => {
+  await fixture(wrappedQuizMarkup, null, async (page) => {
+    const snapshot = await extract(page);
+    await page.evaluate(() => {
+      document.querySelector('#q1 h5 span').textContent = '另一道完全不同的判断题。';
+    });
+    const response = await execute(page, snapshot, [
+      { action: 'checkRadio', ref: ref(snapshot, 'B.错误') },
+      { action: 'checkRadio', ref: ref(snapshot, 'B. "hello"') },
+    ]);
+    assert.equal(response.results[0].code, 'STALE_TARGET', JSON.stringify(response));
+    assert.equal(response.results[1].ok, true, JSON.stringify(response));
+    assert.deepEqual(await page.evaluate(() => [...document.querySelectorAll('input[type="radio"]')].map((input) => input.checked)), [false, false, false, true]);
+  });
+});
+
+test('单题无兄弟题块页面中，独立倒计时跳动不误报 STALE_TARGET，题干变化仍拒绝', { timeout: 20000 }, async () => {
+  const singleMarkup = `
+  <div id="app">
+    <div class="header">剩余时间 <span class="number"> 06:20:11</span></div>
+    <form class="el-form">
+      <div id="q1" class="subjectDet">
+        <div class="rich-text">
+          <h5><span>单题测试题干</span></h5>
+          <div class="optionList">
+            <div role="radiogroup"><label role="radio" class="el-radio"><input type="radio" value="1">A.正确</label></div>
+            <div role="radiogroup"><label role="radio" class="el-radio"><input type="radio" value="0">B.错误</label></div>
+          </div>
+        </div>
+      </div>
+    </form>
+  </div>`;
+  await fixture(singleMarkup, null, async (page) => {
+    const snapshot = await extract(page);
+    await page.evaluate(() => { document.querySelector('.number').textContent = ' 06:19:59'; });
+    const okRes = await execute(page, snapshot, [{ action: 'checkRadio', ref: ref(snapshot, 'A.正确') }], 'single-clock-ok');
+    success(okRes);
+
+    const snapshot2 = await extract(page);
+    await page.evaluate(() => {
+      document.querySelector('.number').textContent = ' 06:19:50';
+      document.querySelector('#q1 h5 span').textContent = '单题题干已被替换';
+    });
+    stale(await execute(page, snapshot2, [{ action: 'checkRadio', ref: ref(snapshot2, 'B.错误') }], 'single-prompt-changed'));
+  });
+});
+
+test('role=main 页级容器只取标题，页级全局进度变化不误报 STALE_TARGET，题干变化仍拒绝', { timeout: 20000 }, async () => {
+  const roleMainMarkup = `
+  <div role="main">
+    <div id="global-progress">已答 0/1 题</div>
+    <h2>第一题题干</h2>
+    <div class="options">
+      <label><input type="radio" name="q" value="a">选项甲</label>
+      <label><input type="radio" name="q" value="b">选项乙</label>
+    </div>
+  </div>`;
+  await fixture(roleMainMarkup, null, async (page) => {
+    const snapshot = await extract(page);
+    await page.evaluate(() => { document.querySelector('#global-progress').textContent = '已答 1/1 题（已自动保存）'; });
+    success(await execute(page, snapshot, [{ action: 'checkRadio', ref: ref(snapshot, '选项甲') }], 'role-main-progress-ok'));
+
+    const snapshot2 = await extract(page);
+    await page.evaluate(() => { document.querySelector('h2').textContent = '第二题题干'; });
+    stale(await execute(page, snapshot2, [{ action: 'checkRadio', ref: ref(snapshot2, '选项乙') }], 'role-main-heading-changed'));
+  });
+});
